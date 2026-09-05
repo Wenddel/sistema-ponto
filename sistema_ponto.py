@@ -565,6 +565,8 @@ th { background: #f8f9fa; font-weight: bold; color: #555; }
 .justificativa-cell { max-width: 180px; font-size: 11px; color: #666; font-style: italic; overflow: hidden; text-overflow: ellipsis; }
 .minutos-cell { color: #f44336; font-weight: bold; }
 .banco-cell { color: #0c5460; font-weight: bold; }
+.fim-semana { background-color: #fffde7 !important; }
+.fim-semana td { color: #e65100; }
 .filtros { display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap; align-items: center; }
 .filtros input, .filtros select { margin: 0; width: auto; min-width: 150px; }
 label { font-size: 13px; color: #555; font-weight: bold; display: block; margin-top: 8px; }
@@ -776,10 +778,11 @@ async function carregarRegistros() {
     }
     tbody.innerHTML = dados.map(function(r) {
         const classeTipo = 'tipo-' + r.tipo.toLowerCase().replace(/_/g, '-');
+        const classeFimSemana = r.dia_semana >= 5 ? ' fim-semana' : '';
         const minHtml = r.minutos_atraso > 0 ? '<span class="minutos-cell">'+r.minutos_atraso+' min</span>' : '-';
         const bancoHtml = r.minutos_banco_horas > 0 ? '<span class="banco-cell">+'+r.minutos_banco_horas+' min</span>' : '-';
         const justHtml = r.justificativa ? '<span class="justificativa-cell" title="'+r.justificativa.replace(/"/g,'&quot;')+'">'+r.justificativa+'</span>' : '<span style="color:#ccc;">-</span>';
-        return '<tr><td>'+r.nome+'</td><td>'+r.cpf+'</td><td>'+r.data+'</td><td>'+r.hora+'</td><td class="'+classeTipo+'">'+r.tipo_formatado+'</td><td class="'+(r.atrasado?'atrasado':'')+'">'+(r.atrasado?'⚠️ SIM':'✅ NÃO')+'</td><td>'+minHtml+'</td><td>'+bancoHtml+'</td><td>'+justHtml+'</td></tr>';
+        return '<tr class="'+classeFimSemana+'"><td>'+r.nome+'</td><td>'+r.cpf+'</td><td>'+r.data+'</td><td>'+r.hora+'</td><td class="'+classeTipo+'">'+r.tipo_formatado+'</td><td class="'+(r.atrasado?'atrasado':'')+'">'+(r.atrasado?'⚠️ SIM':'✅ NÃO')+'</td><td>'+minHtml+'</td><td>'+bancoHtml+'</td><td>'+justHtml+'</td></tr>';
     }).join('');
 }
 
@@ -916,6 +919,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 """).fetchall()
                 conn.close()
                 resultado = []
+                dias_semana = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]
                 for r in regs:
                     dh = datetime.strptime(r["data_hora"], "%Y-%m-%d %H:%M:%S")
                     resultado.append({
@@ -925,7 +929,9 @@ class ServidorPonto(BaseHTTPRequestHandler):
                         "atrasado": bool(r["atrasado"]),
                         "minutos_atraso": r["minutos_atraso"] or 0,
                         "minutos_banco_horas": r["minutos_banco_horas"] or 0,
-                        "justificativa": r["justificativa"] or ""
+                        "justificativa": r["justificativa"] or "",
+                        "dia_semana": dh.weekday(),
+                        "dia_semana_nome": dias_semana[dh.weekday()]
                     })
                 responder_json(self, resultado)
             except Exception as e:
@@ -1299,6 +1305,12 @@ def desenhar_pagina_funcionario(c, func, registros, mes, dias_semana, altura, la
         hora = dh.strftime("%H:%M:%S")
         dia_semana = dias_semana[dh.weekday()]
         tipo_fmt = reg["tipo"].replace("_", " ")
+        
+        # Destaca sabado e domingo
+        if dh.weekday() >= 5:  # 5=Sabado, 6=Domingo
+            c.setFillColor(colors.HexColor("#fff3cd"))
+            c.rect(40, y - 2, largura - 80, 12, fill=True, stroke=False)
+            c.setFillColor(colors.black)
         
         c.drawString(45, y, data)
         c.drawString(100, y, hora)
