@@ -12,7 +12,7 @@ from urllib.parse import urlparse, parse_qs
 SEGREDO_QR = "CLINICA_PONTO_2024"
 PORTA = int(os.environ.get("PORT", 8000))
 ADMIN_USUARIO = "admin"
-ADMIN_SENHA = "admin123"
+ADMIN_SENHA = "3223ronte"
 sessoes_admin = {}
 os.makedirs("static", exist_ok=True)
 
