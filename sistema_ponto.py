@@ -3,16 +3,15 @@ import json
 import os
 import io
 import hashlib
-import base64
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 # ===================== CONFIGURACOES =====================
 SEGREDO_QR = "CLINICA_PONTO_2024"
-PORTA = int(os.environ.get("PORT", 8000))
+PORTA = 8000
 ADMIN_USUARIO = "admin"
-ADMIN_SENHA = "3223ronte"
+ADMIN_SENHA = "ronte314"
 sessoes_admin = {}
 os.makedirs("static", exist_ok=True)
 
@@ -44,9 +43,20 @@ def init_db():
             data_hora TEXT NOT NULL,
             tipo TEXT NOT NULL,
             atrasado INTEGER DEFAULT 0,
+            minutos_atraso INTEGER DEFAULT 0,
+            justificativa TEXT DEFAULT '',
             FOREIGN KEY (funcionario_id) REFERENCES funcionarios(id) ON DELETE CASCADE
         )
     """)
+    # Migracao: adiciona colunas se nao existirem em bancos antigos
+    try:
+        conn.execute("ALTER TABLE registros_ponto ADD COLUMN minutos_atraso INTEGER DEFAULT 0")
+    except:
+        pass
+    try:
+        conn.execute("ALTER TABLE registros_ponto ADD COLUMN justificativa TEXT DEFAULT ''")
+    except:
+        pass
     conn.commit()
     conn.close()
 
@@ -57,7 +67,7 @@ def formatar_cpf(cpf):
     return ''.join(filter(str.isdigit, str(cpf)))
 
 def verificar_atraso(hora_registro, horario_padrao):
-    """Verifica se a hora do registro é MAIOR que o horário padrão (atrasado)."""
+    """Verifica se a hora do registro e MAIOR que o horario padrao (atrasado)."""
     try:
         h_r = hora_registro.split(":")
         h_p = horario_padrao.split(":")
@@ -67,19 +77,75 @@ def verificar_atraso(hora_registro, horario_padrao):
     except:
         return False
 
+def calcular_minutos_atraso(hora_registro, horario_padrao, invertido=False):
+    """Calcula a diferenca em minutos entre dois horarios.
+    Se invertido=True, calcula quanto tempo ANTES do horario padrao (para saida antecipada)."""
+    try:
+        h_r = hora_registro.split(":")
+        h_p = horario_padrao.split(":")
+        t_r = int(h_r[0]) * 3600 + int(h_r[1]) * 60 + (int(h_r[2]) if len(h_r) > 2 else 0)
+        t_p = int(h_p[0]) * 3600 + int(h_p[1]) * 60 + (int(h_p[2]) if len(h_p) > 2 else 0)
+        if invertido:
+            # Para saida: quanto tempo antes do horario (saida antecipada)
+            diff = t_p - t_r
+        else:
+            # Para entrada/retorno: quanto tempo depois do horario
+            diff = t_r - t_p
+        return max(0, diff // 60)
+    except:
+        return 0
+
+def obter_ultimo_registro(funcionario_id, data_str):
+    """Retorna o ultimo registro do funcionario em uma data especifica."""
+    conn = get_db()
+    ultimo = conn.execute("""
+        SELECT * FROM registros_ponto 
+        WHERE funcionario_id = ? AND strftime('%Y-%m-%d', data_hora) = ?
+        ORDER BY data_hora DESC LIMIT 1
+    """, (funcionario_id, data_str)).fetchone()
+    conn.close()
+    return ultimo
+
+def verificar_sequencia_valida(ultimo_tipo, novo_tipo):
+    """Verifica se o novo tipo de registro e valido em relacao ao ultimo.
+    Sequencia logica: NENHUM/SAIDA -> ENTRADA -> SAIDA_ALMOCO -> RETORNO_ALMOCO -> SAIDA
+    Retorna (valido: bool, mensagem: str)"""
+    sequencia = {
+        None: ["ENTRADA"],
+        "ENTRADA": ["SAIDA_ALMOCO", "SAIDA"],
+        "SAIDA_ALMOCO": ["RETORNO_ALMOCO"],
+        "RETORNO_ALMOCO": ["SAIDA", "SAIDA_ALMOCO"],
+        "SAIDA": ["ENTRADA"]
+    }
+    
+    proximos_permitidos = sequencia.get(ultimo_tipo, ["ENTRADA"])
+    
+    if novo_tipo in proximos_permitidos:
+        return True, ""
+    
+    # Mensagens de erro amigaveis
+    mensagens = {
+        "ENTRADA": f"Voce ja registrou ENTRADA hoje. O proximo registro deve ser SAIDA ALMOCO ou SAIDA.",
+        "SAIDA_ALMOCO": f"Voce ja registrou SAIDA ALMOCO. O proximo registro deve ser RETORNO ALMOCO.",
+        "RETORNO_ALMOCO": f"Voce ja registrou RETORNO ALMOCO. O proximo registro deve ser SAIDA.",
+        "SAIDA": f"Voce ja registrou SAIDA hoje. Uma nova ENTRADA so pode ser registrada no proximo dia util."
+    }
+    
+    return False, mensagens.get(ultimo_tipo, f"Registro de {novo_tipo.replace('_', ' ')} nao permitido agora.")
+
 def gerar_sessao():
-    """Gera um token de sessão seguro e compatível com cookies."""
+    """Gera um token de sessao seguro e compativel com cookies."""
     return hashlib.sha256(os.urandom(64)).hexdigest()
 
 def limpar_sessoes_expiradas():
-    """Remove sessões que já expiraram."""
+    """Remove sessoes que ja expiraram."""
     agora = datetime.now()
     expiradas = [token for token, expira in sessoes_admin.items() if expira <= agora]
     for token in expiradas:
         del sessoes_admin[token]
 
 def verificar_login(handler):
-    """Verifica se o admin está logado pelo cookie."""
+    """Verifica se o admin esta logado pelo cookie."""
     limpar_sessoes_expiradas()
     try:
         cookies = handler.headers.get("Cookie", "")
@@ -132,8 +198,9 @@ HTML_LOGIN = """<!DOCTYPE html>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; font-family: Arial, sans-serif; }
 body { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
-.login-box { background: white; padding: 40px; border-radius: 16px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); width: 100%; max-width: 380px; }
-.login-box h1 { color: #333; margin-bottom: 10px; font-size: 24px; text-align: center; }
+.login-box { background: white; padding: 40px; border-radius: 16px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); width: 100%; max-width: 380px; text-align: center; }
+.logo { max-width: 100px; margin-bottom: 15px; }
+.login-box h1 { color: #333; margin-bottom: 10px; font-size: 24px; }
 .login-box p.sub { color: #888; margin-bottom: 30px; text-align: center; font-size: 14px; }
 .login-box input { width: 100%; padding: 14px; margin: 8px 0; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 15px; transition: border 0.2s; }
 .login-box input:focus { border-color: #667eea; outline: none; }
@@ -147,6 +214,7 @@ body { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height
 </head>
 <body>
 <div class="login-box">
+<img src="/static/logo.png" alt="Logo" class="logo" onerror="this.style.display='none'">
 <h1>🔐 Login Admin</h1>
 <p class="sub">Acesso ao painel administrativo</p>
 <input type="text" id="usuario" placeholder="Usuário" autocomplete="username">
@@ -163,7 +231,6 @@ document.getElementById('usuario').addEventListener('keypress', function(e) {
     if(e.key === 'Enter') document.getElementById('senha').focus();
 });
 document.getElementById('usuario').focus();
-
 async function logar() {
     const usuario = document.getElementById('usuario').value.trim();
     const senha = document.getElementById('senha').value;
@@ -209,7 +276,7 @@ HTML_PONTO = """<!DOCTYPE html>
 * { margin: 0; padding: 0; box-sizing: border-box; font-family: Arial, sans-serif; }
 body { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 15px; }
 .container { background: white; padding: 30px; border-radius: 16px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); width: 100%; max-width: 420px; text-align: center; }
-.logo { max-width: 120px; margin-bottom: 15px; }
+.logo { max-width: 140px; margin-bottom: 15px; border-radius: 8px; }
 .container h1 { color: #333; font-size: 26px; margin-bottom: 5px; }
 .subtitulo { color: #888; font-size: 14px; margin-bottom: 20px; }
 .data-hora { background: #f0f4ff; color: #667eea; padding: 12px; border-radius: 8px; font-weight: bold; font-size: 14px; margin-bottom: 20px; }
@@ -219,6 +286,7 @@ body { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height
 .botoes button { padding: 16px 8px; border: none; border-radius: 10px; color: white; font-weight: bold; font-size: 13px; cursor: pointer; transition: transform 0.1s, opacity 0.2s; }
 .botoes button:hover { opacity: 0.9; }
 .botoes button:active { transform: scale(0.97); }
+.botoes button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
 .btn-entrada { background: linear-gradient(135deg, #4CAF50, #45a049); }
 .btn-almoco { background: linear-gradient(135deg, #ff9800, #f57c00); }
 .btn-retorno { background: linear-gradient(135deg, #2196F3, #1976D2); }
@@ -228,14 +296,29 @@ body { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height
 .mensagem { padding: 14px; border-radius: 8px; margin-top: 18px; font-size: 14px; font-weight: bold; white-space: pre-line; line-height: 1.5; display: none; }
 .sucesso { background: #d4edda; color: #155724; display: block; }
 .erro { background: #f8d7da; color: #721c24; display: block; }
+.atencao { background: #fff3cd; color: #856404; display: block; }
 .admin-link { margin-top: 20px; padding-top: 15px; border-top: 1px solid #eee; }
 .admin-link a { color: #888; font-size: 12px; text-decoration: none; }
 .admin-link a:hover { color: #667eea; text-decoration: underline; }
+
+/* Modal de Justificativa */
+.modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); z-index: 1000; align-items: center; justify-content: center; padding: 20px; }
+.modal-overlay.ativo { display: flex; }
+.modal-box { background: white; border-radius: 16px; padding: 30px; width: 100%; max-width: 400px; box-shadow: 0 20px 60px rgba(0,0,0,0.4); }
+.modal-box h2 { color: #f44336; font-size: 20px; margin-bottom: 10px; }
+.modal-box p { color: #555; font-size: 14px; margin-bottom: 15px; line-height: 1.5; }
+.modal-box .info-atraso { background: #fff3cd; padding: 12px; border-radius: 8px; margin-bottom: 15px; font-weight: bold; color: #856404; font-size: 15px; }
+.modal-box textarea { width: 100%; padding: 12px; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 14px; resize: vertical; min-height: 80px; font-family: Arial, sans-serif; }
+.modal-box textarea:focus { border-color: #667eea; outline: none; }
+.modal-botoes { display: flex; gap: 10px; margin-top: 15px; }
+.modal-botoes button { flex: 1; padding: 12px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; font-size: 14px; }
+.btn-cancelar { background: #e0e0e0; color: #333; }
+.btn-confirmar { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
 </style>
 </head>
 <body>
 <div class="container">
-<img src="/static/logo.png" alt="Logo" class="logo" onerror="this.style.display='none'">
+<img src="/static/logo.png" alt="Logo Clínica" class="logo" onerror="this.style.display='none'">
 <h1>Registro de Ponto</h1>
 <p class="subtitulo">Clínica - Controle de Funcionários</p>
 <div class="data-hora" id="dataHora">Carregando...</div>
@@ -258,8 +341,26 @@ body { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height
 <div class="mensagem" id="mensagem"></div>
 <div class="admin-link"><a href="/admin">🔐 Acesso Administrador</a></div>
 </div>
+
+<!-- Modal de Justificativa -->
+<div class="modal-overlay" id="modalJustificativa">
+<div class="modal-box">
+<h2>⚠️ Atenção!</h2>
+<p id="modalTexto"></p>
+<div class="info-atraso" id="modalInfoAtraso"></div>
+<p style="font-weight:bold; color:#333; margin-bottom:8px;">Informe a justificativa:</p>
+<textarea id="justificativa" placeholder="Descreva o motivo do atraso, saída antecipada, etc..."></textarea>
+<div class="modal-botoes">
+<button class="btn-cancelar" onclick="fecharModal()">Cancelar</button>
+<button class="btn-confirmar" onclick="confirmarComJustificativa()">Confirmar Registro</button>
+</div>
+</div>
+</div>
+
 <script>
 const QR_SEGREDO = "CLINICA_PONTO_2024";
+let registroPendente = null;
+
 function atualizarDataHora() {
     const agora = new Date();
     const opcoes = { weekday: 'long', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' };
@@ -302,13 +403,76 @@ async function registrar(tipo) {
         mostrarMensagem('Digite um CPF válido com 11 números!', 'erro');
         return;
     }
+    
     try {
-        const res = await fetch('/api/bater_ponto', {
+        const res = await fetch('/api/verificar_ponto', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({cpf: cpf, tipo: tipo, qr_code: QR_SEGREDO})
         });
+        
         const dados = await res.json();
+        
+        if (!res.ok) {
+            mostrarMensagem(dados.detail || 'Erro ao verificar', 'erro');
+            return;
+        }
+        
+        // Se precisar de justificativa, abre o modal
+        if (dados.precisa_justificativa) {
+            registroPendente = {
+                cpf: cpf,
+                tipo: tipo,
+                dados: dados
+            };
+            document.getElementById('modalTexto').textContent = dados.mensagem_justificativa;
+            document.getElementById('modalInfoAtraso').textContent = '⏱️ ' + dados.info_atraso;
+            document.getElementById('justificativa').value = '';
+            document.getElementById('modalJustificativa').classList.add('ativo');
+            document.getElementById('justificativa').focus();
+        } else {
+            // Registra diretamente sem justificativa
+            await executarRegistro(cpf, tipo, '');
+        }
+    } catch(e) {
+        mostrarMensagem('Erro de conexão com o servidor!\\nVerifique se está na mesma rede Wi-Fi.', 'erro');
+    }
+}
+
+function fecharModal() {
+    document.getElementById('modalJustificativa').classList.remove('ativo');
+    registroPendente = null;
+}
+
+async function confirmarComJustificativa() {
+    if (!registroPendente) return;
+    
+    const justificativa = document.getElementById('justificativa').value.trim();
+    if (!justificativa) {
+        alert('Por favor, informe a justificativa!');
+        document.getElementById('justificativa').focus();
+        return;
+    }
+    
+    fecharModal();
+    await executarRegistro(registroPendente.cpf, registroPendente.tipo, justificativa);
+}
+
+async function executarRegistro(cpf, tipo, justificativa) {
+    try {
+        const res = await fetch('/api/bater_ponto', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                cpf: cpf, 
+                tipo: tipo, 
+                qr_code: QR_SEGREDO,
+                justificativa: justificativa
+            })
+        });
+        
+        const dados = await res.json();
+        
         if (res.ok) {
             mostrarMensagem(dados.mensagem, 'sucesso');
             document.getElementById('cpf').value = '';
@@ -317,7 +481,7 @@ async function registrar(tipo) {
             mostrarMensagem(dados.detail || 'Erro ao registrar', 'erro');
         }
     } catch(e) {
-        mostrarMensagem('Erro de conexão com o servidor!\\nVerifique se está na mesma rede Wi-Fi.', 'erro');
+        mostrarMensagem('Erro de conexão com o servidor!', 'erro');
     }
 }
 
@@ -327,6 +491,18 @@ function mostrarMensagem(texto, tipo) {
     msg.className = 'mensagem ' + tipo;
     setTimeout(function() { msg.className = 'mensagem'; }, 7000);
 }
+
+// Fecha modal ao clicar fora
+document.getElementById('modalJustificativa').addEventListener('click', function(e) {
+    if (e.target === this) fecharModal();
+});
+
+// Enter no textarea confirma
+document.getElementById('justificativa').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' && e.ctrlKey) {
+        confirmarComJustificativa();
+    }
+});
 </script>
 </body>
 </html>"""
@@ -342,24 +518,27 @@ HTML_ADMIN = """<!DOCTYPE html>
 * { margin: 0; padding: 0; box-sizing: border-box; font-family: Arial, sans-serif; }
 body { background: #f5f5f5; }
 .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 18px; text-align: center; position: relative; }
+.header-content { display: flex; align-items: center; justify-content: center; gap: 15px; }
+.header-logo { max-height: 50px; border-radius: 6px; }
 .header h1 { font-size: 22px; }
 .logout { position: absolute; right: 20px; top: 50%; transform: translateY(-50%); background: rgba(255,255,255,0.2); padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; border: 1px solid rgba(255,255,255,0.3); }
 .logout:hover { background: rgba(255,255,255,0.3); }
-.container { max-width: 1000px; margin: 20px auto; padding: 0 20px; }
+.container { max-width: 1100px; margin: 20px auto; padding: 0 20px; }
 .tabs { display: flex; gap: 5px; margin-bottom: 20px; flex-wrap: wrap; }
 .tab { padding: 12px 18px; background: #ddd; border: none; border-radius: 8px 8px 0 0; cursor: pointer; font-weight: bold; font-size: 13px; }
 .tab.ativo { background: white; color: #667eea; }
 .painel { background: white; border-radius: 0 12px 12px 12px; padding: 25px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); display: none; }
 .painel.ativo { display: block; }
 h2 { color: #333; margin-bottom: 20px; font-size: 20px; }
-input, select { width: 100%; padding: 12px; margin: 8px 0; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 14px; }
+input, select, textarea { width: 100%; padding: 12px; margin: 8px 0; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 14px; font-family: Arial, sans-serif; }
 button { padding: 12px 24px; background: #667eea; color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; font-size: 14px; margin: 5px 5px 5px 0; }
 button:hover { opacity: 0.9; }
 .btn-success { background: #4CAF50; }
 .btn-danger { background: #f44336; }
 .btn-warning { background: #ff9800; }
+.btn-small { padding: 6px 12px; font-size: 12px; }
 table { width: 100%; border-collapse: collapse; margin-top: 15px; display: block; overflow-x: auto; }
-th, td { padding: 10px; text-align: left; border-bottom: 1px solid #eee; font-size: 13px; white-space: nowrap; }
+th, td { padding: 10px; text-align: left; border-bottom: 1px solid #eee; font-size: 13px; white-space: nowrap; max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
 th { background: #f8f9fa; font-weight: bold; color: #555; }
 .atrasado { color: #f44336; font-weight: bold; }
 .tipo-entrada { color: #4CAF50; font-weight: bold; }
@@ -375,11 +554,18 @@ th { background: #f8f9fa; font-weight: bold; color: #555; }
 .card { background: #fafafa; padding: 15px; border-radius: 8px; margin: 10px 0; border-left: 4px solid #667eea; }
 .horarios-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .info-box { background: #fff3cd; border-left: 4px solid #ffc107; padding: 12px; border-radius: 4px; margin: 15px 0; font-size: 13px; color: #856404; }
+.justificativa-cell { max-width: 180px; font-size: 11px; color: #666; font-style: italic; }
+.minutos-cell { color: #f44336; font-weight: bold; }
+.filtros { display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap; align-items: center; }
+.filtros input, .filtros select { margin: 0; width: auto; min-width: 150px; }
 </style>
 </head>
 <body>
 <div class="header">
+<div class="header-content">
+<img src="/static/logo.png" alt="Logo" class="header-logo" onerror="this.style.display='none'">
 <h1>⚙️ Painel Administrativo</h1>
+</div>
 <div class="logout" onclick="sair()">🚪 Sair</div>
 </div>
 <div class="container">
@@ -414,8 +600,18 @@ th { background: #f8f9fa; font-weight: bold; color: #555; }
 
 <div id="registros" class="painel">
 <h2>Todos os Registros de Ponto</h2>
+<div class="filtros">
+<input type="text" id="filtroNome" placeholder="Filtrar por nome..." oninput="carregarRegistros()">
+<select id="filtroTipo" onchange="carregarRegistros()">
+<option value="">Todos os tipos</option>
+<option value="ENTRADA">ENTRADA</option>
+<option value="SAIDA_ALMOCO">SAÍDA ALMOÇO</option>
+<option value="RETORNO_ALMOCO">RETORNO ALMOÇO</option>
+<option value="SAIDA">SAÍDA</option>
+</select>
 <button onclick="carregarRegistros()">🔄 Atualizar</button>
-<table><thead><tr><th>Funcionário</th><th>CPF</th><th>Data</th><th>Hora</th><th>Tipo</th><th>Atrasado</th></tr></thead><tbody id="tbodyReg"></tbody></table>
+</div>
+<table><thead><tr><th>Funcionário</th><th>CPF</th><th>Data</th><th>Hora</th><th>Tipo</th><th>Atrasado</th><th>Min. Atraso</th><th>Justificativa</th></tr></thead><tbody id="tbodyReg"></tbody></table>
 </div>
 
 <div id="relatorios" class="painel">
@@ -474,11 +670,10 @@ th { background: #f8f9fa; font-weight: bold; color: #555; }
 </p>
 </div>
 <div class="card">
-<h3 style="margin-bottom:10px;">⚡ Iniciar automaticamente</h3>
+<h3 style="margin-bottom:10px;">🖼️ Logo da Clínica</h3>
 <p style="font-size:14px; line-height:1.6;">
-Use o arquivo <strong>ligar.vbs</strong> para iniciar com um clique.<br>
-Para iniciar com o Windows: crie um atalho do .vbs na pasta de inicialização.<br>
-(Win+R → digite <strong>shell:startup</strong> → cole o atalho lá)
+Para adicionar o logotipo da clínica, coloque uma imagem <strong>PNG</strong> com o nome <strong>logo.png</strong> na pasta <strong>static/</strong> do sistema.<br>
+Tamanho recomendado: 200x200 pixels. A imagem aparecerá automaticamente na tela de registro de ponto e no painel administrativo.
 </p>
 </div>
 <div class="card">
@@ -493,6 +688,7 @@ Para iniciar com o Windows: crie um atalho do .vbs na pasta de inicialização.<
 
 </div>
 </div>
+
 <script>
 const hoje = new Date();
 const mesAno = hoje.toISOString().slice(0,7);
@@ -561,7 +757,7 @@ async function carregarFuncionarios() {
         return;
     }
     tbody.innerHTML = dados.map(function(f) {
-        return '<tr><td>'+f.id+'</td><td>'+f.nome+'</td><td>'+f.cpf+'</td><td>'+f.horario_entrada+'</td><td>'+f.horario_saida_almoco+'</td><td>'+f.horario_retorno_almoco+'</td><td>'+f.horario_saida+'</td><td><button class="btn-danger" onclick="excluir('+f.id+')">Excluir</button></td></tr>';
+        return '<tr><td>'+f.id+'</td><td>'+f.nome+'</td><td>'+f.cpf+'</td><td>'+f.horario_entrada+'</td><td>'+f.horario_saida_almoco+'</td><td>'+f.horario_retorno_almoco+'</td><td>'+f.horario_saida+'</td><td><button class="btn-danger btn-small" onclick="excluir('+f.id+')">Excluir</button></td></tr>';
     }).join('');
 }
 
@@ -576,15 +772,29 @@ async function excluir(id) {
 async function carregarRegistros() {
     const res = await fetch('/api/registros');
     if(res.status === 401) { window.location.href = '/admin'; return; }
-    const dados = await res.json();
+    let dados = await res.json();
+    
+    // Filtros
+    const filtroNome = document.getElementById('filtroNome').value.toLowerCase();
+    const filtroTipo = document.getElementById('filtroTipo').value;
+    
+    if(filtroNome) {
+        dados = dados.filter(r => r.nome.toLowerCase().includes(filtroNome));
+    }
+    if(filtroTipo) {
+        dados = dados.filter(r => r.tipo === filtroTipo);
+    }
+    
     const tbody = document.getElementById('tbodyReg');
     if(dados.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:#999; padding:20px;">Nenhum registro ainda.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color:#999; padding:20px;">Nenhum registro encontrado.</td></tr>';
         return;
     }
     tbody.innerHTML = dados.map(function(r) {
         const classeTipo = 'tipo-' + r.tipo.toLowerCase().replace(/_/g, '-');
-        return '<tr><td>'+r.nome+'</td><td>'+r.cpf+'</td><td>'+r.data+'</td><td>'+r.hora+'</td><td class="'+classeTipo+'">'+r.tipo_formatado+'</td><td class="'+(r.atrasado?'atrasado':'')+'">'+(r.atrasado?'⚠️ SIM':'✅ NÃO')+'</td></tr>';
+        const minutosHtml = r.minutos_atraso > 0 ? '<span class="minutos-cell">'+r.minutos_atraso+' min</span>' : '-';
+        const justificativaHtml = r.justificativa ? '<span class="justificativa-cell" title="'+r.justificativa.replace(/"/g,'&quot;')+'">'+r.justificativa+'</span>' : '<span style="color:#ccc;">-</span>';
+        return '<tr><td>'+r.nome+'</td><td>'+r.cpf+'</td><td>'+r.data+'</td><td>'+r.hora+'</td><td class="'+classeTipo+'">'+r.tipo_formatado+'</td><td class="'+(r.atrasado?'atrasado':'')+'">'+(r.atrasado?'⚠️ SIM':'✅ NÃO')+'</td><td>'+minutosHtml+'</td><td>'+justificativaHtml+'</td></tr>';
     }).join('');
 }
 
@@ -745,7 +955,9 @@ class ServidorPonto(BaseHTTPRequestHandler):
                         "data": dh.strftime("%d/%m/%Y"),
                         "hora": dh.strftime("%H:%M:%S"),
                         "tipo": r["tipo"], "tipo_formatado": tipo_fmt,
-                        "atrasado": bool(r["atrasado"])
+                        "atrasado": bool(r["atrasado"]),
+                        "minutos_atraso": r["minutos_atraso"] or 0,
+                        "justificativa": r["justificativa"] or ""
                     })
                 responder_json(self, resultado)
             except Exception as e:
@@ -761,7 +973,6 @@ class ServidorPonto(BaseHTTPRequestHandler):
         if caminho == "/api/gerar_qrcode":
             try:
                 import qrcode
-                # Detecta a URL correta baseada no Host do cabeçalho
                 host = self.headers.get("Host", f"localhost:{PORTA}")
                 url = f"http://{host}/"
                 qr = qrcode.QRCode(version=1, box_size=10, border=5)
@@ -847,8 +1058,8 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 responder_json(self, {"detail": "Usuário ou senha incorretos!"}, status=401)
             return
         
-        # API - Bater ponto (NÃO precisa de login)
-        if caminho == "/api/bater_ponto":
+        # API - Verificar ponto (antecipa validacoes e detecta se precisa de justificativa)
+        if caminho == "/api/verificar_ponto":
             cpf = formatar_cpf(dados.get("cpf", ""))
             tipo = dados.get("tipo", "ENTRADA")
             qr_code = dados.get("qr_code", "")
@@ -875,38 +1086,145 @@ class ServidorPonto(BaseHTTPRequestHandler):
                     return
                 
                 agora = datetime.now()
+                data_str = agora.strftime("%Y-%m-%d")
+                hora_str = agora.strftime("%H:%M:%S")
+                
+                # Verifica sequencia de registros
+                ultimo = obter_ultimo_registro(func["id"], data_str)
+                ultimo_tipo = ultimo["tipo"] if ultimo else None
+                
+                valido, msg_erro = verificar_sequencia_valida(ultimo_tipo, tipo)
+                if not valido:
+                    conn.close()
+                    responder_json(self, {"detail": "⛔ " + msg_erro}, status=400)
+                    return
+                
+                # Verifica se havera atraso e se precisa de justificativa
+                atrasado = 0
+                minutos = 0
+                mensagem_justificativa = ""
+                info_atraso = ""
+                
+                if tipo == "ENTRADA":
+                    atrasado = 1 if verificar_atraso(hora_str, func["horario_entrada"]) else 0
+                    if atrasado:
+                        minutos = calcular_minutos_atraso(hora_str, func["horario_entrada"])
+                        mensagem_justificativa = f"Foi detectado atraso na ENTRADA. O horário padrão é {func['horario_entrada']}."
+                        info_atraso = f"Atraso de {minutos} minuto(s)"
+                elif tipo == "SAIDA_ALMOCO":
+                    # Verifica se esta saindo muito cedo para o almoco (mais de 30 min antes)
+                    minutos_antes = calcular_minutos_atraso(func["horario_saida_almoco"], hora_str, invertido=True)
+                    if minutos_antes >= 30:
+                        atrasado = 0
+                        minutos = minutos_antes
+                        mensagem_justificativa = f"Você está saindo para o almoço com {minutos_antes} minutos de antecedência. O horário padrão é {func['horario_saida_almoco']}."
+                        info_atraso = f"Saída antecipada em {minutos_antes} minuto(s)"
+                elif tipo == "RETORNO_ALMOCO":
+                    atrasado = 1 if verificar_atraso(hora_str, func["horario_retorno_almoco"]) else 0
+                    if atrasado:
+                        minutos = calcular_minutos_atraso(hora_str, func["horario_retorno_almoco"])
+                        mensagem_justificativa = f"Foi detectado atraso no RETORNO do almoço. O horário padrão é {func['horario_retorno_almoco']}."
+                        info_atraso = f"Atraso de {minutos} minuto(s)"
+                elif tipo == "SAIDA":
+                    atrasado = 1 if verificar_atraso(func["horario_saida"], hora_str) else 0
+                    if atrasado:
+                        minutos = calcular_minutos_atraso(func["horario_saida"], hora_str, invertido=True)
+                        mensagem_justificativa = f"Foi detectada SAÍDA ANTECIPADA. O horário padrão de saída é {func['horario_saida']}."
+                        info_atraso = f"Saída antecipada em {minutos} minuto(s)"
+                
+                conn.close()
+                
+                precisa_justificativa = (minutos > 0)
+                
+                responder_json(self, {
+                    "precisa_justificativa": precisa_justificativa,
+                    "mensagem_justificativa": mensagem_justificativa,
+                    "info_atraso": info_atraso,
+                    "minutos_atraso": minutos,
+                    "atrasado": atrasado
+                })
+            except Exception as e:
+                responder_json(self, {"detail": f"Erro no banco de dados: {str(e)}"}, status=500)
+            return
+        
+        # API - Bater ponto (efetivamente registra)
+        if caminho == "/api/bater_ponto":
+            cpf = formatar_cpf(dados.get("cpf", ""))
+            tipo = dados.get("tipo", "ENTRADA")
+            qr_code = dados.get("qr_code", "")
+            justificativa = dados.get("justificativa", "")
+            
+            if qr_code != SEGREDO_QR:
+                responder_json(self, {"detail": "QR Code inválido!"}, status=400)
+                return
+            
+            if tipo not in TIPOS_REGISTRO:
+                responder_json(self, {"detail": "Tipo de registro inválido!"}, status=400)
+                return
+            
+            if len(cpf) != 11:
+                responder_json(self, {"detail": "CPF inválido! Deve ter 11 dígitos."}, status=400)
+                return
+            
+            try:
+                conn = get_db()
+                func = conn.execute("SELECT * FROM funcionarios WHERE cpf = ?", (cpf,)).fetchone()
+                
+                if not func:
+                    conn.close()
+                    responder_json(self, {"detail": "CPF não cadastrado! Procure o administrador."}, status=404)
+                    return
+                
+                agora = datetime.now()
+                data_str = agora.strftime("%Y-%m-%d")
                 data_hora_str = agora.strftime("%Y-%m-%d %H:%M:%S")
                 hora_str = agora.strftime("%H:%M:%S")
                 
-                # Verifica atraso baseado no tipo de registro
+                # Verifica sequencia de registros NOVAMENTE (seguranca)
+                ultimo = obter_ultimo_registro(func["id"], data_str)
+                ultimo_tipo = ultimo["tipo"] if ultimo else None
+                
+                valido, msg_erro = verificar_sequencia_valida(ultimo_tipo, tipo)
+                if not valido:
+                    conn.close()
+                    responder_json(self, {"detail": "⛔ " + msg_erro}, status=400)
+                    return
+                
+                # Calcula atraso e minutos
                 atrasado = 0
+                minutos = 0
+                
                 if tipo == "ENTRADA":
                     atrasado = 1 if verificar_atraso(hora_str, func["horario_entrada"]) else 0
+                    if atrasado:
+                        minutos = calcular_minutos_atraso(hora_str, func["horario_entrada"])
                 elif tipo == "SAIDA_ALMOCO":
-                    # Para saída almoço: NÃO é atrasado se sair no horário ou depois
-                    # Só é "problema" se sair ANTES, mas não contamos como atraso
                     atrasado = 0
                 elif tipo == "RETORNO_ALMOCO":
                     atrasado = 1 if verificar_atraso(hora_str, func["horario_retorno_almoco"]) else 0
+                    if atrasado:
+                        minutos = calcular_minutos_atraso(hora_str, func["horario_retorno_almoco"])
                 elif tipo == "SAIDA":
-                    # Para saída: só é atrasado se sair ANTES do horário (sair mais cedo)
-                    # Usamos a lógica inversa: verifica se horário padrão > hora registro
                     atrasado = 1 if verificar_atraso(func["horario_saida"], hora_str) else 0
+                    if atrasado:
+                        minutos = calcular_minutos_atraso(func["horario_saida"], hora_str, invertido=True)
                 
                 conn.execute("""
-                    INSERT INTO registros_ponto (funcionario_id, data_hora, tipo, atrasado)
-                    VALUES (?, ?, ?, ?)
-                """, (func["id"], data_hora_str, tipo, atrasado))
+                    INSERT INTO registros_ponto (funcionario_id, data_hora, tipo, atrasado, minutos_atraso, justificativa)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (func["id"], data_hora_str, tipo, atrasado, minutos, justificativa))
                 conn.commit()
                 conn.close()
                 
                 tipo_info = TIPOS_REGISTRO[tipo]
-                msg = f"{tipo_info['icone']} {tipo_info['label']} registrada!\n"
+                msg = f"{tipo_info['icone']} {tipo_info['label']} registrada com sucesso!\n"
                 msg += f"👤 Funcionário: {func['nome']}\n"
                 msg += f"📅 Data: {agora.strftime('%d/%m/%Y')}\n"
                 msg += f"⏰ Hora: {hora_str}"
                 if atrasado:
-                    msg += "\n⚠️ ATENÇÃO: Atraso detectado!"
+                    msg += f"\n⚠️ ATENÇÃO: Atraso de {minutos} minuto(s) detectado!"
+                if justificativa:
+                    msg += f"\n📝 Justificativa registrada."
                 
                 responder_json(self, {"mensagem": msg})
             except Exception as e:
@@ -984,6 +1302,148 @@ class ServidorPonto(BaseHTTPRequestHandler):
         responder_json(self, {"detail": "Rota não encontrada"}, status=404)
 
 # ===================== GERAÇÃO DE PDF =====================
+def desenhar_pagina_funcionario(c, func, registros, mes, dias_semana, altura, largura, colors):
+    # Cabeçalho roxo
+    c.setFillColor(colors.HexColor("#667eea"))
+    c.rect(0, altura - 80, largura, 80, fill=True, stroke=False)
+    c.setFillColor(colors.white)
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(40, altura - 50, "RELATÓRIO DE FOLHA PONTO")
+    c.setFont("Helvetica", 10)
+    c.drawString(40, altura - 68, "Mês/Ano: " + mes)
+    
+    # Dados funcionário
+    y = altura - 110
+    c.setFillColor(colors.black)
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(40, y, "Funcionário: " + func["nome"])
+    y -= 18
+    c.setFont("Helvetica", 9)
+    c.drawString(40, y, "CPF: " + func["cpf"])
+    c.drawString(200, y, "Entrada: " + func["horario_entrada"])
+    c.drawString(340, y, "Saída Almoço: " + func["horario_saida_almoco"])
+    y -= 14
+    c.drawString(200, y, "Retorno: " + func["horario_retorno_almoco"])
+    c.drawString(340, y, "Saída: " + func["horario_saida"])
+    y -= 25
+    
+    # Cabeçalho tabela
+    c.setFont("Helvetica-Bold", 8)
+    c.setFillColor(colors.HexColor("#f0f0f0"))
+    c.rect(40, y - 14, largura - 80, 18, fill=True, stroke=False)
+    c.setFillColor(colors.black)
+    c.drawString(48, y - 9, "DATA")
+    c.drawString(110, y - 9, "HORA")
+    c.drawString(175, y - 9, "TIPO")
+    c.drawString(270, y - 9, "ATRASO")
+    c.drawString(325, y - 9, "MIN.")
+    c.drawString(370, y - 9, "DIA SEMANA")
+    c.drawString(450, y - 9, "JUSTIFICATIVA")
+    y -= 32
+    
+    c.setFont("Helvetica", 8)
+    contagem = {"ENTRADA": 0, "SAIDA_ALMOCO": 0, "RETORNO_ALMOCO": 0, "SAIDA": 0}
+    total_atrasos = 0
+    total_minutos_atraso = 0
+    
+    for reg in registros:
+        if y < 100:
+            c.showPage()
+            y = altura - 50
+            c.setFont("Helvetica", 8)
+        
+        dh = datetime.strptime(reg["data_hora"], "%Y-%m-%d %H:%M:%S")
+        data = dh.strftime("%d/%m/%Y")
+        hora = dh.strftime("%H:%M:%S")
+        dia_semana = dias_semana[dh.weekday()]
+        tipo_fmt = reg["tipo"].replace("_", " ")
+        
+        c.drawString(48, y, data)
+        c.drawString(110, y, hora)
+        
+        if reg["tipo"] == "ENTRADA":
+            c.setFillColor(colors.HexColor("#4CAF50"))
+        elif reg["tipo"] == "SAIDA_ALMOCO":
+            c.setFillColor(colors.HexColor("#ff9800"))
+        elif reg["tipo"] == "RETORNO_ALMOCO":
+            c.setFillColor(colors.HexColor("#2196F3"))
+        else:
+            c.setFillColor(colors.HexColor("#f44336"))
+        
+        contagem[reg["tipo"]] += 1
+        c.drawString(175, y, tipo_fmt)
+        c.setFillColor(colors.black)
+        
+        if reg["atrasado"]:
+            c.setFillColor(colors.HexColor("#f44336"))
+            c.drawString(270, y, "SIM")
+            c.setFillColor(colors.black)
+            total_atrasos += 1
+        else:
+            c.drawString(270, y, "Não")
+        
+        minutos = reg["minutos_atraso"] or 0
+        if minutos > 0:
+            c.setFillColor(colors.HexColor("#f44336"))
+            c.drawString(325, y, str(minutos) + " min")
+            c.setFillColor(colors.black)
+            total_minutos_atraso += minutos
+        else:
+            c.drawString(325, y, "-")
+        
+        c.drawString(370, y, dia_semana)
+        
+        justificativa = reg["justificativa"] or ""
+        if justificativa:
+            c.setFillColor(colors.HexColor("#666666"))
+            # Trunca justificativa longa
+            if len(justificativa) > 55:
+                justificativa = justificativa[:52] + "..."
+            c.drawString(450, y, justificativa)
+            c.setFillColor(colors.black)
+        
+        y -= 14
+    
+    # Resumo
+    if y < 180:
+        c.showPage()
+        y = altura - 50
+    
+    y -= 10
+    c.setFillColor(colors.HexColor("#f5f5f5"))
+    c.rect(40, y - 85, largura - 80, 95, fill=True, stroke=False)
+    c.setFillColor(colors.black)
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(50, y - 15, "📊 RESUMO DO MÊS:")
+    c.setFont("Helvetica", 9)
+    c.drawString(50, y - 35, "Total de registros: " + str(len(registros)))
+    c.drawString(200, y - 35, "✅ Entradas: " + str(contagem["ENTRADA"]))
+    c.drawString(330, y - 35, "🍽️ Saída Almoço: " + str(contagem["SAIDA_ALMOCO"]))
+    c.drawString(50, y - 50, "↩️ Retorno Almoço: " + str(contagem["RETORNO_ALMOCO"]))
+    c.drawString(200, y - 50, "🚪 Saídas: " + str(contagem["SAIDA"]))
+    c.drawString(330, y - 50, "⚠️ Total de atrasos: " + str(total_atrasos))
+    c.drawString(50, y - 65, "⏱️ Total de minutos atrasados: " + str(total_minutos_atraso) + " min")
+    
+    # Espaço para assinatura
+    y -= 100
+    c.setFillColor(colors.black)
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(40, y, "_______________________________________________________")
+    y -= 15
+    c.setFont("Helvetica", 9)
+    c.drawString(40, y, "Assinatura do Funcionário: ___________________________")
+    y -= 15
+    c.drawString(40, y, "Data: ____/____/__________")
+    
+    y -= 40
+    c.drawString(300, y, "_______________________________________________________")
+    y -= 15
+    c.drawString(300, y, "Assinatura do Responsável: ___________________________")
+    y -= 15
+    c.drawString(300, y, "Data: ____/____/__________")
+    
+    c.showPage()
+
 def gerar_pdf_geral(mes):
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
@@ -1047,111 +1507,10 @@ def gerar_pdf_individual(func_id, mes):
     buffer.seek(0)
     return buffer
 
-def desenhar_pagina_funcionario(c, func, registros, mes, dias_semana, altura, largura, colors):
-    # Cabeçalho
-    c.setFillColor(colors.HexColor("#667eea"))
-    c.rect(0, altura - 80, largura, 80, fill=True, stroke=False)
-    c.setFillColor(colors.white)
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(40, altura - 50, "RELATÓRIO DE FOLHA PONTO")
-    c.setFont("Helvetica", 10)
-    c.drawString(40, altura - 68, "Mês/Ano: " + mes)
-    
-    # Dados funcionário
-    y = altura - 110
-    c.setFillColor(colors.black)
-    c.setFont("Helvetica-Bold", 13)
-    c.drawString(40, y, "Funcionário: " + func["nome"])
-    y -= 18
-    c.setFont("Helvetica", 9)
-    c.drawString(40, y, "CPF: " + func["cpf"])
-    c.drawString(200, y, "Entrada: " + func["horario_entrada"])
-    c.drawString(320, y, "Saída Almoço: " + func["horario_saida_almoco"])
-    y -= 14
-    c.drawString(200, y, "Retorno: " + func["horario_retorno_almoco"])
-    c.drawString(320, y, "Saída: " + func["horario_saida"])
-    y -= 25
-    
-    # Cabeçalho tabela
-    c.setFont("Helvetica-Bold", 9)
-    c.setFillColor(colors.HexColor("#f0f0f0"))
-    c.rect(40, y - 14, largura - 80, 18, fill=True, stroke=False)
-    c.setFillColor(colors.black)
-    c.drawString(50, y - 9, "DATA")
-    c.drawString(130, y - 9, "HORA EXATA")
-    c.drawString(220, y - 9, "TIPO")
-    c.drawString(350, y - 9, "ATRASO")
-    c.drawString(440, y - 9, "DIA SEMANA")
-    y -= 32
-    
-    c.setFont("Helvetica", 9)
-    contagem = {"ENTRADA": 0, "SAIDA_ALMOCO": 0, "RETORNO_ALMOCO": 0, "SAIDA": 0}
-    total_atrasos = 0
-    
-    for reg in registros:
-        if y < 80:
-            c.showPage()
-            y = altura - 50
-            c.setFont("Helvetica", 9)
-        
-        dh = datetime.strptime(reg["data_hora"], "%Y-%m-%d %H:%M:%S")
-        data = dh.strftime("%d/%m/%Y")
-        hora = dh.strftime("%H:%M:%S")
-        dia_semana = dias_semana[dh.weekday()]
-        tipo_fmt = reg["tipo"].replace("_", " ")
-        
-        c.drawString(50, y, data)
-        c.drawString(130, y, hora)
-        
-        if reg["tipo"] == "ENTRADA":
-            c.setFillColor(colors.HexColor("#4CAF50"))
-        elif reg["tipo"] == "SAIDA_ALMOCO":
-            c.setFillColor(colors.HexColor("#ff9800"))
-        elif reg["tipo"] == "RETORNO_ALMOCO":
-            c.setFillColor(colors.HexColor("#2196F3"))
-        else:
-            c.setFillColor(colors.HexColor("#f44336"))
-        
-        contagem[reg["tipo"]] += 1
-        c.drawString(220, y, tipo_fmt)
-        c.setFillColor(colors.black)
-        
-        if reg["atrasado"]:
-            c.setFillColor(colors.HexColor("#f44336"))
-            c.drawString(350, y, "SIM")
-            c.setFillColor(colors.black)
-            total_atrasos += 1
-        else:
-            c.drawString(350, y, "Não")
-        
-        c.drawString(440, y, dia_semana)
-        y -= 16
-    
-    # Resumo
-    if y < 120:
-        c.showPage()
-        y = altura - 50
-    
-    y -= 10
-    c.setFillColor(colors.HexColor("#f5f5f5"))
-    c.rect(40, y - 55, largura - 80, 65, fill=True, stroke=False)
-    c.setFillColor(colors.black)
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(50, y - 15, "📊 RESUMO DO MÊS:")
-    c.setFont("Helvetica", 9)
-    c.drawString(50, y - 35, "Total: " + str(len(registros)) + " registros")
-    c.drawString(160, y - 35, "✅ Entradas: " + str(contagem["ENTRADA"]))
-    c.drawString(270, y - 35, "🍽️ Saída Almoço: " + str(contagem["SAIDA_ALMOCO"]))
-    c.drawString(50, y - 50, "↩️ Retorno: " + str(contagem["RETORNO_ALMOCO"]))
-    c.drawString(160, y - 50, "🚪 Saídas: " + str(contagem["SAIDA"]))
-    c.drawString(270, y - 50, "⚠️ Atrasos: " + str(total_atrasos))
-    
-    c.showPage()
-
 # ===================== INICIAR SERVIDOR =====================
 if __name__ == "__main__":
     print("=" * 65)
-    print("   🚀 SISTEMA DE PONTO v2.1 - FUNCIONANDO!")
+    print("   🚀 SISTEMA DE PONTO v2.2 - FUNCIONANDO!")
     print("=" * 65)
     print(f"📱 Página do funcionário:  http://localhost:{PORTA}")
     print(f"🔐 Login Admin:            http://localhost:{PORTA}/admin")
@@ -1159,6 +1518,13 @@ if __name__ == "__main__":
     print("=" * 65)
     print("📝 4 opções de registro:")
     print("   ✅ ENTRADA  |  🍽️ SAÍDA ALMOÇO  |  ↩️ RETORNO ALMOÇO  |  🚪 SAÍDA")
+    print("=" * 65)
+    print("✨ NOVAS FUNCIONALIDADES v2.2:")
+    print("   • Controle de sequência (não duplica registros)")
+    print("   • Cálculo exato de minutos de atraso")
+    print("   • Modal de justificativa para atrasos")
+    print("   • Relatório PDF com justificativas e assinatura")
+    print("   • Suporte a logo da clínica")
     print("=" * 65)
     print("🌐 Acesso na rede WI-FI: http://SEU_IP:8000")
     print("   (descubra seu IP com o comando: ipconfig)")
