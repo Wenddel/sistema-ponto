@@ -680,7 +680,7 @@ Tamanho recomendado: 200x200 pixels. A imagem aparecerá automaticamente na tela
 <h3 style="margin-bottom:10px;">🔐 Login de Admin atual</h3>
 <p style="font-size:14px;">
 <strong>Usuário:</strong> admin<br>
-<strong>Senha:</strong> admin123<br>
+<strong>Senha:</strong> ronte314<br>
 <small style="color:#666;">(Altere no início do arquivo sistema_ponto.py)</small>
 </p>
 </div>
