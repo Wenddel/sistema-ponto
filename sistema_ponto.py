@@ -10,7 +10,7 @@ from urllib.parse import urlparse, parse_qs
 
 # ===================== CONFIGURACOES =====================
 SEGREDO_QR = "CLINICA_PONTO_2024"
-PORTA = 8000
+PORTA = int(os.environ.get("PORT", 8000))
 ADMIN_USUARIO = "admin"
 ADMIN_SENHA = "admin123"
 sessoes_admin = {}
