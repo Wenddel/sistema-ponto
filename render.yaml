@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: sistema-ponto-clinica
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python sistema_ponto.py"
+    envVars:
+      - key: PORT
+        value: "10000"
