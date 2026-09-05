@@ -20,7 +20,8 @@ def criar_logo_padrao():
     """Cria uma logo padrao automaticamente se nao existir."""
     caminho_logo = os.path.join("static", "logo.png")
     if os.path.exists(caminho_logo):
-        print(f"[LOGO] Logo encontrada em: {caminho_logo}")
+        tamanho = os.path.getsize(caminho_logo)
+        print(f"[LOGO] Encontrada: {caminho_logo} ({tamanho} bytes)")
         return True
     
     try:
@@ -43,14 +44,14 @@ def criar_logo_padrao():
         draw.text((70, 192), "PONTO", fill='#667eea', font=font_pequena)
         
         img.save(caminho_logo, "PNG")
-        print(f"[LOGO] Logo padrao criada em: {caminho_logo}")
+        print(f"[LOGO] Padrao criada: {caminho_logo}")
         print("[LOGO] Dica: Substitua static/logo.png pela logo da sua clinica!")
         return True
     except ImportError:
         print("[LOGO] Pillow nao instalado. Instale: pip install pillow")
         return False
     except Exception as e:
-        print(f"[LOGO] Erro ao criar logo: {e}")
+        print(f"[LOGO] Erro: {e}")
         return False
 
 # ===================== BANCO DE DADOS =====================
@@ -82,20 +83,23 @@ def init_db():
             tipo TEXT NOT NULL,
             atrasado INTEGER DEFAULT 0,
             minutos_atraso INTEGER DEFAULT 0,
+            minutos_banco_horas INTEGER DEFAULT 0,
             justificativa TEXT DEFAULT '',
             FOREIGN KEY (funcionario_id) REFERENCES funcionarios(id) ON DELETE CASCADE
         )
     """)
-    try:
-        conn.execute("ALTER TABLE registros_ponto ADD COLUMN minutos_atraso INTEGER DEFAULT 0")
-        print("[MIGRACAO] Coluna minutos_atraso adicionada")
-    except:
-        pass
-    try:
-        conn.execute("ALTER TABLE registros_ponto ADD COLUMN justificativa TEXT DEFAULT ''")
-        print("[MIGRACAO] Coluna justificativa adicionada")
-    except:
-        pass
+    # Migracoes para bancos antigos
+    migracoes = [
+        ("minutos_atraso", "INTEGER DEFAULT 0"),
+        ("minutos_banco_horas", "INTEGER DEFAULT 0"),
+        ("justificativa", "TEXT DEFAULT ''")
+    ]
+    for coluna, tipo in migracoes:
+        try:
+            conn.execute(f"ALTER TABLE registros_ponto ADD COLUMN {coluna} {tipo}")
+            print(f"[MIGRACAO] Coluna {coluna} adicionada")
+        except:
+            pass
     conn.commit()
     conn.close()
 
@@ -107,6 +111,7 @@ def formatar_cpf(cpf):
     return ''.join(filter(str.isdigit, str(cpf)))
 
 def verificar_atraso(hora_registro, horario_padrao):
+    """Verifica se hora_registro > horario_padrao (atrasado)."""
     try:
         h_r = hora_registro.split(":")
         h_p = horario_padrao.split(":")
@@ -116,17 +121,53 @@ def verificar_atraso(hora_registro, horario_padrao):
     except:
         return False
 
-def calcular_minutos_atraso(hora_registro, horario_padrao, invertido=False):
+def calcular_minutos(hora1, hora2):
+    """Calcula diferenca em minutos entre duas horas (absoluta)."""
+    try:
+        h1 = hora1.split(":")
+        h2 = hora2.split(":")
+        t1 = int(h1[0]) * 3600 + int(h1[1]) * 60 + (int(h1[2]) if len(h1) > 2 else 0)
+        t2 = int(h2[0]) * 3600 + int(h2[1]) * 60 + (int(h2[2]) if len(h2) > 2 else 0)
+        return abs(t1 - t2) // 60
+    except:
+        return 0
+
+def calcular_banco_horas(tipo, hora_registro, func):
+    """Calcula minutos de banco de horas (horas extras trabalhadas).
+    Retorna minutos positivos se houve banco de horas."""
     try:
         h_r = hora_registro.split(":")
-        h_p = horario_padrao.split(":")
         t_r = int(h_r[0]) * 3600 + int(h_r[1]) * 60 + (int(h_r[2]) if len(h_r) > 2 else 0)
-        t_p = int(h_p[0]) * 3600 + int(h_p[1]) * 60 + (int(h_p[2]) if len(h_p) > 2 else 0)
-        if invertido:
-            diff = t_p - t_r
-        else:
-            diff = t_r - t_p
-        return max(0, diff // 60)
+        
+        if tipo == "ENTRADA":
+            # Banco de horas: entrou ANTES do horario
+            h_p = func["horario_entrada"].split(":")
+            t_p = int(h_p[0]) * 3600 + int(h_p[1]) * 60 + (int(h_p[2]) if len(h_p) > 2 else 0)
+            if t_r < t_p:
+                return (t_p - t_r) // 60
+        
+        elif tipo == "SAIDA_ALMOCO":
+            # Banco de horas: saiu DEPOIS do horario (trabalhou mais)
+            h_p = func["horario_saida_almoco"].split(":")
+            t_p = int(h_p[0]) * 3600 + int(h_p[1]) * 60 + (int(h_p[2]) if len(h_p) > 2 else 0)
+            if t_r > t_p:
+                return (t_r - t_p) // 60
+        
+        elif tipo == "RETORNO_ALMOCO":
+            # Banco de horas: voltou ANTES do horario
+            h_p = func["horario_retorno_almoco"].split(":")
+            t_p = int(h_p[0]) * 3600 + int(h_p[1]) * 60 + (int(h_p[2]) if len(h_p) > 2 else 0)
+            if t_r < t_p:
+                return (t_p - t_r) // 60
+        
+        elif tipo == "SAIDA":
+            # Banco de horas: saiu DEPOIS do horario
+            h_p = func["horario_saida"].split(":")
+            t_p = int(h_p[0]) * 3600 + int(h_p[1]) * 60 + (int(h_p[2]) if len(h_p) > 2 else 0)
+            if t_r > t_p:
+                return (t_r - t_p) // 60
+        
+        return 0
     except:
         return 0
 
@@ -155,13 +196,13 @@ def verificar_sequencia_valida(ultimo_tipo, novo_tipo):
         return True, ""
     
     mensagens = {
-        "ENTRADA": "Voce ja registrou ENTRADA hoje. O proximo registro deve ser SAIDA ALMOCO ou SAIDA.",
-        "SAIDA_ALMOCO": "Voce ja registrou SAIDA ALMOCO. O proximo registro deve ser RETORNO ALMOCO.",
-        "RETORNO_ALMOCO": "Voce ja registrou RETORNO ALMOCO. O proximo registro deve ser SAIDA.",
-        "SAIDA": "Voce ja registrou SAIDA hoje. Uma nova ENTRADA so pode ser registrada no proximo dia util."
+        "ENTRADA": "Voce ja registrou ENTRADA hoje. Proximo: SAIDA ALMOCO ou SAIDA.",
+        "SAIDA_ALMOCO": "Voce ja registrou SAIDA ALMOCO. Proximo: RETORNO ALMOCO.",
+        "RETORNO_ALMOCO": "Voce ja registrou RETORNO ALMOCO. Proximo: SAIDA.",
+        "SAIDA": "Voce ja registrou SAIDA hoje. Nova ENTRADA so amanha."
     }
     
-    return False, mensagens.get(ultimo_tipo, f"Registro de {novo_tipo.replace('_', ' ')} nao permitido agora.")
+    return False, mensagens.get(ultimo_tipo, "Registro nao permitido agora.")
 
 def gerar_sessao():
     return hashlib.sha256(os.urandom(64)).hexdigest()
@@ -242,7 +283,7 @@ body { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height
 <body>
 <div class="login-box">
 <div class="logo-container">
-<img src="/static/logo.png" alt="Logo" class="logo" onerror="this.outerHTML='<div class=\\'logo-fallback\\'>🏥</div>'">
+<img src="/static/logo.png?t=TIMESTAMP" alt="Logo" class="logo" onerror="this.outerHTML='<div class=\\'logo-fallback\\'>🏥</div>'">
 </div>
 <h1>🔐 Login Admin</h1>
 <p class="sub">Acesso ao painel administrativo</p>
@@ -253,46 +294,30 @@ body { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height
 <a href="/" class="voltar">← Voltar para o registro de ponto</a>
 </div>
 <script>
-document.getElementById('senha').addEventListener('keypress', function(e) {
-    if(e.key === 'Enter') logar();
+// Atualiza timestamp da logo para evitar cache
+document.querySelectorAll('img[src*="logo.png"]').forEach(function(img) {
+    img.src = img.src.replace('TIMESTAMP', Date.now());
 });
-document.getElementById('usuario').addEventListener('keypress', function(e) {
-    if(e.key === 'Enter') document.getElementById('senha').focus();
-});
+document.getElementById('senha').addEventListener('keypress', function(e) { if(e.key === 'Enter') logar(); });
+document.getElementById('usuario').addEventListener('keypress', function(e) { if(e.key === 'Enter') document.getElementById('senha').focus(); });
 document.getElementById('usuario').focus();
 async function logar() {
     const usuario = document.getElementById('usuario').value.trim();
     const senha = document.getElementById('senha').value;
     const msg = document.getElementById('mensagem');
-    
-    if(!usuario || !senha) {
-        msg.textContent = 'Preencha usuário e senha!';
-        msg.className = 'mensagem erro';
-        return;
-    }
-    
+    if(!usuario || !senha) { msg.textContent = 'Preencha usuário e senha!'; msg.className = 'mensagem erro'; return; }
     try {
         const res = await fetch('/api/login', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
+            method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({usuario: usuario, senha: senha})
         });
-        
-        if(res.ok) {
-            window.location.href = '/admin';
-        } else {
-            const err = await res.json();
-            msg.textContent = err.detail || 'Erro ao fazer login';
-            msg.className = 'mensagem erro';
-        }
-    } catch(e) {
-        msg.textContent = 'Erro de conexão com o servidor!';
-        msg.className = 'mensagem erro';
-    }
+        if(res.ok) { window.location.href = '/admin'; }
+        else { const err = await res.json(); msg.textContent = err.detail || 'Erro'; msg.className = 'mensagem erro'; }
+    } catch(e) { msg.textContent = 'Erro de conexão!'; msg.className = 'mensagem erro'; }
 }
 </script>
 </body>
-</html>"""
+</html>""".replace('TIMESTAMP', str(int(datetime.now().timestamp())))
 
 # ===================== HTML - PAGINA PRINCIPAL (PONTO) =====================
 HTML_PONTO = """<!DOCTYPE html>
@@ -326,6 +351,7 @@ body { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height
 .mensagem { padding: 14px; border-radius: 8px; margin-top: 18px; font-size: 14px; font-weight: bold; white-space: pre-line; line-height: 1.5; display: none; }
 .sucesso { background: #d4edda; color: #155724; display: block; }
 .erro { background: #f8d7da; color: #721c24; display: block; }
+.banco-horas { background: #d1ecf1; color: #0c5460; display: block; }
 .admin-link { margin-top: 20px; padding-top: 15px; border-top: 1px solid #eee; }
 .admin-link a { color: #888; font-size: 12px; text-decoration: none; }
 .admin-link a:hover { color: #667eea; text-decoration: underline; }
@@ -346,7 +372,7 @@ body { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height
 <body>
 <div class="container">
 <div class="logo-container">
-<img src="/static/logo.png" alt="Logo Clínica" class="logo" onerror="this.outerHTML='<div class=\\'logo-fallback\\'>🏥</div>'">
+<img src="/static/logo.png?t=TS_LOGO" alt="Logo Clínica" class="logo" onerror="this.outerHTML='<div class=\\'logo-fallback\\'>🏥</div>'">
 </div>
 <h1>Registro de Ponto</h1>
 <p class="subtitulo">Clínica - Controle de Funcionários</p>
@@ -381,6 +407,11 @@ body { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height
 const QR_SEGREDO = "CLINICA_PONTO_2024";
 let registroPendente = null;
 
+// Anti-cache logo
+document.querySelectorAll('img[src*="logo.png"]').forEach(function(img) {
+    img.src = img.src.replace('TS_LOGO', Date.now());
+});
+
 function atualizarDataHora() {
     const agora = new Date();
     const opcoes = { weekday: 'long', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' };
@@ -389,9 +420,7 @@ function atualizarDataHora() {
 setInterval(atualizarDataHora, 1000);
 atualizarDataHora();
 
-document.getElementById('cpf').addEventListener('input', function() {
-    this.value = this.value.replace(/\\D/g, '');
-});
+document.getElementById('cpf').addEventListener('input', function() { this.value = this.value.replace(/\\D/g, ''); });
 
 document.getElementById('cpf').addEventListener('blur', async function() {
     const cpf = this.value.replace(/\\D/g, '');
@@ -402,41 +431,27 @@ document.getElementById('cpf').addEventListener('blur', async function() {
             const dados = await res.json();
             if (dados.encontrado) {
                 info.textContent = '👤 ' + dados.nome;
-                info.style.background = '#e8f5e9';
-                info.style.color = '#2e7d32';
-                info.style.display = 'block';
+                info.style.background = '#e8f5e9'; info.style.color = '#2e7d32'; info.style.display = 'block';
             } else {
-                info.textContent = '⚠️ CPF NÃO cadastrado! Procure o administrador.';
-                info.style.background = '#fff3cd';
-                info.style.color = '#856404';
-                info.style.display = 'block';
+                info.textContent = '⚠️ CPF NÃO cadastrado!';
+                info.style.background = '#fff3cd'; info.style.color = '#856404'; info.style.display = 'block';
             }
         } catch(e) { info.style.display = 'none'; }
-    } else {
-        info.style.display = 'none';
-    }
+    } else { info.style.display = 'none'; }
 });
 
 async function registrar(tipo) {
     const cpf = document.getElementById('cpf').value.replace(/\\D/g, '');
-    if (!cpf || cpf.length !== 11) {
-        mostrarMensagem('Digite um CPF válido com 11 números!', 'erro');
-        return;
-    }
+    if (!cpf || cpf.length !== 11) { mostrarMensagem('Digite um CPF válido com 11 números!', 'erro'); return; }
     
     try {
         const res = await fetch('/api/verificar_ponto', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
+            method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({cpf: cpf, tipo: tipo, qr_code: QR_SEGREDO})
         });
-        
         const dados = await res.json();
         
-        if (!res.ok) {
-            mostrarMensagem(dados.detail || 'Erro ao verificar', 'erro');
-            return;
-        }
+        if (!res.ok) { mostrarMensagem(dados.detail || 'Erro', 'erro'); return; }
         
         if (dados.precisa_justificativa) {
             registroPendente = { cpf: cpf, tipo: tipo };
@@ -448,9 +463,7 @@ async function registrar(tipo) {
         } else {
             await executarRegistro(cpf, tipo, '');
         }
-    } catch(e) {
-        mostrarMensagem('Erro de conexão! Verifique a rede Wi-Fi.', 'erro');
-    }
+    } catch(e) { mostrarMensagem('Erro de conexão!', 'erro'); }
 }
 
 function fecharModal() {
@@ -461,11 +474,7 @@ function fecharModal() {
 async function confirmarComJustificativa() {
     if (!registroPendente) return;
     const justificativa = document.getElementById('justificativa').value.trim();
-    if (!justificativa) {
-        alert('Por favor, informe a justificativa!');
-        document.getElementById('justificativa').focus();
-        return;
-    }
+    if (!justificativa) { alert('Informe a justificativa!'); document.getElementById('justificativa').focus(); return; }
     fecharModal();
     await executarRegistro(registroPendente.cpf, registroPendente.tipo, justificativa);
 }
@@ -473,23 +482,21 @@ async function confirmarComJustificativa() {
 async function executarRegistro(cpf, tipo, justificativa) {
     try {
         const res = await fetch('/api/bater_ponto', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
+            method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({ cpf: cpf, tipo: tipo, qr_code: QR_SEGREDO, justificativa: justificativa })
         });
-        
         const dados = await res.json();
         
         if (res.ok) {
-            mostrarMensagem(dados.mensagem, 'sucesso');
+            let tipoMsg = 'sucesso';
+            if (dados.mensagem.includes('Banco')) tipoMsg = 'banco-horas';
+            mostrarMensagem(dados.mensagem, tipoMsg);
             document.getElementById('cpf').value = '';
             document.getElementById('infoFunc').style.display = 'none';
         } else {
-            mostrarMensagem(dados.detail || 'Erro ao registrar', 'erro');
+            mostrarMensagem(dados.detail || 'Erro', 'erro');
         }
-    } catch(e) {
-        mostrarMensagem('Erro de conexão com o servidor!', 'erro');
-    }
+    } catch(e) { mostrarMensagem('Erro de conexão!', 'erro'); }
 }
 
 function mostrarMensagem(texto, tipo) {
@@ -504,7 +511,7 @@ document.getElementById('modalJustificativa').addEventListener('click', function
 });
 </script>
 </body>
-</html>"""
+</html>""".replace('TS_LOGO', str(int(datetime.now().timestamp())))
 
 # ===================== HTML - PAINEL ADMIN =====================
 HTML_ADMIN = """<!DOCTYPE html>
@@ -523,7 +530,7 @@ body { background: #f5f5f5; }
 .header h1 { font-size: 22px; }
 .logout { position: absolute; right: 20px; top: 50%; transform: translateY(-50%); background: rgba(255,255,255,0.2); padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; border: 1px solid rgba(255,255,255,0.3); }
 .logout:hover { background: rgba(255,255,255,0.3); }
-.container { max-width: 1150px; margin: 20px auto; padding: 0 20px; }
+.container { max-width: 1200px; margin: 20px auto; padding: 0 20px; }
 .tabs { display: flex; gap: 5px; margin-bottom: 20px; flex-wrap: wrap; }
 .tab { padding: 12px 18px; background: #ddd; border: none; border-radius: 8px 8px 0 0; cursor: pointer; font-weight: bold; font-size: 13px; }
 .tab.ativo { background: white; color: #667eea; }
@@ -541,6 +548,7 @@ table { width: 100%; border-collapse: collapse; margin-top: 15px; display: block
 th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #eee; font-size: 13px; white-space: nowrap; }
 th { background: #f8f9fa; font-weight: bold; color: #555; }
 .atrasado { color: #f44336; font-weight: bold; }
+.banco-horas { color: #0c5460; font-weight: bold; }
 .tipo-entrada { color: #4CAF50; font-weight: bold; }
 .tipo-saida-almoco { color: #ff9800; font-weight: bold; }
 .tipo-retorno-almoco { color: #2196F3; font-weight: bold; }
@@ -554,8 +562,9 @@ th { background: #f8f9fa; font-weight: bold; color: #555; }
 .card { background: #fafafa; padding: 15px; border-radius: 8px; margin: 10px 0; border-left: 4px solid #667eea; }
 .horarios-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .info-box { background: #fff3cd; border-left: 4px solid #ffc107; padding: 12px; border-radius: 4px; margin: 15px 0; font-size: 13px; color: #856404; }
-.justificativa-cell { max-width: 200px; font-size: 11px; color: #666; font-style: italic; overflow: hidden; text-overflow: ellipsis; }
+.justificativa-cell { max-width: 180px; font-size: 11px; color: #666; font-style: italic; overflow: hidden; text-overflow: ellipsis; }
 .minutos-cell { color: #f44336; font-weight: bold; }
+.banco-cell { color: #0c5460; font-weight: bold; }
 .filtros { display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap; align-items: center; }
 .filtros input, .filtros select { margin: 0; width: auto; min-width: 150px; }
 label { font-size: 13px; color: #555; font-weight: bold; display: block; margin-top: 8px; }
@@ -564,7 +573,7 @@ label { font-size: 13px; color: #555; font-weight: bold; display: block; margin-
 <body>
 <div class="header">
 <div class="header-content">
-<img src="/static/logo.png" alt="Logo" class="logo-header" onerror="this.outerHTML='<div class=\\'logo-header-fallback\\'>🏥</div>'">
+<img src="/static/logo.png?t=TS_ADMIN" alt="Logo" class="logo-header" onerror="this.outerHTML='<div class=\\'logo-header-fallback\\'>🏥</div>'">
 <h1>⚙️ Painel Administrativo</h1>
 </div>
 <div class="logout" onclick="sair()">🚪 Sair</div>
@@ -598,7 +607,7 @@ label { font-size: 13px; color: #555; font-weight: bold; display: block; margin-
 <div id="funcionarios" class="painel">
 <h2>Funcionários Cadastrados</h2>
 <button onclick="carregarFuncionarios()">🔄 Atualizar Lista</button>
-<table><thead><tr><th>ID</th><th>Nome</th><th>CPF</th><th>Entrada</th><th>Saída Almoço</th><th>Retorno Almoço</th><th>Saída</th><th>Ação</th></tr></thead><tbody id="tbodyFunc"></tbody></table>
+<table><thead><tr><th>ID</th><th>Nome</th><th>CPF</th><th>Entrada</th><th>Saída Almoço</th><th>Retorno</th><th>Saída</th><th>Ação</th></tr></thead><tbody id="tbodyFunc"></tbody></table>
 </div>
 
 <div id="registros" class="painel">
@@ -614,7 +623,7 @@ label { font-size: 13px; color: #555; font-weight: bold; display: block; margin-
 </select>
 <button onclick="carregarRegistros()">🔄 Atualizar</button>
 </div>
-<table><thead><tr><th>Funcionário</th><th>CPF</th><th>Data</th><th>Hora</th><th>Tipo</th><th>Atrasado</th><th>Min. Atraso</th><th>Justificativa</th></tr></thead><tbody id="tbodyReg"></tbody></table>
+<table><thead><tr><th>Funcionário</th><th>CPF</th><th>Data</th><th>Hora</th><th>Tipo</th><th>Atrasado</th><th>Min. Atraso</th><th>Banco Horas</th><th>Justificativa</th></tr></thead><tbody id="tbodyReg"></tbody></table>
 </div>
 
 <div id="relatorios" class="painel">
@@ -651,12 +660,12 @@ label { font-size: 13px; color: #555; font-weight: bold; display: block; margin-
 <div class="card">
 <h3 style="margin-bottom:10px;">🖼️ Logo da Clínica</h3>
 <p style="font-size:14px; line-height:1.6;">
-O sistema cria uma logo padrão automaticamente.<br>
-Para usar sua logo, substitua o arquivo <strong>static/logo.png</strong> pela sua imagem (PNG, 256x256 pixels).
+Coloque sua logo em <strong>static/logo.png</strong> (formato PNG).<br>
+Se a logo não aparecer, pressione <strong>Ctrl+F5</strong> para atualizar o cache do navegador.
 </p>
 </div>
 <div class="card">
-<h3 style="margin-bottom:10px;">🔐 Login Admin</h3>
+<h3 style="margin-bottom:10px;">🔐 Credenciais de Acesso</h3>
 <p style="font-size:14px;"><strong>Usuário:</strong> admin<br><strong>Senha:</strong> 3223ronte</p>
 </div>
 </div>
@@ -671,9 +680,12 @@ document.getElementById('mesAno').value = mesAno;
 document.getElementById('mesAnoFunc').value = mesAno;
 document.getElementById('urlLocal').textContent = window.location.origin + '/';
 
-document.getElementById('cpfCad').addEventListener('input', function() {
-    this.value = this.value.replace(/\\D/g, '');
+// Anti-cache logo
+document.querySelectorAll('img[src*="logo.png"]').forEach(function(img) {
+    img.src = img.src.replace('TS_ADMIN', Date.now());
 });
+
+document.getElementById('cpfCad').addEventListener('input', function() { this.value = this.value.replace(/\\D/g, ''); });
 
 function abrirAba(nome, btn) {
     document.querySelectorAll('.painel').forEach(p => p.classList.remove('ativo'));
@@ -730,7 +742,7 @@ async function carregarFuncionarios() {
     const dados = await res.json();
     const tbody = document.getElementById('tbodyFunc');
     if(dados.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color:#999; padding:20px;">Nenhum funcionário cadastrado.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color:#999; padding:20px;">Nenhum cadastrado.</td></tr>';
         return;
     }
     tbody.innerHTML = dados.map(function(f) {
@@ -759,14 +771,15 @@ async function carregarRegistros() {
     
     const tbody = document.getElementById('tbodyReg');
     if(dados.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color:#999; padding:20px;">Nenhum registro encontrado.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="9" style="text-align:center; color:#999; padding:20px;">Nenhum registro.</td></tr>';
         return;
     }
     tbody.innerHTML = dados.map(function(r) {
         const classeTipo = 'tipo-' + r.tipo.toLowerCase().replace(/_/g, '-');
-        const minutosHtml = r.minutos_atraso > 0 ? '<span class="minutos-cell">'+r.minutos_atraso+' min</span>' : '-';
+        const minHtml = r.minutos_atraso > 0 ? '<span class="minutos-cell">'+r.minutos_atraso+' min</span>' : '-';
+        const bancoHtml = r.minutos_banco_horas > 0 ? '<span class="banco-cell">+'+r.minutos_banco_horas+' min</span>' : '-';
         const justHtml = r.justificativa ? '<span class="justificativa-cell" title="'+r.justificativa.replace(/"/g,'&quot;')+'">'+r.justificativa+'</span>' : '<span style="color:#ccc;">-</span>';
-        return '<tr><td>'+r.nome+'</td><td>'+r.cpf+'</td><td>'+r.data+'</td><td>'+r.hora+'</td><td class="'+classeTipo+'">'+r.tipo_formatado+'</td><td class="'+(r.atrasado?'atrasado':'')+'">'+(r.atrasado?'⚠️ SIM':'✅ NÃO')+'</td><td>'+minutosHtml+'</td><td>'+justHtml+'</td></tr>';
+        return '<tr><td>'+r.nome+'</td><td>'+r.cpf+'</td><td>'+r.data+'</td><td>'+r.hora+'</td><td class="'+classeTipo+'">'+r.tipo_formatado+'</td><td class="'+(r.atrasado?'atrasado':'')+'">'+(r.atrasado?'⚠️ SIM':'✅ NÃO')+'</td><td>'+minHtml+'</td><td>'+bancoHtml+'</td><td>'+justHtml+'</td></tr>';
     }).join('');
 }
 
@@ -781,7 +794,7 @@ async function carregarSelect() {
 
 function gerarGeral() {
     const mes = document.getElementById('mesAno').value;
-    if(!mes) { alert('Selecione o mês/ano!'); return; }
+    if(!mes) { alert('Selecione o mês!'); return; }
     window.open('/api/pdf/geral?mes=' + mes, '_blank');
 }
 
@@ -804,7 +817,7 @@ async function gerarQR() {
 }
 </script>
 </body>
-</html>"""
+</html>""".replace('TS_ADMIN', str(int(datetime.now().timestamp())))
 
 # ===================== SERVIDOR HTTP =====================
 class ServidorPonto(BaseHTTPRequestHandler):
@@ -833,7 +846,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
             return
         
         if caminho.startswith("/static/"):
-            nome_arquivo = caminho.replace("/static/", "")
+            nome_arquivo = caminho.replace("/static/", "").split("?")[0]
             caminho_completo = os.path.join("static", nome_arquivo)
             if os.path.exists(caminho_completo):
                 self.send_response(200)
@@ -843,6 +856,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
                     self.send_header("Content-Type", "image/jpeg")
                 else:
                     self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
                 self.end_headers()
                 with open(caminho_completo, "rb") as f:
                     self.wfile.write(f.read())
@@ -869,7 +883,6 @@ class ServidorPonto(BaseHTTPRequestHandler):
             return
         
         rotas_admin = ["/api/funcionarios", "/api/registros", "/api/gerar_qrcode", "/api/pdf/geral", "/api/logout"]
-        
         precisa_login = (caminho in rotas_admin or caminho.startswith("/api/funcionarios/") or caminho.startswith("/api/pdf/funcionario/"))
         
         if precisa_login and not verificar_login(self):
@@ -911,6 +924,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
                         "tipo": r["tipo"], "tipo_formatado": r["tipo"].replace("_", " "),
                         "atrasado": bool(r["atrasado"]),
                         "minutos_atraso": r["minutos_atraso"] or 0,
+                        "minutos_banco_horas": r["minutos_banco_horas"] or 0,
                         "justificativa": r["justificativa"] or ""
                     })
                 responder_json(self, resultado)
@@ -1047,25 +1061,25 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 if tipo == "ENTRADA":
                     atrasado = 1 if verificar_atraso(hora_str, func["horario_entrada"]) else 0
                     if atrasado:
-                        minutos = calcular_minutos_atraso(hora_str, func["horario_entrada"])
+                        minutos = calcular_minutos(hora_str, func["horario_entrada"])
                         msg_just = f"Atraso na ENTRADA. Horário padrão: {func['horario_entrada']}."
                         info = f"Atraso de {minutos} minuto(s)"
                 elif tipo == "SAIDA_ALMOCO":
-                    minutos_antes = calcular_minutos_atraso(func["horario_saida_almoco"], hora_str, invertido=True)
-                    if minutos_antes >= 30:
+                    minutos_antes = calcular_minutos(func["horario_saida_almoco"], hora_str)
+                    if not verificar_atraso(hora_str, func["horario_saida_almoco"]) and minutos_antes >= 30:
                         minutos = minutos_antes
                         msg_just = f"Saída para almoço com {minutos_antes} min de antecedência. Padrão: {func['horario_saida_almoco']}."
                         info = f"Antecedência de {minutos_antes} min"
                 elif tipo == "RETORNO_ALMOCO":
                     atrasado = 1 if verificar_atraso(hora_str, func["horario_retorno_almoco"]) else 0
                     if atrasado:
-                        minutos = calcular_minutos_atraso(hora_str, func["horario_retorno_almoco"])
+                        minutos = calcular_minutos(hora_str, func["horario_retorno_almoco"])
                         msg_just = f"Atraso no RETORNO. Padrão: {func['horario_retorno_almoco']}."
                         info = f"Atraso de {minutos} minuto(s)"
                 elif tipo == "SAIDA":
                     atrasado = 1 if verificar_atraso(func["horario_saida"], hora_str) else 0
                     if atrasado:
-                        minutos = calcular_minutos_atraso(func["horario_saida"], hora_str, invertido=True)
+                        minutos = calcular_minutos(func["horario_saida"], hora_str)
                         msg_just = f"SAÍDA ANTECIPADA. Padrão: {func['horario_saida']}."
                         info = f"Antecipada em {minutos} minuto(s)"
                 
@@ -1105,6 +1119,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
                     responder_json(self, {"detail": "CPF não cadastrado!"}, status=404)
                     return
                 
+                # HORARIO REAL DO SERVIDOR NO MOMENTO DO REGISTRO
                 agora = datetime.now()
                 data_str = agora.strftime("%Y-%m-%d")
                 data_hora_str = agora.strftime("%Y-%m-%d %H:%M:%S")
@@ -1119,31 +1134,39 @@ class ServidorPonto(BaseHTTPRequestHandler):
                     responder_json(self, {"detail": "⛔ " + msg_erro}, status=400)
                     return
                 
+                # Calcula atraso
                 atrasado = 0
-                minutos = 0
+                minutos_atraso = 0
                 
                 if tipo == "ENTRADA":
                     atrasado = 1 if verificar_atraso(hora_str, func["horario_entrada"]) else 0
-                    if atrasado: minutos = calcular_minutos_atraso(hora_str, func["horario_entrada"])
+                    if atrasado: minutos_atraso = calcular_minutos(hora_str, func["horario_entrada"])
                 elif tipo == "RETORNO_ALMOCO":
                     atrasado = 1 if verificar_atraso(hora_str, func["horario_retorno_almoco"]) else 0
-                    if atrasado: minutos = calcular_minutos_atraso(hora_str, func["horario_retorno_almoco"])
+                    if atrasado: minutos_atraso = calcular_minutos(hora_str, func["horario_retorno_almoco"])
                 elif tipo == "SAIDA":
                     atrasado = 1 if verificar_atraso(func["horario_saida"], hora_str) else 0
-                    if atrasado: minutos = calcular_minutos_atraso(func["horario_saida"], hora_str, invertido=True)
+                    if atrasado: minutos_atraso = calcular_minutos(func["horario_saida"], hora_str)
                 
+                # Calcula banco de horas
+                minutos_banco = calcular_banco_horas(tipo, hora_str, func)
+                
+                # INSERE NO BANCO COM HORARIO REAL
                 conn.execute("""
-                    INSERT INTO registros_ponto (funcionario_id, data_hora, tipo, atrasado, minutos_atraso, justificativa)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (func["id"], data_hora_str, tipo, atrasado, minutos, justificativa))
+                    INSERT INTO registros_ponto (funcionario_id, data_hora, tipo, atrasado, minutos_atraso, minutos_banco_horas, justificativa)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (func["id"], data_hora_str, tipo, atrasado, minutos_atraso, minutos_banco, justificativa))
                 conn.commit()
                 conn.close()
                 
                 tipo_info = TIPOS_REGISTRO[tipo]
                 msg = f"{tipo_info['icone']} {tipo_info['label']} registrada!\n"
                 msg += f"👤 {func['nome']}\n📅 {agora.strftime('%d/%m/%Y')}\n⏰ {hora_str}"
-                if atrasado: msg += f"\n⚠️ Atraso: {minutos} min"
+                if atrasado: msg += f"\n⚠️ Atraso: {minutos_atraso} min"
+                if minutos_banco > 0: msg += f"\n⏱️ Banco de horas: +{minutos_banco} min"
                 if justificativa: msg += f"\n📝 Justificativa registrada"
+                
+                print(f"[PONTO] {func['nome']} | {tipo} | {hora_str} | Atraso:{minutos_atraso}min | Banco:+{minutos_banco}min")
                 
                 responder_json(self, {"mensagem": msg})
             except Exception as e:
@@ -1186,9 +1209,9 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 
                 novo_id = conn.execute("SELECT last_insert_rowid() as id").fetchone()["id"]
                 
-                # Confirma que salvou
+                # CONFIRMA GRAVACAO
                 salvo = conn.execute("SELECT * FROM funcionarios WHERE id = ?", (novo_id,)).fetchone()
-                print(f"[CADASTRO OK] {salvo['nome']} | Entrada={salvo['horario_entrada']} | Saida={salvo['horario_saida']}")
+                print(f"[CADASTRO] {salvo['nome']} | Entrada={salvo['horario_entrada']} | Almoco={salvo['horario_saida_almoco']} | Retorno={salvo['horario_retorno_almoco']} | Saida={salvo['horario_saida']}")
                 
                 conn.close()
                 responder_json(self, {"status": "ok", "id": novo_id})
@@ -1245,29 +1268,31 @@ def desenhar_pagina_funcionario(c, func, registros, mes, dias_semana, altura, la
     c.drawString(340, y, "Saída: " + func["horario_saida"])
     y -= 25
     
-    c.setFont("Helvetica-Bold", 8)
+    c.setFont("Helvetica-Bold", 7)
     c.setFillColor(colors.HexColor("#f0f0f0"))
     c.rect(40, y - 14, largura - 80, 18, fill=True, stroke=False)
     c.setFillColor(colors.black)
-    c.drawString(48, y - 9, "DATA")
-    c.drawString(110, y - 9, "HORA")
-    c.drawString(175, y - 9, "TIPO")
-    c.drawString(270, y - 9, "ATRASO")
-    c.drawString(325, y - 9, "MIN.")
-    c.drawString(370, y - 9, "DIA SEMANA")
-    c.drawString(450, y - 9, "JUSTIFICATIVA")
+    c.drawString(45, y - 9, "DATA")
+    c.drawString(100, y - 9, "HORA")
+    c.drawString(155, y - 9, "TIPO")
+    c.drawString(240, y - 9, "ATRASO")
+    c.drawString(290, y - 9, "MIN. ATR.")
+    c.drawString(355, y - 9, "BANCO H.")
+    c.drawString(420, y - 9, "DIA")
+    c.drawString(460, y - 9, "JUSTIFICATIVA")
     y -= 32
     
-    c.setFont("Helvetica", 8)
+    c.setFont("Helvetica", 7)
     contagem = {"ENTRADA": 0, "SAIDA_ALMOCO": 0, "RETORNO_ALMOCO": 0, "SAIDA": 0}
     total_atrasos = 0
-    total_minutos = 0
+    total_min_atraso = 0
+    total_banco_horas = 0
     
     for reg in registros:
         if y < 100:
             c.showPage()
             y = altura - 50
-            c.setFont("Helvetica", 8)
+            c.setFont("Helvetica", 7)
         
         dh = datetime.strptime(reg["data_hora"], "%Y-%m-%d %H:%M:%S")
         data = dh.strftime("%d/%m/%Y")
@@ -1275,8 +1300,8 @@ def desenhar_pagina_funcionario(c, func, registros, mes, dias_semana, altura, la
         dia_semana = dias_semana[dh.weekday()]
         tipo_fmt = reg["tipo"].replace("_", " ")
         
-        c.drawString(48, y, data)
-        c.drawString(110, y, hora)
+        c.drawString(45, y, data)
+        c.drawString(100, y, hora)
         
         if reg["tipo"] == "ENTRADA": c.setFillColor(colors.HexColor("#4CAF50"))
         elif reg["tipo"] == "SAIDA_ALMOCO": c.setFillColor(colors.HexColor("#ff9800"))
@@ -1284,58 +1309,74 @@ def desenhar_pagina_funcionario(c, func, registros, mes, dias_semana, altura, la
         else: c.setFillColor(colors.HexColor("#f44336"))
         
         contagem[reg["tipo"]] += 1
-        c.drawString(175, y, tipo_fmt)
+        c.drawString(155, y, tipo_fmt)
         c.setFillColor(colors.black)
         
         if reg["atrasado"]:
             c.setFillColor(colors.HexColor("#f44336"))
-            c.drawString(270, y, "SIM")
+            c.drawString(240, y, "SIM")
             c.setFillColor(colors.black)
             total_atrasos += 1
         else:
-            c.drawString(270, y, "Não")
+            c.drawString(240, y, "Não")
         
-        minutos = reg["minutos_atraso"] or 0
-        if minutos > 0:
+        min_atraso = reg["minutos_atraso"] or 0
+        if min_atraso > 0:
             c.setFillColor(colors.HexColor("#f44336"))
-            c.drawString(325, y, str(minutos) + " min")
+            c.drawString(290, y, str(min_atraso) + " min")
             c.setFillColor(colors.black)
-            total_minutos += minutos
+            total_min_atraso += min_atraso
         else:
-            c.drawString(325, y, "-")
+            c.drawString(290, y, "-")
         
-        c.drawString(370, y, dia_semana)
+        min_banco = reg["minutos_banco_horas"] or 0
+        if min_banco > 0:
+            c.setFillColor(colors.HexColor("#0c5460"))
+            c.drawString(355, y, "+" + str(min_banco) + " min")
+            c.setFillColor(colors.black)
+            total_banco_horas += min_banco
+        else:
+            c.drawString(355, y, "-")
+        
+        c.drawString(420, y, dia_semana[:3])
         
         justificativa = reg["justificativa"] or ""
         if justificativa:
             c.setFillColor(colors.HexColor("#666666"))
-            if len(justificativa) > 55: justificativa = justificativa[:52] + "..."
-            c.drawString(450, y, justificativa)
+            if len(justificativa) > 50: justificativa = justificativa[:47] + "..."
+            c.drawString(460, y, justificativa)
             c.setFillColor(colors.black)
         
-        y -= 14
+        y -= 13
     
-    if y < 180:
+    if y < 200:
         c.showPage()
         y = altura - 50
     
     y -= 10
     c.setFillColor(colors.HexColor("#f5f5f5"))
-    c.rect(40, y - 85, largura - 80, 95, fill=True, stroke=False)
+    c.rect(40, y - 100, largura - 80, 110, fill=True, stroke=False)
     c.setFillColor(colors.black)
     c.setFont("Helvetica-Bold", 10)
     c.drawString(50, y - 15, "📊 RESUMO DO MÊS:")
     c.setFont("Helvetica", 9)
     c.drawString(50, y - 35, "Total: " + str(len(registros)) + " registros")
-    c.drawString(200, y - 35, "✅ Entradas: " + str(contagem["ENTRADA"]))
-    c.drawString(330, y - 35, "🍽️ Saída Almoço: " + str(contagem["SAIDA_ALMOCO"]))
+    c.drawString(180, y - 35, "✅ Entradas: " + str(contagem["ENTRADA"]))
+    c.drawString(310, y - 35, "🍽️ Saída Almoço: " + str(contagem["SAIDA_ALMOCO"]))
     c.drawString(50, y - 50, "↩️ Retorno: " + str(contagem["RETORNO_ALMOCO"]))
-    c.drawString(200, y - 50, "🚪 Saídas: " + str(contagem["SAIDA"]))
-    c.drawString(330, y - 50, "⚠️ Atrasos: " + str(total_atrasos))
-    c.drawString(50, y - 65, "⏱️ Minutos atrasados: " + str(total_minutos) + " min")
+    c.drawString(180, y - 50, "🚪 Saídas: " + str(contagem["SAIDA"]))
+    c.drawString(310, y - 50, "⚠️ Atrasos: " + str(total_atrasos))
+    c.drawString(50, y - 65, "⏱️ Min. atrasados: " + str(total_min_atraso) + " min")
     
-    y -= 100
+    c.setFillColor(colors.HexColor("#0c5460"))
+    c.setFont("Helvetica-Bold", 9)
+    horas_banco = total_banco_horas // 60
+    min_banco = total_banco_horas % 60
+    c.drawString(180, y - 65, f"💰 Banco de Horas: +{total_banco_horas} min ({horas_banco}h {min_banco}min)")
     c.setFillColor(colors.black)
+    
+    # Espaço assinatura
+    y -= 115
     c.setFont("Helvetica-Bold", 10)
     c.drawString(40, y, "_______________________________________________________")
     y -= 15
@@ -1345,8 +1386,10 @@ def desenhar_pagina_funcionario(c, func, registros, mes, dias_semana, altura, la
     c.drawString(40, y, "Data: ____/____/__________")
     
     y -= 40
+    c.setFont("Helvetica-Bold", 10)
     c.drawString(300, y, "_______________________________________________________")
     y -= 15
+    c.setFont("Helvetica", 9)
     c.drawString(300, y, "Assinatura do Responsável: ___________________________")
     y -= 15
     c.drawString(300, y, "Data: ____/____/__________")
@@ -1417,7 +1460,7 @@ def gerar_pdf_individual(func_id, mes):
 # ===================== INICIAR SERVIDOR =====================
 if __name__ == "__main__":
     print("=" * 65)
-    print("   🚀 SISTEMA DE PONTO v2.2 - FUNCIONANDO!")
+    print("   🚀 SISTEMA DE PONTO v2.3 - FUNCIONANDO!")
     print("=" * 65)
     print(f"📱 Página funcionário:  http://localhost:{PORTA}")
     print(f"🔐 Login Admin:         http://localhost:{PORTA}/admin")
@@ -1426,9 +1469,10 @@ if __name__ == "__main__":
     print("✨ Funcionalidades:")
     print("   • Sem duplicatas (controle de sequência)")
     print("   • Minutos de atraso calculados")
+    print("   • 💰 Banco de horas (horas extras)")
     print("   • Modal de justificativa")
-    print("   • PDF completo com assinatura")
-    print("   • Logo padrão automática")
+    print("   • PDF completo com banco de horas e assinatura")
+    print("   • Logo com anti-cache")
     print("=" * 65)
     print("\nServidor rodando... Ctrl+C para parar.\n")
     
