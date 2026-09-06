@@ -4,247 +4,43 @@ import os
 import io
 import hashlib
 import re
-import base64
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 # ===================== HORARIO DE BRASILIA (UTC-3) =====================
+# Sempre retorna o horário correto de Brasília, independente do fuso do servidor
 FUSO_BRASILIA = timezone(timedelta(hours=-3))
+
 def agora_brasilia():
+    """Retorna datetime atual no horário de Brasília (UTC-3)"""
     return datetime.now(timezone.utc).astimezone(FUSO_BRASILIA).replace(tzinfo=None)
+
 
 # ===================== CONFIGURACOES =====================
 SEGREDO_QR = "CLINICA_PONTO_2024"
 PORTA = 8000
 ADMIN_USUARIO = "admin"
 ADMIN_SENHA = "3223ronte"
-MAX_TENTATIVAS_FACIAIS = 5
-LIMIAR_CONFIANCA_FACIAL = 70.0
-
 sessoes_admin = {}
 tentativas_login = {}
 acessos_funcionarios = {}
+
+# ===== SISTEMA DE AUTORIZACAO DE HORARIO =====
+# Estrutura: chave = id_solicitacao, valor = dict com dados da solicitacao
 autorizacoes_pendentes = {}
-TIMEOUT_AUTORIZACAO_SEGUNDOS = 300
+TIMEOUT_AUTORIZACAO_SEGUNDOS = 300  # 5 minutos
 
 os.makedirs("static", exist_ok=True)
-os.makedirs("static/fotos", exist_ok=True)
-os.makedirs("modelos_faciais", exist_ok=True)
 
 CABECALHOS_SEGURANCA = {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
     "X-XSS-Protection": "1; mode=block",
     "Referrer-Policy": "strict-origin-when-cross-origin",
-    "Permissions-Policy": "camera=self, microphone=(), geolocation=()"
+    "Permissions-Policy": "geolocation=(), microphone=(), camera=()"
 }
 
-# ===================== RECONHECIMENTO FACIAL =====================
-try:
-    import cv2
-    import numpy as np
-    FACE_REC_DISPONIVEL = True
-    
-    try:
-        CAMINHO_HAAR = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-        detector_faces = cv2.CascadeClassifier(CAMINHO_HAAR)
-        if detector_faces.empty():
-            raise Exception("Haar Cascade vazio")
-    except:
-        detector_faces = None
-    
-    def detectar_face_opencv(img_bytes, tamanho_alvo=(200, 200)):
-        try:
-            nparr = np.frombuffer(img_bytes, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            if img is None:
-                return None, False, "Imagem inválida"
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            
-            face_detectada = False
-            face = None
-            
-            if detector_faces is not None:
-                # Tenta detecção normal primeiro
-                faces = detector_faces.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(60, 60))
-                if len(faces) > 0:
-                    # Pega a maior face detectada
-                    maior_face = max(faces, key=lambda f: f[2] * f[3])
-                    x, y, w, h = maior_face
-                    # Adiciona margem ao redor da face
-                    margem = int(0.1 * w)
-                    x1 = max(0, x - margem)
-                    y1 = max(0, y - margem)
-                    x2 = min(gray.shape[1], x + w + margem)
-                    y2 = min(gray.shape[0], y + h + margem)
-                    face = gray[y1:y2, x1:x2]
-                    face_detectada = True
-            
-            # Se não detectou face, usa a imagem toda (fallback)
-            if not face_detectada:
-                face = gray
-            
-            # Aplica equalização de histograma para melhorar contraste
-            face = cv2.equalizeHist(face)
-            
-            face_redimensionada = cv2.resize(face, tamanho_alvo)
-            return face_redimensionada, True, "OK"
-        except Exception as e:
-            return None, False, f"Erro: {str(e)}"
-    
-    def treinar_modelo_face(funcionario_id, img_bytes):
-        # Primeiro: SEMPRE salva a foto de perfil, independente da detecção
-        try:
-            caminho_foto = os.path.join("static/fotos", f"func_{funcionario_id}.jpg")
-            nparr = np.frombuffer(img_bytes, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            if img is not None:
-                cv2.imwrite(caminho_foto, img)
-                foto_perfil_caminho = f"/static/fotos/func_{funcionario_id}.jpg"
-            else:
-                foto_perfil_caminho = ""
-        except:
-            foto_perfil_caminho = ""
-        
-        # Depois: tenta detectar face e extrair características
-        face, sucesso, msg = detectar_face_opencv(img_bytes)
-        if not sucesso:
-            # Atualiza banco com a foto, mas marca como não treinada
-            conn = get_db()
-            conn.execute("UPDATE funcionarios SET foto_perfil = ?, face_treinada = 0 WHERE id = ?",
-                        (foto_perfil_caminho, funcionario_id))
-            conn.commit()
-            conn.close()
-            return False, f"Foto salva, mas {msg}"
-        
-        try:
-            caminho_modelo = os.path.join("modelos_faciais", f"func_{funcionario_id}.yml")
-            caminho_hist = os.path.join("modelos_faciais", f"func_{funcionario_id}_hist.npy")
-            
-            usou_lbph = False
-            try:
-                if hasattr(cv2, 'face'):
-                    recognizer = cv2.face.LBPHFaceRecognizer_create(radius=1, neighbors=8, grid_x=8, grid_y=8)
-                    recognizer.train([face], np.array([funcionario_id]))
-                    recognizer.save(caminho_modelo)
-                    usou_lbph = True
-            except:
-                usou_lbph = False
-            
-            # SEMPRE salva também o histograma como fallback
-            hist = cv2.calcHist([face], [0], None, [256], [0, 256])
-            cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
-            np.save(caminho_hist, hist)
-            
-            conn = get_db()
-            conn.execute("UPDATE funcionarios SET foto_perfil = ?, face_treinada = 1 WHERE id = ?",
-                        (foto_perfil_caminho, funcionario_id))
-            conn.commit()
-            conn.close()
-            
-            metodo = "LBPH" if usou_lbph else "Histograma"
-            return True, f"Modelo facial treinado com sucesso! ({metodo})"
-        except Exception as e:
-            conn = get_db()
-            conn.execute("UPDATE funcionarios SET foto_perfil = ?, face_treinada = 0 WHERE id = ?",
-                        (foto_perfil_caminho, funcionario_id))
-            conn.commit()
-            conn.close()
-            return False, f"Foto salva, mas erro no treinamento: {str(e)}"
-    
-    def verificar_face(funcionario_id, img_bytes):
-        caminho_modelo = os.path.join("modelos_faciais", f"func_{funcionario_id}.yml")
-        caminho_hist = os.path.join("modelos_faciais", f"func_{funcionario_id}_hist.npy")
-        caminho_foto = os.path.join("static/fotos", f"func_{funcionario_id}.jpg")
-        
-        tem_modelo = os.path.exists(caminho_modelo)
-        tem_hist = os.path.exists(caminho_hist)
-        tem_foto = os.path.exists(caminho_foto)
-        
-        if not tem_foto and not tem_modelo and not tem_hist:
-            return False, 0, "Funcionário não tem foto cadastrada. Contate o admin."
-        
-        face, sucesso, msg = detectar_face_opencv(img_bytes)
-        if not sucesso:
-            return False, 0, msg
-        
-        try:
-            # Tenta 1: LBPH se disponível
-            if tem_modelo and hasattr(cv2, 'face'):
-                try:
-                    recognizer = cv2.face.LBPHFaceRecognizer_create()
-                    recognizer.read(caminho_modelo)
-                    label, confianca = recognizer.predict(face)
-                    if label == funcionario_id and confianca < LIMIAR_CONFIANCA_FACIAL:
-                        return True, confianca, f"Reconhecido! Confiança: {confianca:.1f}"
-                except:
-                    pass
-            
-            # Tenta 2: Comparação de histograma (fallback)
-            if tem_hist:
-                hist_armazenado = np.load(caminho_hist)
-                hist_novo = cv2.calcHist([face], [0], None, [256], [0, 256])
-                cv2.normalize(hist_novo, hist_novo, 0, 1, cv2.NORM_MINMAX)
-                
-                # Compara usando correlação (quanto mais próximo de 1, melhor)
-                correlacao = cv2.compareHist(hist_armazenado, hist_novo, cv2.HISTCMP_CORREL)
-                
-                # Também compara com ORB para mais robustez
-                similaridade_orb = 0.5
-                try:
-                    img_original = cv2.imread(caminho_foto, cv2.IMREAD_GRAYSCALE)
-                    if img_original is not None:
-                        orb = cv2.ORB_create(nfeatures=100)
-                        kp1, des1 = orb.detectAndCompute(img_original, None)
-                        kp2, des2 = orb.detectAndCompute(face, None)
-                        if des1 is not None and des2 is not None and len(des1) > 0 and len(des2) > 0:
-                            bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-                            matches = bf.match(des1, des2)
-                            if len(kp1) > 0:
-                                similaridade_orb = min(1.0, len(matches) / max(len(kp1), len(kp2), 1))
-                except:
-                    pass
-                
-                # Score combinado
-                score = (correlacao * 0.7) + (similaridade_orb * 0.3)
-                confianca_calculada = (1.0 - score) * 100
-                
-                limiar_score = 0.55
-                
-                if score >= limiar_score:
-                    return True, confianca_calculada, f"Reconhecido! Similaridade: {score*100:.1f}%"
-                else:
-                    return False, confianca_calculada, f"Rosto não reconhecido. Similaridade: {score*100:.1f}%"
-            
-            if tem_foto:
-                return False, 0, "Foto cadastrada mas modelo não treinado. Contate o admin."
-            
-            return False, 0, "Modelo facial não disponível."
-            
-        except Exception as e:
-            return False, 0, f"Erro verificação: {str(e)}"
-    
-    def modelo_face_existe(funcionario_id):
-        return (os.path.exists(os.path.join("modelos_faciais", f"func_{funcionario_id}.yml")) or
-                os.path.exists(os.path.join("modelos_faciais", f"func_{funcionario_id}_hist.npy")))
-    
-    print("[FACE REC] OpenCV disponível - Reconhecimento facial ATIVO")
-
-except ImportError:
-    FACE_REC_DISPONIVEL = False
-    print("[FACE REC] OpenCV NÃO disponível")
-    
-    def detectar_face_opencv(img_bytes, tamanho_alvo=(200, 200)):
-        return None, False, "OpenCV não instalado"
-    def treinar_modelo_face(funcionario_id, img_bytes):
-        return False, "OpenCV não instalado no servidor"
-    def verificar_face(funcionario_id, img_bytes):
-        return False, 0, "OpenCV não instalado no servidor"
-    def modelo_face_existe(funcionario_id):
-        return False
-
-# ===================== FUNCOES AUXILIARES =====================
 def sanitizar_texto(texto, max_len=500):
     if not texto: return ""
     texto = str(texto).strip()
@@ -320,12 +116,7 @@ def init_db():
         horario_entrada TEXT DEFAULT '08:00:00',
         horario_saida_almoco TEXT DEFAULT '12:00:00',
         horario_retorno_almoco TEXT DEFAULT '13:00:00',
-        horario_saida TEXT DEFAULT '18:00:00',
-        foto_perfil TEXT DEFAULT '',
-        face_treinada INTEGER DEFAULT 0,
-        bloqueado INTEGER DEFAULT 0,
-        tentativas_reconhecimento INTEGER DEFAULT 0,
-        motivo_bloqueio TEXT DEFAULT ''
+        horario_saida TEXT DEFAULT '18:00:00'
     )""")
     conn.execute("""CREATE TABLE IF NOT EXISTS registros_ponto (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -340,9 +131,7 @@ def init_db():
         user_agent TEXT DEFAULT '',
         horario_acesso TEXT DEFAULT '',
         autorizado_admin INTEGER DEFAULT 0,
-        admin_resposta TEXT DEFAULT '',
-        foto_verificacao TEXT DEFAULT '',
-        confianca_facial REAL DEFAULT 0
+        admin_resposta TEXT DEFAULT ''
     )""")
     conn.execute("""CREATE TABLE IF NOT EXISTS acessos_dispositivos (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -354,29 +143,20 @@ def init_db():
         tipo_acesso TEXT DEFAULT 'pagina_inicial',
         FOREIGN KEY (funcionario_id) REFERENCES funcionarios(id) ON DELETE SET NULL
     )""")
-    
     for coluna, tipo in [
-        ("foto_perfil","TEXT DEFAULT ''"),("face_treinada","INTEGER DEFAULT 0"),
-        ("bloqueado","INTEGER DEFAULT 0"),("tentativas_reconhecimento","INTEGER DEFAULT 0"),
-        ("motivo_bloqueio","TEXT DEFAULT ''")
-    ]:
-        try:
-            conn.execute(f"ALTER TABLE funcionarios ADD COLUMN {coluna} {tipo}")
-            print(f"[MIG FUNC] {coluna} adicionada")
-        except: pass
-    
-    for coluna, tipo in [
-        ("minutos_atraso","INTEGER DEFAULT 0"),("minutos_banco_horas","INTEGER DEFAULT 0"),
-        ("justificativa","TEXT DEFAULT ''"),("ip_dispositivo","TEXT DEFAULT ''"),
-        ("user_agent","TEXT DEFAULT ''"),("horario_acesso","TEXT DEFAULT ''"),
-        ("autorizado_admin","INTEGER DEFAULT 0"),("admin_resposta","TEXT DEFAULT ''"),
-        ("foto_verificacao","TEXT DEFAULT ''"),("confianca_facial","REAL DEFAULT 0")
+        ("minutos_atraso","INTEGER DEFAULT 0"),
+        ("minutos_banco_horas","INTEGER DEFAULT 0"),
+        ("justificativa","TEXT DEFAULT ''"),
+        ("ip_dispositivo","TEXT DEFAULT ''"),
+        ("user_agent","TEXT DEFAULT ''"),
+        ("horario_acesso","TEXT DEFAULT ''"),
+        ("autorizado_admin","INTEGER DEFAULT 0"),
+        ("admin_resposta","TEXT DEFAULT ''")
     ]:
         try:
             conn.execute(f"ALTER TABLE registros_ponto ADD COLUMN {coluna} {tipo}")
-            print(f"[MIG REG] {coluna} adicionada")
+            print(f"[MIGRACAO] Coluna {coluna} adicionada")
         except: pass
-    
     conn.commit()
     conn.close()
 
@@ -388,7 +168,8 @@ def formatar_cpf(cpf):
 
 def verificar_atraso(hora_registro, horario_padrao):
     try:
-        h_r = hora_registro.split(":"); h_p = horario_padrao.split(":")
+        h_r = hora_registro.split(":")
+        h_p = horario_padrao.split(":")
         t_r = int(h_r[0])*3600 + int(h_r[1])*60 + (int(h_r[2]) if len(h_r)>2 else 0)
         t_p = int(h_p[0])*3600 + int(h_p[1])*60 + (int(h_p[2]) if len(h_p)>2 else 0)
         return t_r > t_p
@@ -421,116 +202,114 @@ def calcular_banco_horas(tipo, hora_registro, func):
         return 0
     except: return 0
 
-# ===== BLOQUEIO/DESBLOQUEIO =====
-def incrementar_tentativas_face(funcionario_id):
-    conn = get_db()
-    func = conn.execute("SELECT * FROM funcionarios WHERE id = ?", (funcionario_id,)).fetchone()
-    if not func:
-        conn.close()
-        return False, "Funcionário não encontrado"
-    
-    novas_tentativas = (func["tentativas_reconhecimento"] or 0) + 1
-    bloqueado = 0; motivo = ""
-    
-    if novas_tentativas >= MAX_TENTATIVAS_FACIAIS:
-        bloqueado = 1
-        motivo = f"Bloqueado por {MAX_TENTATIVAS_FACIAIS} tentativas de reconhecimento facial falhas"
-        print(f"[BLOQUEIO] {func['nome']} (ID:{funcionario_id})")
-    
-    conn.execute("UPDATE funcionarios SET tentativas_reconhecimento = ?, bloqueado = ?, motivo_bloqueio = ? WHERE id = ?",
-                 (novas_tentativas, bloqueado, motivo, funcionario_id))
-    conn.commit(); conn.close()
-    
-    restantes = MAX_TENTATIVAS_FACIAIS - novas_tentativas
-    if bloqueado:
-        return True, f"🚫 BLOQUEADO! {motivo}. Apenas o administrador pode desbloquear."
-    return False, f"Rosto não reconhecido. Tentativas restantes: {restantes}"
-
-def resetar_tentativas_face(funcionario_id):
-    conn = get_db()
-    conn.execute("UPDATE funcionarios SET tentativas_reconhecimento = 0 WHERE id = ?", (funcionario_id,))
-    conn.commit(); conn.close()
-
-def desbloquear_funcionario(funcionario_id):
-    conn = get_db()
-    conn.execute("UPDATE funcionarios SET bloqueado = 0, tentativas_reconhecimento = 0, motivo_bloqueio = '' WHERE id = ?", (funcionario_id,))
-    conn.commit()
-    func = conn.execute("SELECT nome FROM funcionarios WHERE id = ?", (funcionario_id,)).fetchone()
-    conn.close()
-    if func:
-        print(f"[DESBLOQUEIO] {func['nome']} (ID:{funcionario_id})")
-        return True
-    return False
-
-def funcionario_bloqueado(funcionario_id):
-    conn = get_db()
-    func = conn.execute("SELECT bloqueado, motivo_bloqueio FROM funcionarios WHERE id = ?", (funcionario_id,)).fetchone()
-    conn.close()
-    if func and func["bloqueado"]:
-        return True, func["motivo_bloqueio"] or "Funcionário bloqueado"
-    return False, ""
-
-# ===== AUTORIZACAO =====
+# ===== FUNCOES DO SISTEMA DE AUTORIZACAO =====
 def gerar_id_solicitacao():
     return hashlib.sha256(os.urandom(32)).hexdigest()[:16]
 
 def limpar_autorizacoes_expiradas():
     agora = agora_brasilia()
     expiradas = [sid for sid, s in autorizacoes_pendentes.items() if s["expira"] <= agora]
-    for sid in expiradas: del autorizacoes_pendentes[sid]
+    for sid in expiradas:
+        del autorizacoes_pendentes[sid]
     return len(expiradas)
 
 def criar_solicitacao_autorizacao(func, tipo, hora_registro, horario_padrao, minutos_diferenca, tipo_diferenca, ip_cliente, user_agent):
+    """
+    tipo_diferenca: 'antecipado' (registrando antes do horario) ou 'atrasado' (registrando depois)
+    """
     limpar_autorizacoes_expiradas()
     sid = gerar_id_solicitacao()
     agora = agora_brasilia()
+    
+    # Verifica se ja existe solicitacao pendente para este funcionario + tipo
     for s in autorizacoes_pendentes.values():
         if s["funcionario_id"] == func["id"] and s["tipo"] == tipo and s["status"] == "pendente":
-            return s["id"], False
+            return s["id"], False  # ja existe
+    
     autorizacoes_pendentes[sid] = {
-        "id": sid, "funcionario_id": func["id"], "nome": func["nome"], "cpf": func["cpf"],
-        "tipo": tipo, "hora_registro": hora_registro, "horario_padrao": horario_padrao,
-        "minutos_diferenca": minutos_diferenca, "tipo_diferenca": tipo_diferenca,
-        "status": "pendente", "resposta_admin": "", "ip_cliente": ip_cliente, "user_agent": user_agent,
+        "id": sid,
+        "funcionario_id": func["id"],
+        "nome": func["nome"],
+        "cpf": func["cpf"],
+        "tipo": tipo,
+        "hora_registro": hora_registro,
+        "horario_padrao": horario_padrao,
+        "minutos_diferenca": minutos_diferenca,
+        "tipo_diferenca": tipo_diferenca,
+        "status": "pendente",  # pendente / aprovado / rejeitado / expirado
+        "resposta_admin": "",
+        "ip_cliente": ip_cliente,
+        "user_agent": user_agent,
         "criado_em": agora.strftime("%Y-%m-%d %H:%M:%S"),
-        "expira": agora + timedelta(seconds=TIMEOUT_AUTORIZACAO_SEGUNDOS), "respondido_em": None
+        "expira": agora + timedelta(seconds=TIMEOUT_AUTORIZACAO_SEGUNDOS),
+        "respondido_em": None
     }
-    print(f"[AUTORIZACAO] {sid[:8]}... {func['nome']} | {tipo} | {tipo_diferenca} {minutos_diferenca}min")
+    print(f"[AUTORIZACAO] Solicitacao {sid[:8]}... {func['nome']} | {tipo} | {tipo_diferenca} {minutos_diferenca}min")
     return sid, True
 
 def listar_autorizacoes_pendentes():
     limpar_autorizacoes_expiradas()
-    return [{
-        "id": s["id"], "nome": s["nome"], "cpf": s["cpf"], "tipo": s["tipo"],
-        "tipo_formatado": s["tipo"].replace("_", " "), "hora_registro": s["hora_registro"],
-        "horario_padrao": s["horario_padrao"], "minutos_diferenca": s["minutos_diferenca"],
-        "tipo_diferenca": s["tipo_diferenca"], "criado_em": s["criado_em"],
-        "segundos_restantes": max(0, int((s["expira"] - agora_brasilia()).total_seconds()))
-    } for sid, s in autorizacoes_pendentes.items() if s["status"] == "pendente"]
+    resultado = []
+    for sid, s in autorizacoes_pendentes.items():
+        if s["status"] == "pendente":
+            resultado.append({
+                "id": s["id"],
+                "nome": s["nome"],
+                "cpf": s["cpf"],
+                "tipo": s["tipo"],
+                "tipo_formatado": s["tipo"].replace("_", " "),
+                "hora_registro": s["hora_registro"],
+                "horario_padrao": s["horario_padrao"],
+                "minutos_diferenca": s["minutos_diferenca"],
+                "tipo_diferenca": s["tipo_diferenca"],
+                "criado_em": s["criado_em"],
+                "segundos_restantes": max(0, int((s["expira"] - agora_brasilia()).total_seconds()))
+            })
+    return resultado
 
 def responder_autorizacao(sid, aprovar, resposta_admin=""):
-    if sid not in autorizacoes_pendentes: return None, "Não encontrada"
+    if sid not in autorizacoes_pendentes:
+        return None, "Solicitação não encontrada"
+    
     s = autorizacoes_pendentes[sid]
-    if s["status"] != "pendente": return None, "Já respondida"
+    if s["status"] != "pendente":
+        return None, "Solicitação já foi respondida"
+    
     s["status"] = "aprovado" if aprovar else "rejeitado"
     s["resposta_admin"] = resposta_admin
     s["respondido_em"] = agora_brasilia().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[AUTORIZACAO] {'APROVADA' if aprovar else 'REJEITADA'} | {s['nome']} | {s['tipo']}")
+    
+    acao = "APROVADA" if aprovar else "REJEITADA"
+    print(f"[AUTORIZACAO] {acao} | {s['nome']} | {s['tipo']}")
     return s, None
 
 def verificar_status_autorizacao(sid):
     limpar_autorizacoes_expiradas()
     if sid not in autorizacoes_pendentes:
-        return {"status": "expirado", "mensagem": "Solicitação expirada."}
+        return {"status": "expirado", "mensagem": "Solicitação expirada. Tente novamente."}
+    
     s = autorizacoes_pendentes[sid]
     if s["status"] == "pendente":
-        return {"status": "pendente", "mensagem": "Aguardando autorização...",
-                "segundos_restantes": max(0, int((s["expira"] - agora_brasilia()).total_seconds()))}
-    return {"status": s["status"], "resposta_admin": s["resposta_admin"],
-            "respondido_em": s["respondido_em"],
-            "dados": {"funcionario_id": s["funcionario_id"], "cpf": s["cpf"], "tipo": s["tipo"],
-                      "hora_registro": s["hora_registro"], "horario_padrao": s["horario_padrao"],
-                      "minutos_diferenca": s["minutos_diferenca"], "tipo_diferenca": s["tipo_diferenca"]}}
+        return {
+            "status": "pendente",
+            "mensagem": "Aguardando autorização do administrador...",
+            "segundos_restantes": max(0, int((s["expira"] - agora_brasilia()).total_seconds()))
+        }
+    
+    return {
+        "status": s["status"],
+        "resposta_admin": s["resposta_admin"],
+        "respondido_em": s["respondido_em"],
+        "dados": {
+            "funcionario_id": s["funcionario_id"],
+            "cpf": s["cpf"],
+            "tipo": s["tipo"],
+            "hora_registro": s["hora_registro"],
+            "horario_padrao": s["horario_padrao"],
+            "minutos_diferenca": s["minutos_diferenca"],
+            "tipo_diferenca": s["tipo_diferenca"]
+        }
+    }
 
 def obter_ultimo_registro(funcionario_id, data_str):
     conn = get_db()
@@ -548,11 +327,8 @@ def verificar_sequencia_valida(ultimo_tipo, novo_tipo):
     sequencia = {None:["ENTRADA"],"ENTRADA":["SAIDA_ALMOCO","SAIDA"],"SAIDA_ALMOCO":["RETORNO_ALMOCO"],"RETORNO_ALMOCO":["SAIDA"],"SAIDA":["ENTRADA"]}
     proximos = sequencia.get(ultimo_tipo, ["ENTRADA"])
     if novo_tipo in proximos: return True, ""
-    msgs = {"ENTRADA":"Ja registrou ENTRADA. Proximo: SAIDA ALMOCO ou SAIDA.",
-            "SAIDA_ALMOCO":"Ja registrou SAIDA ALMOCO. Proximo: RETORNO ALMOCO.",
-            "RETORNO_ALMOCO":"Ja registrou RETORNO. Proximo: SAIDA.",
-            "SAIDA":"Ja registrou SAIDA hoje. Nova ENTRADA so amanha."}
-    return False, msgs.get(ultimo_tipo, "Registro nao permitido.")
+    msgs = {"ENTRADA":"Voce ja registrou ENTRADA hoje. Proximo: SAIDA ALMOCO ou SAIDA.","SAIDA_ALMOCO":"Voce ja registrou SAIDA ALMOCO. Proximo: RETORNO ALMOCO.","RETORNO_ALMOCO":"Voce ja registrou RETORNO ALMOCO. Proximo: SAIDA.","SAIDA":"Voce ja registrou SAIDA hoje. Nova ENTRADA so amanha."}
+    return False, msgs.get(ultimo_tipo, "Registro nao permitido agora.")
 
 def gerar_sessao():
     return hashlib.sha256(os.urandom(64)).hexdigest()
@@ -624,7 +400,7 @@ RODAPE_WELL = """
   <div class="rodape-content">
     <span class="rodape-icone">⚡</span>
     <span class="rodape-texto">Desenvolvido por <strong>WELL</strong></span>
-    <span class="rodape-versao">v5.0 FACE ID</span>
+    <span class="rodape-versao">v4.0 AUTORIZA</span>
   </div>
 </div>
 """
@@ -652,10 +428,6 @@ ESTILOS_5D = """
 @keyframes girar { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
 .spinner { display:inline-block; width:20px; height:20px; border:3px solid rgba(255,255,255,0.3); border-top-color:white; border-radius:50%; animation:girar 0.8s linear infinite; vertical-align:middle; margin-right:8px; }
 .spinner-escuro { border-color:rgba(102,126,234,0.2); border-top-color:#667eea; }
-.bloqueado { background:linear-gradient(135deg,#ffebee,#ffcdd2) !important; color:#b71c1c; }
-.foto-perfil { width:100%; height:100%; object-fit:cover; border-radius:50%; }
-.foto-perfil-container { width:72px; height:72px; border-radius:50%; overflow:hidden; border:3px solid white; box-shadow:0 10px 25px rgba(102,126,234,0.4); margin:0 auto 12px; background:linear-gradient(135deg,#667eea,#f093fb); display:flex; align-items:center; justify-content:center; color:white; font-size:30px; font-weight:bold; }
-.foto-perfil-container img { width:100%; height:100%; object-fit:cover; }
 """
 SCRIPT_PARTICULAS = """
 <script>
@@ -686,7 +458,7 @@ def gerar_html_login():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>🔐 Login Admin</title>
+<title>🔐 Login Admin - Sistema de Ponto</title>
 <style>
 * { margin:0; padding:0; box-sizing:border-box; font-family:'Segoe UI',Arial,sans-serif; }
 body { min-height:100vh; display:flex; align-items:center; justify-content:center; padding:20px; position:relative; overflow:hidden; }
@@ -743,7 +515,7 @@ async function logar(){
 </body>
 </html>"""
 
-# ===================== HTML - PAGINA PRINCIPAL =====================
+# ===================== HTML - PAGINA PRINCIPAL (ENTRADA CPF) =====================
 def gerar_html_ponto():
     ts = str(int(agora_brasilia().timestamp()))
     return """<!DOCTYPE html>
@@ -751,7 +523,7 @@ def gerar_html_ponto():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>📱 Sistema de Ponto</title>
+<title>📱 Sistema de Ponto - Clínica</title>
 <style>
 * { margin:0; padding:0; box-sizing:border-box; font-family:'Segoe UI',Arial,sans-serif; }
 body { min-height:100vh; display:flex; align-items:center; justify-content:center; padding:15px; position:relative; overflow-x:hidden; }
@@ -764,7 +536,7 @@ body { min-height:100vh; display:flex; align-items:center; justify-content:cente
 .logo-fallback { width:130px; height:130px; border-radius:22px; background:linear-gradient(135deg,#667eea,#764ba2); display:flex; align-items:center; justify-content:center; color:white; font-size:52px; box-shadow:0 15px 40px rgba(102,126,234,0.4); }
 .container h1 { color:#333; font-size:28px; margin-bottom:5px; text-align:center; background:linear-gradient(135deg,#667eea,#f093fb,#4facfe); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; }
 .subtitulo { color:#888; font-size:14px; margin-bottom:25px; text-align:center; }
-.data-hora { background:linear-gradient(135deg,#e8f0fe,#f3e8ff); color:#667eea; padding:15px; border-radius:14px; font-weight:bold; font-size:14px; margin-bottom:25px; text-align:center; border:2px solid rgba(102,126,234,0.2); }
+.data-hora { background:linear-gradient(135deg,#e8f0fe,#f3e8ff); color:#667eea; padding:15px; border-radius:14px; font-weight:bold; font-size:14px; margin-bottom:25px; text-align:center; border:2px solid rgba(102,126,234,0.2); box-shadow:0 5px 15px rgba(102,126,234,0.12); }
 .input-moderno { margin:10px 0; text-align:center; font-size:18px; letter-spacing:2px; }
 .btn-acessar { width:100%; padding:18px; margin-top:18px; font-size:17px; background:linear-gradient(135deg,#43e97b,#38f9d7); }
 .info-func { margin-top:15px; padding:14px; border-radius:12px; font-size:14px; font-weight:bold; text-align:center; display:none; }
@@ -785,13 +557,13 @@ body { min-height:100vh; display:flex; align-items:center; justify-content:cente
 <img src="/static/logo.png?t=""" + ts + """" alt="Logo" class="logo" onerror="this.outerHTML='<div class=\\'logo-fallback\\'>🏥</div>'">
 </div>
 <h1>Sistema de Ponto</h1>
-<p class="subtitulo">👤 Reconhecimento Facial Obrigatório</p>
+<p class="subtitulo">Clínica - Controle de Funcionários</p>
 <div class="data-hora" id="dataHora">Carregando...</div>
-<input type="text" id="cpf" class="input-moderno" placeholder="Digite seu CPF" maxlength="11" inputmode="numeric">
+<input type="text" id="cpf" class="input-moderno" placeholder="Digite seu CPF (apenas números)" maxlength="11" inputmode="numeric">
 <div class="info-func" id="infoFunc"></div>
-<button class="btn-3d btn-acessar" onclick="acessar()">🔓 ACESSAR</button>
+<button class="btn-3d btn-acessar" onclick="acessar()">🔓 ACESSAR MEU PAINEL</button>
 <div class="mensagem" id="mensagem"></div>
-<div class="dica">📸 Você precisará usar a câmera para reconhecimento facial</div>
+<div class="dica">🔒 Seus dados estão protegidos. Acesso registrado por dispositivo.</div>
 <div class="admin-link"><a href="/admin">🔐 Acesso Administrador</a></div>
 """ + RODAPE_WELL + """
 </div>
@@ -811,13 +583,13 @@ cpfInp.addEventListener('blur',async function(){
   if(c.length===11){
     try{const r=await fetch('/api/buscar/'+c);const d=await r.json();
       if(d.encontrado){inf.textContent='👤 '+d.nome;inf.className='info-func info-ok';}
-      else{inf.textContent='⚠️ CPF NÃO cadastrado!';inf.className='info-func info-err';}
+      else{inf.textContent='⚠️ CPF NÃO cadastrado! Contate o RH.';inf.className='info-func info-err';}
     }catch(e){inf.style.display='none';}
   }else inf.style.display='none';
 });
 async function acessar(){
   const c=cpfInp.value.replace(/\\D/g,''); const m=document.getElementById('mensagem');
-  if(!c||c.length!==11){m.textContent='Digite um CPF válido!';m.className='mensagem erro';return;}
+  if(!c||c.length!==11){m.textContent='Digite um CPF válido com 11 números!';m.className='mensagem erro';return;}
   try{
     const r=await fetch('/api/funcionario/acessar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cpf:c})});
     if(r.ok)window.location.href='/funcionario?cpf='+c;
@@ -828,7 +600,7 @@ async function acessar(){
 </body>
 </html>"""
 
-# ===================== HTML - PAINEL DO FUNCIONARIO (COM CAMERA E FACE ID) =====================
+# ===================== HTML - PAINEL DO FUNCIONARIO (COM AUTORIZACAO) =====================
 def gerar_html_funcionario():
     return """<!DOCTYPE html>
 <html lang="pt-BR">
@@ -845,16 +617,17 @@ body { min-height:100vh; padding:15px; position:relative; overflow-x:hidden; }
 .card-topo.animar-entrar { animation-delay:0.1s; }
 .voltar { display:inline-flex; align-items:center; gap:5px; color:#667eea; text-decoration:none; font-size:13px; font-weight:bold; margin-bottom:15px; padding:6px 12px; background:rgba(102,126,234,0.1); border-radius:20px; transition:all 0.3s; }
 .voltar:hover { background:rgba(102,126,234,0.2); transform:translateX(-3px); }
+.foto-func { width:72px; height:72px; border-radius:50%; background:linear-gradient(135deg,#667eea,#f093fb); display:flex; align-items:center; justify-content:center; color:white; font-size:30px; font-weight:bold; margin:0 auto 12px; box-shadow:0 10px 25px rgba(102,126,234,0.4); border:3px solid white; }
+.nome-func { text-align:center; font-size:20px; color:#333; margin-bottom:5px; }
+.cpf-func { text-align:center; color:#888; font-size:13px; margin-bottom:16px; }
 .status-wrapper { text-align:center; margin-bottom:15px; }
 .status-acesso { background:linear-gradient(135deg,#e8f5e9,#c8e6c9); color:#2e7d32; padding:10px 16px; border-radius:25px; font-size:12px; font-weight:bold; display:inline-block; }
-.status-bloqueado { background:linear-gradient(135deg,#ffebee,#ffcdd2); color:#b71c1c; padding:10px 16px; border-radius:25px; font-size:12px; font-weight:bold; display:inline-block; }
 .horarios-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:18px; }
 .horario-item { background:linear-gradient(135deg,#f5f7fa,#e4e8ec); padding:10px; border-radius:10px; text-align:center; }
 .horario-label { font-size:10px; color:#888; text-transform:uppercase; font-weight:bold; }
 .horario-valor { font-size:14px; color:#333; font-weight:bold; margin-top:3px; }
 .data-hora { background:linear-gradient(135deg,#e8f0fe,#f3e8ff); color:#667eea; padding:14px; border-radius:14px; font-weight:bold; font-size:13px; margin-bottom:20px; text-align:center; border:2px solid rgba(102,126,234,0.2); }
-.card-botoes { padding:25px; margin-bottom:20px; display:none; }
-.card-botoes.visivel { display:block; animation:entrar-cima 0.5s ease; }
+.card-botoes { padding:25px; margin-bottom:20px; }
 .card-botoes h2 { font-size:16px; color:#333; margin-bottom:18px; text-align:center; }
 .botoes { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
 .botoes button { padding:20px 10px; font-size:13px; }
@@ -867,45 +640,12 @@ body { min-height:100vh; padding:15px; position:relative; overflow-x:hidden; }
 .sucesso { background:linear-gradient(135deg,#e8f5e9,#c8e6c9); color:#1b5e20; display:block; border:1px solid #a5d6a7; }
 .erro { background:linear-gradient(135deg,#ffebee,#ffcdd2); color:#b71c1c; display:block; border:1px solid #ef9a9a; }
 .banco-horas { background:linear-gradient(135deg,#e0f7fa,#b2ebf2); color:#006064; display:block; border:1px solid #80deea; }
-.atencao { background:linear-gradient(135deg,#fff8e1,#ffecb3); color:#e65100; display:block; border:1px solid #ffcc80; }
 .disp-info { margin-top:15px; padding:12px; background:linear-gradient(135deg,#f3e5f5,#e1bee7); border-radius:12px; font-size:11px; color:#6a1b9a; text-align:center; border:1px solid #ce93d8; }
 
-/* ===== TELA DE RECONHECIMENTO FACIAL (LOGIN) ===== */
-.tela-face-login { display:block; }
-.tela-face-login.oculta { display:none; }
-.card-face-login { padding:30px 25px; margin-bottom:20px; text-align:center; }
-.card-face-login.animar-entrar { animation-delay:0.1s; }
-.card-face-login h2 { color:#333; font-size:20px; margin-bottom:8px; }
-.card-face-login .sub { color:#666; font-size:13px; margin-bottom:20px; line-height:1.5; }
-.camera-login-container { position:relative; width:100%; aspect-ratio:1; background:#000; border-radius:20px; overflow:hidden; margin:0 auto 18px; max-width:360px; box-shadow:0 15px 40px rgba(102,126,234,0.3); }
-.camera-login-container video, .camera-login-container canvas { width:100%; height:100%; object-fit:cover; }
-.camera-login-container .frame-overlay { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); width:75%; height:75%; border:4px dashed rgba(102,126,234,0.7); border-radius:50%; pointer-events:none; animation:pulsar-alerta 2s infinite; }
-.camera-login-status { padding:14px; border-radius:12px; margin-bottom:15px; font-size:14px; font-weight:bold; }
-.status-aguardando { background:linear-gradient(135deg,#e3f2fd,#bbdefb); color:#1565c0; }
-.status-sucesso { background:linear-gradient(135deg,#e8f5e9,#c8e6c9); color:#2e7d32; }
-.status-erro { background:linear-gradient(135deg,#ffebee,#ffcdd2); color:#b71c1c; }
-.tentativas-info { text-align:center; font-size:13px; color:#888; margin-top:10px; }
-.tentativas-info .restantes { color:#f44336; font-weight:bold; font-size:16px; }
-.auto-capture-info { font-size:11px; color:#999; margin-top:12px; font-style:italic; }
-
-/* ===== MODAL CAMERA PARA REGISTRO ===== */
-.modal-overlay { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); backdrop-filter:blur(8px); z-index:1000; align-items:center; justify-content:center; padding:15px; }
-.modal-overlay.ativo { display:flex; }
-.modal-camera { background:white; border-radius:22px; padding:25px; width:100%; max-width:420px; box-shadow:0 30px 70px rgba(0,0,0,0.5); animation:entrar-cima 0.4s ease; }
-.modal-camera h2 { color:#333; font-size:20px; margin-bottom:8px; text-align:center; }
-.modal-camera .sub { color:#666; font-size:13px; margin-bottom:18px; text-align:center; }
-.camera-container { position:relative; width:100%; aspect-ratio:1; background:#000; border-radius:16px; overflow:hidden; margin-bottom:15px; }
-.camera-container video, .camera-container canvas { width:100%; height:100%; object-fit:cover; }
-.camera-container .frame-overlay { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); width:70%; height:70%; border:3px dashed rgba(102,126,234,0.6); border-radius:50%; pointer-events:none; animation:pulsar-alerta 2s infinite; }
-.modal-botoes { display:flex; gap:10px; }
-.modal-botoes button { flex:1; padding:14px; border:none; border-radius:12px; font-weight:bold; cursor:pointer; font-size:14px; transition:all 0.3s; }
-.btn-capturar { background:linear-gradient(135deg,#667eea,#764ba2); color:white; }
-.btn-fechar { background:linear-gradient(135deg,#e0e0e0,#bdbdbd); color:#333; }
-
-/* ===== TELA DE AUTORIZACAO ===== */
-.tela-autorizacao { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:linear-gradient(135deg,rgba(102,126,234,0.97),rgba(118,75,162,0.97)); z-index:9999; align-items:center; justify-content:center; padding:20px; backdrop-filter:blur(10px); }
+/* ===== TELA DE AUTORIZACAO BLOQUEADA ===== */
+.tela-autorizacao { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:linear-gradient(135deg,rgba(102,126,234,0.95),rgba(118,75,162,0.95)); z-index:9999; align-items:center; justify-content:center; padding:20px; backdrop-filter:blur(10px); }
 .tela-autorizacao.ativa { display:flex; }
-.autorizacao-box { background:white; border-radius:28px; padding:35px 30px; width:100%; max-width:420px; text-align:center; box-shadow:0 30px 80px rgba(0,0,0,0.4); animation:entrar-cima 0.5s ease; }
+.autorizacao-box { background:white; border-radius:28px; padding:35px 30px; width:100%; max-width:420px; text-align:center; box-shadow:0 30px 80px rgba(0,0,0,0.4); animation:entrar-cima 0.5s cubic-bezier(0.175,0.885,0.32,1.275); }
 .autorizacao-icone { width:100px; height:100px; border-radius:50%; background:linear-gradient(135deg,#ff9800,#ffc107); display:flex; align-items:center; justify-content:center; font-size:50px; margin:0 auto 20px; box-shadow:0 10px 30px rgba(255,152,0,0.4); animation:pulsar-alerta 2s infinite; }
 .autorizacao-box h2 { color:#333; font-size:22px; margin-bottom:10px; }
 .autorizacao-box .sub { color:#666; font-size:14px; margin-bottom:20px; line-height:1.5; }
@@ -918,84 +658,41 @@ body { min-height:100vh; padding:15px; position:relative; overflow-x:hidden; }
 .tempo-restante { font-size:12px; color:#0d47a1; margin-top:5px; }
 .barra-progresso { width:100%; height:8px; background:#e3f2fd; border-radius:4px; margin-top:10px; overflow:hidden; }
 .barra-progresso .preenchimento { height:100%; background:linear-gradient(90deg,#2196F3,#667eea); border-radius:4px; transition:width 1s linear; }
+.btn-cancelar-aut { width:100%; padding:14px; margin-top:10px; background:linear-gradient(135deg,#e0e0e0,#bdbdbd); color:#333; border:none; border-radius:12px; font-weight:bold; font-size:14px; cursor:pointer; transition:all 0.3s; }
+.btn-cancelar-aut:hover { transform:translateY(-2px); box-shadow:0 5px 15px rgba(0,0,0,0.15); }
 .resposta-admin { padding:15px; border-radius:12px; margin-top:15px; font-size:13px; font-style:italic; color:#555; background:#f5f5f5; border-left:4px solid #667eea; display:none; }
 .resposta-admin.visivel { display:block; }
 </style>
 </head>
 <body class="fundo-animado">
 <div class="wrapper">
-
-<!-- ===== TELA 1: RECONHECIMENTO FACIAL LOGIN ===== -->
-<div class="tela-face-login" id="telaFaceLogin">
-<div class="card-face-login card-3d animar-entrar">
-<a href="/" class="voltar">← Trocar usuário</a>
-<div class="foto-perfil-container" id="fotoContainerLogin">👤</div>
-<h2 class="nome-func" id="nomeFuncLogin" style="font-size:20px;color:#333;margin-bottom:5px;">Carregando...</h2>
-<p class="cpf-func" id="cpfFuncLogin" style="color:#888;font-size:13px;margin-bottom:20px;">CPF: ---</p>
-<h2 style="color:#667eea;font-size:18px;">🔐 Verificação Facial</h2>
-<p class="sub">Posicione seu rosto dentro do círculo<br>para confirmar sua identidade</p>
-<div class="camera-login-container">
-<video id="videoLogin" autoplay playsinline muted></video>
-<canvas id="canvasLogin" style="display:none;"></canvas>
-<div class="frame-overlay"></div>
-</div>
-<div class="camera-login-status status-aguardando" id="cameraLoginStatus">
-<span class="spinner spinner-escuro"></span>Inicializando câmera...
-</div>
-<div class="tentativas-info" id="tentativasLoginInfo"></div>
-<p class="auto-capture-info">📸 A captura será feita automaticamente em instantes</p>
-</div>
-</div>
-
-<!-- ===== TELA 2: DADOS E BOTOES DE REGISTRO ===== -->
-<div id="conteudoPrincipal" style="display:none;">
 <div class="card-topo card-3d animar-entrar">
-<div class="foto-perfil-container" id="fotoContainer">👤</div>
-<h2 class="nome-func" id="nomeFunc" style="text-align:center;font-size:20px;color:#333;margin-bottom:5px;"></h2>
-<p class="cpf-func" id="cpfFunc" style="text-align:center;color:#888;font-size:13px;margin-bottom:16px;"></p>
-<div class="status-wrapper" id="statusWrapper"><span class="status-acesso">✅ Identidade confirmada</span></div>
+<a href="/" class="voltar">← Trocar usuário</a>
+<div class="foto-func" id="fotoFunc">👤</div>
+<h2 class="nome-func" id="nomeFunc">Carregando...</h2>
+<p class="cpf-func" id="cpfFunc">CPF: ---</p>
+<div class="status-wrapper"><span class="status-acesso">✅ Sessão segura ativa</span></div>
 <div class="horarios-grid" id="horariosInfo"></div>
 </div>
-
-<div class="card-botoes visivel">
+<div class="card-botoes card-3d animar-entrar" style="animation-delay:0.2s">
 <div class="data-hora" id="dataHora">Carregando...</div>
 <h2>🎯 Selecione o Registro</h2>
-<div class="botoes" id="botoesRegistro">
-<button class="btn-3d btn-entrada" onclick="iniciarRegistro('ENTRADA')"><span class="icone-btn">✅</span>ENTRADA</button>
-<button class="btn-3d btn-almoco" onclick="iniciarRegistro('SAIDA_ALMOCO')"><span class="icone-btn">🍽️</span>SAÍDA ALMOÇO</button>
-<button class="btn-3d btn-retorno" onclick="iniciarRegistro('RETORNO_ALMOCO')"><span class="icone-btn">↩️</span>RETORNO ALMOÇO</button>
-<button class="btn-3d btn-saida" onclick="iniciarRegistro('SAIDA')"><span class="icone-btn">🚪</span>SAÍDA</button>
+<div class="botoes">
+<button class="btn-3d btn-entrada" onclick="registrar('ENTRADA')"><span class="icone-btn">✅</span>ENTRADA</button>
+<button class="btn-3d btn-almoco" onclick="registrar('SAIDA_ALMOCO')"><span class="icone-btn">🍽️</span>SAÍDA ALMOÇO</button>
+<button class="btn-3d btn-retorno" onclick="registrar('RETORNO_ALMOCO')"><span class="icone-btn">↩️</span>RETORNO ALMOÇO</button>
+<button class="btn-3d btn-saida" onclick="registrar('SAIDA')"><span class="icone-btn">🚪</span>SAÍDA</button>
 </div>
 <div class="mensagem" id="mensagem"></div>
-<div class="disp-info">📸 Reconhecimento facial obrigatório em cada registro</div>
+<div class="disp-info">📡 Dispositivo registrado com segurança</div>
 </div>
 """ + RODAPE_WELL + """
 </div>
-</div>
 
-<!-- ===== MODAL CAMERA PARA REGISTROS ===== -->
-<div class="modal-overlay" id="modalCamera">
-<div class="modal-camera">
-<h2>📸 Verificação Facial</h2>
-<p class="sub">Confirme sua identidade para registrar</p>
-<div class="camera-container">
-<video id="videoCamera" autoplay playsinline muted></video>
-<canvas id="canvasCamera" style="display:none;"></canvas>
-<div class="frame-overlay"></div>
-</div>
-<div class="camera-login-status status-aguardando" id="cameraStatus"><span class="spinner spinner-escuro"></span>Inicializando...</div>
-<div class="tentativas-info" id="tentativasInfo"></div>
-<div class="modal-botoes">
-<button class="btn-fechar" onclick="fecharCamera()">❌ Cancelar</button>
-<button class="btn-capturar" id="btnCapturar" onclick="capturarEVerificar()" disabled>📸 CAPTURAR</button>
-</div>
-</div>
-</div>
-
-<!-- ===== TELA DE AUTORIZACAO ===== -->
+<!-- ===== TELA DE AUTORIZACAO BLOQUEADA ===== -->
 <div class="tela-autorizacao" id="telaAutorizacao">
 <div class="autorizacao-box">
-<div class="autorizacao-icone" id="autIcone">⏰</div>
+<div class="autorizacao-icone">⏰</div>
 <h2 id="autTitulo">Atenção! Horário Diferenciado</h2>
 <p class="sub" id="autSubtitulo">Sua solicitação foi enviada para o administrador</p>
 <div class="info-destaque">
@@ -1009,6 +706,7 @@ body { min-height:100vh; padding:15px; position:relative; overflow-x:hidden; }
 <div class="barra-progresso"><div class="preenchimento" id="autBarra" style="width:100%"></div></div>
 </div>
 <div class="resposta-admin" id="autResposta"></div>
+<button class="btn-cancelar-aut" onclick="cancelarAutorizacao()">❌ Cancelar Solicitação</button>
 </div>
 </div>
 
@@ -1017,341 +715,51 @@ body { min-height:100vh; padding:15px; position:relative; overflow-x:hidden; }
 const QR="CLINICA_PONTO_2024";
 const prm=new URLSearchParams(window.location.search);
 const CPF=prm.get('cpf')||'';
-let FUNC_ID=null;
-let FUNC_NOME=null;
-let TEM_FOTO=false;
-let FACE_TREINADA=false;
-let TIPO_ATUAL=null;
-let streamCamera=null;
-let streamLogin=null;
 let idSolicitacaoAtual=null;
 let pollingAutorizacao=null;
 let tempoInicioAutorizacao=null;
-let autoCapturaTimer=null;
 const TEMPO_MAX_AUTORIZACAO=300;
 
 function atualizarDH(){
-  const el=document.getElementById('dataHora');
-  if(!el)return;
   const o={weekday:'long',day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'};
-  el.textContent='🕐 '+new Date().toLocaleDateString('pt-BR',o);
+  document.getElementById('dataHora').textContent='🕐 '+new Date().toLocaleDateString('pt-BR',o);
 }
-setInterval(atualizarDH,1000);
+setInterval(atualizarDH,1000); atualizarDH();
 
 async function carregar(){
   if(!CPF){window.location.href='/';return;}
   try{
     const r=await fetch('/api/buscar/'+CPF);const d=await r.json();
     if(!d.encontrado){window.location.href='/';return;}
-    FUNC_ID=d.id;FUNC_NOME=d.nome;TEM_FOTO=!!d.foto_perfil;FACE_TREINADA=d.face_treinada;
-    
-    document.getElementById('nomeFuncLogin').textContent=d.nome;
-    document.getElementById('cpfFuncLogin').textContent='CPF: '+CPF.replace(/(\\d{3})(\\d{3})(\\d{3})(\\d{2})/,'$1.$2.$3-$4');
-    
-    const fotoContainerLogin=document.getElementById('fotoContainerLogin');
-    if(d.foto_perfil){
-      fotoContainerLogin.innerHTML='<img src="'+d.foto_perfil+'?t='+Date.now()+'" class="foto-perfil" onerror="this.parentElement.innerHTML=\\''+d.nome.charAt(0).toUpperCase()+'\\'">';
-    }else{
-      fotoContainerLogin.textContent=d.nome.charAt(0).toUpperCase();
-    }
-    
-    if(d.bloqueado){
-      document.getElementById('cameraLoginStatus').className='camera-login-status status-erro';
-      document.getElementById('cameraLoginStatus').innerHTML='🚫 VOCÊ ESTÁ BLOQUEADO!<br><small>Contate o administrador para desbloquear.</small>';
-      return;
-    }
-    
-    if(!FACE_TREINADA){
-      document.getElementById('cameraLoginStatus').className='camera-login-status status-erro';
-      document.getElementById('cameraLoginStatus').innerHTML='📸 Sem reconhecimento facial cadastrado.<br><small>Contate o administrador.</small>';
-      return;
-    }
-    
-    // Preenche também os dados da tela principal
     document.getElementById('nomeFunc').textContent=d.nome;
     document.getElementById('cpfFunc').textContent='CPF: '+CPF.replace(/(\\d{3})(\\d{3})(\\d{3})(\\d{2})/,'$1.$2.$3-$4');
-    const fotoContainer=document.getElementById('fotoContainer');
-    if(d.foto_perfil){
-      fotoContainer.innerHTML='<img src="'+d.foto_perfil+'?t='+Date.now()+'" class="foto-perfil" onerror="this.parentElement.innerHTML=\\''+d.nome.charAt(0).toUpperCase()+'\\'">';
-    }else{
-      fotoContainer.textContent=d.nome.charAt(0).toUpperCase();
-    }
+    document.getElementById('fotoFunc').textContent=d.nome.charAt(0).toUpperCase();
     document.getElementById('horariosInfo').innerHTML=
       '<div class="horario-item"><div class="horario-label">Entrada</div><div class="horario-valor">🕐 '+d.horario_entrada+'</div></div>'+
       '<div class="horario-item"><div class="horario-label">Saída Almoço</div><div class="horario-valor">🍽️ '+d.horario_saida_almoco+'</div></div>'+
       '<div class="horario-item"><div class="horario-label">Retorno</div><div class="horario-valor">↩️ '+d.horario_retorno_almoco+'</div></div>'+
       '<div class="horario-item"><div class="horario-label">Saída</div><div class="horario-valor">🚪 '+d.horario_saida+'</div></div>';
-    
-    // Inicia a câmera de login automaticamente
-    setTimeout(iniciarCameraLogin, 500);
-    
   }catch(e){window.location.href='/';}
 }
 carregar();
 
-async function iniciarCameraLogin(){
-  const video=document.getElementById('videoLogin');
-  const status=document.getElementById('cameraLoginStatus');
-
-  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
-    status.className='camera-login-status status-erro';
-    if(location.protocol!=='https:' && location.hostname!=='localhost' && location.hostname!=='127.0.0.1'){
-      status.innerHTML='❌ ACESSO BLOQUEADO PELO NAVEGADOR!<br><small style="font-size:11px;font-weight:normal;"><strong>Motivo:</strong> Acesso via HTTP não seguro.<br><br>✅ SOLUÇÕES:<br>💻 PC: Acesse <strong>http://localhost:8000</strong><br>📱 Ou use <strong>HTTPS</strong> com certificado SSL<br>🔧 Chrome: chrome://flags/#unsafely-treat-insecure-origin-as-secure</small>';
-    }else{
-      status.innerHTML='❌ Navegador não suporta acesso à câmera!';
-    }
-    return;
-  }
-
-  const ehSeguro=location.protocol==='https:' || location.hostname==='localhost' || location.hostname==='127.0.0.1';
-  if(!ehSeguro){
-    status.className='camera-login-status status-erro';
-    status.innerHTML='❌ ACESSO VIA HTTP NÃO SEGURO!<br><small style="font-size:11px;font-weight:normal;"><strong>Navegadores BLOQUEIAM câmera em HTTP.</strong><br><br>✅ Acesse: <strong>http://localhost:8000</strong> (no próprio PC)<br>✅ Ou configure <strong>HTTPS</strong> na rede<br>🔧 Chrome: ative flag de origem insegura</small>';
-    return;
-  }
-
-  status.className='camera-login-status status-aguardando';
-  status.innerHTML='<span class="spinner spinner-escuro"></span>📷 Pedindo permissão da câmera...<br><small style="font-size:11px;font-weight:normal;">👆 Procure o pop-up no topo → CLIQUE EM PERMITIR</small>';
-
-  try{
-    const opcoes=[
-      {video:{facingMode:'user',width:{ideal:640},height:{ideal:640}},audio:false},
-      {video:{facingMode:'user'},audio:false},
-      {video:true,audio:false}
-    ];
-    let erroUltimo=null;
-    for(let opcao of opcoes){
-      try{streamLogin=await navigator.mediaDevices.getUserMedia(opcao);break;}
-      catch(e){erroUltimo=e;streamLogin=null;}
-    }
-    if(!streamLogin) throw erroUltimo || new Error('Sem acesso');
-
-    video.srcObject=streamLogin;
-    await video.play();
-
-    status.className='camera-login-status status-sucesso';
-    status.innerHTML='✅ Câmera ativada! Capturando em 2s...<br><small style="font-size:11px;font-weight:normal;">Centralize seu rosto</small>';
-
-    autoCapturaTimer=setTimeout(capturarLogin, 2000);
-
-  }catch(err){
-    status.className='camera-login-status status-erro';
-    let dica='';
-    if(err.name==='NotAllowedError')dica='<br>👉 Você NEGOU a permissão. Clique no 🔒 ao lado da URL → Permitir câmera';
-    else if(err.name==='NotFoundError')dica='<br>👉 Nenhuma câmera encontrada';
-    else if(err.name==='NotReadableError')dica='<br>👉 Câmera em uso por outro app';
-    status.innerHTML='❌ '+err.message+dica;
-  }
-}
-
-async function capturarLogin(){
-  const video=document.getElementById('videoLogin');
-  const canvas=document.getElementById('canvasLogin');
-  const status=document.getElementById('cameraLoginStatus');
-  const tentInfo=document.getElementById('tentativasLoginInfo');
-  
-  if(!streamLogin)return;
-  
-  canvas.width=video.videoWidth;
-  canvas.height=video.videoHeight;
-  canvas.getContext('2d').drawImage(video,0,0);
-  
-  const imagemBase64=canvas.toDataURL('image/jpeg',0.8).split(',')[1];
-  
-  status.className='camera-login-status status-aguardando';
-  status.innerHTML='<span class="spinner spinner-escuro"></span>Verificando identidade...';
-  
-  try{
-    const r=await fetch('/api/verificar_face_login',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({cpf:CPF,funcionario_id:FUNC_ID,imagem:imagemBase64})
-    });
-    const d=await r.json();
-    
-    if(r.ok && d.reconhecido){
-      status.className='camera-login-status status-sucesso';
-      status.innerHTML='✅ Identidade confirmada! Confiança: '+(d.confianca||0).toFixed(1);
-      
-      // Para a câmera e mostra a tela principal
-      setTimeout(()=>{
-        if(streamLogin){streamLogin.getTracks().forEach(t=>t.stop());streamLogin=null;}
-        document.getElementById('telaFaceLogin').classList.add('oculta');
-        document.getElementById('conteudoPrincipal').style.display='block';
-        atualizarDH();
-      },1000);
-      
-    }else{
-      status.className='camera-login-status status-erro';
-      status.innerHTML='❌ '+(d.detail||'Rosto não reconhecido');
-      
-      if(d.tentativas_restantes!==undefined){
-        tentInfo.innerHTML='Tentativas restantes: <span class="restantes">'+d.tentativas_restantes+'</span> de """ + str(MAX_TENTATIVAS_FACIAIS) + """';
-      }
-      
-      if(d.bloqueado){
-        setTimeout(()=>{
-          if(streamLogin){streamLogin.getTracks().forEach(t=>t.stop());streamLogin=null;}
-          status.innerHTML='🚫 BLOQUEADO!<br><small>Após """ + str(MAX_TENTATIVAS_FACIAIS) + """ tentativas falhas. Contate o administrador.</small>';
-        },1500);
-      }else{
-        // Tenta novamente automaticamente após 2 segundos
-        autoCapturaTimer=setTimeout(capturarLogin, 2500);
-      }
-    }
-  }catch(e){
-    status.className='camera-login-status status-erro';
-    status.innerHTML='❌ Erro de conexão';
-    autoCapturaTimer=setTimeout(capturarLogin, 3000);
-  }
-}
-
 function travarBotoes(travar){
-  document.querySelectorAll('#botoesRegistro button').forEach(b=>b.disabled=travar);
+  document.querySelectorAll('.botoes button').forEach(b=>b.disabled=travar);
 }
 
-async function iniciarRegistro(tipo){
-  if(!FUNC_ID)return;
-  TIPO_ATUAL=tipo;
-  await abrirCamera();
-}
-
-async function abrirCamera(){
-  const modal=document.getElementById('modalCamera');
-  const video=document.getElementById('videoCamera');
-  const status=document.getElementById('cameraStatus');
-  const btnCap=document.getElementById('btnCapturar');
-  const tentInfo=document.getElementById('tentativasInfo');
-
-  status.className='camera-login-status status-aguardando';
-  btnCap.disabled=true;
-  tentInfo.innerHTML='';
-
-  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
-    status.className='camera-login-status status-erro';
-    status.innerHTML='❌ Navegador não suporta câmera! Use localhost ou HTTPS.';
-    modal.classList.add('ativo');
-    setTimeout(fecharCamera,4000);
-    return;
-  }
-
-  const ehSeguro=location.protocol==='https:' || location.hostname==='localhost' || location.hostname==='127.0.0.1';
-  if(!ehSeguro){
-    status.className='camera-login-status status-erro';
-    status.innerHTML='❌ HTTP bloqueia câmera! Use http://localhost:8000 ou HTTPS';
-    modal.classList.add('ativo');
-    return;
-  }
-
-  modal.classList.add('ativo');
-  status.innerHTML='<span class="spinner spinner-escuro"></span>📷 Pedindo permissão...';
-
-  try{
-    const opcoes=[
-      {video:{facingMode:'user',width:{ideal:640},height:{ideal:640}},audio:false},
-      {video:{facingMode:'user'},audio:false},
-      {video:true,audio:false}
-    ];
-    let erroUltimo=null;
-    for(let opcao of opcoes){
-      try{streamCamera=await navigator.mediaDevices.getUserMedia(opcao);break;}
-      catch(e){erroUltimo=e;streamCamera=null;}
-    }
-    if(!streamCamera) throw erroUltimo || new Error('Sem acesso');
-
-    video.srcObject=streamCamera;
-    await video.play();
-
-    status.className='camera-login-status status-sucesso';
-    status.innerHTML='✅ Câmera pronta! Posicione e capture';
-    btnCap.disabled=false;
-
-  }catch(err){
-    status.className='camera-login-status status-erro';
-    let dica='';
-    if(err.name==='NotAllowedError')dica=' - Permissão negada';
-    status.innerHTML='❌ '+err.message+dica;
-    setTimeout(fecharCamera,4000);
-  }
-}
-
-function fecharCamera(){
-  const modal=document.getElementById('modalCamera');
-  if(streamCamera){streamCamera.getTracks().forEach(t=>t.stop());streamCamera=null;}
-  modal.classList.remove('ativo');
-  TIPO_ATUAL=null;
-}
-
-async function capturarEVerificar(){
-  const video=document.getElementById('videoCamera');
-  const canvas=document.getElementById('canvasCamera');
-  const status=document.getElementById('cameraStatus');
-  const btnCap=document.getElementById('btnCapturar');
-  const tentInfo=document.getElementById('tentativasInfo');
-  
-  btnCap.disabled=true;
-  status.className='camera-login-status status-aguardando';
-  status.innerHTML='<span class="spinner spinner-escuro"></span>Processando e verificando...';
-  
-  canvas.width=video.videoWidth;
-  canvas.height=video.videoHeight;
-  canvas.getContext('2d').drawImage(video,0,0);
-  
-  const imagemBase64=canvas.toDataURL('image/jpeg',0.8).split(',')[1];
-  
-  try{
-    const r=await fetch('/api/verificar_face',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({cpf:CPF,funcionario_id:FUNC_ID,tipo:TIPO_ATUAL,imagem:imagemBase64})
-    });
-    const d=await r.json();
-    
-    if(r.ok && d.reconhecido){
-      status.className='camera-login-status status-sucesso';
-      status.innerHTML='✅ Rosto reconhecido! Confiança: '+(d.confianca||0).toFixed(1);
-      setTimeout(()=>{
-        fecharCamera();
-        continuarRegistroAposFace(d.foto_salva||'',d.confianca||0);
-      },800);
-    }else{
-      status.className='camera-login-status status-erro';
-      status.innerHTML='❌ '+(d.detail||'Rosto não reconhecido');
-      if(d.tentativas_restantes!==undefined){
-        tentInfo.innerHTML='Tentativas restantes: <span class="restantes">'+d.tentativas_restantes+'</span> de """ + str(MAX_TENTATIVAS_FACIAIS) + """';
-      }
-      if(d.bloqueado){
-        setTimeout(()=>{
-          fecharCamera();
-          mostrar('🚫 VOCÊ FOI BLOQUEADO!\\nApós """ + str(MAX_TENTATIVAS_FACIAIS) + """ tentativas falhas de reconhecimento facial.\\n\\nContate o administrador para desbloquear.','erro');
-          setTimeout(()=>location.reload(),4000);
-        },1500);
-      }else{
-        btnCap.disabled=false;
-      }
-    }
-  }catch(e){
-    status.className='camera-login-status status-erro';
-    status.innerHTML='❌ Erro de conexão';
-    btnCap.disabled=false;
-  }
-}
-
-async function continuarRegistroAposFace(fotoSalva,confianca){
+async function registrar(tipo){
+  if(!CPF)return;
   travarBotoes(true);
   try{
-    const r=await fetch('/api/solicitar_ponto',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({cpf:CPF,tipo:TIPO_ATUAL,qr_code:QR,foto_verificacao:fotoSalva,confianca_facial:confianca})
-    });
+    const r=await fetch('/api/solicitar_ponto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cpf:CPF,tipo:tipo,qr_code:QR})});
     const d=await r.json();
-    
     if(!r.ok){mostrar(d.detail||'Erro','erro');travarBotoes(false);return;}
     
     if(d.requer_autorizacao){
+      // Precisa de autorizacao admin - mostra tela bloqueada
       abrirTelaAutorizacao(d);
     }else{
+      // Registro normal sem necessidade de autorizacao
       await finalizarRegistro(d.registro_id);
     }
   }catch(e){mostrar('Erro de conexão!','erro');travarBotoes(false);}
@@ -1367,11 +775,11 @@ function abrirTelaAutorizacao(dados){
   let textoDiferenca='';
   if(dados.tipo_diferenca==='antecipado'){
     document.getElementById('autTitulo').textContent='⏰ Entrando Antes do Horário';
-    document.getElementById('autSubtitulo').textContent='Sua solicitação foi enviada para o administrador';
+    document.getElementById('autSubtitulo').textContent='Sua solicitação de registro antecipado foi enviada';
     textoDiferenca=dados.minutos_diferenca+' min ANTES do horário';
   }else{
     document.getElementById('autTitulo').textContent='⚠️ Atraso Detectado';
-    document.getElementById('autSubtitulo').textContent='Sua solicitação foi enviada para o administrador';
+    document.getElementById('autSubtitulo').textContent='Sua solicitação de registro com atraso foi enviada';
     textoDiferenca=dados.minutos_diferenca+' min ATRASADO';
   }
   
@@ -1379,9 +787,11 @@ function abrirTelaAutorizacao(dados){
     'Horário padrão: <strong>'+dados.horario_padrao+'</strong><br>'+
     'Horário atual: <strong>'+dados.hora_registro+'</strong>';
   document.getElementById('autMinutos').textContent=textoDiferenca;
+  
   document.getElementById('autResposta').className='resposta-admin';
   document.getElementById('telaAutorizacao').classList.add('ativa');
   
+  // Inicia polling para verificar status
   pollingAutorizacao=setInterval(verificarStatusAutorizacao,2000);
   atualizarTempoRestante();
 }
@@ -1399,10 +809,11 @@ function atualizarTempoRestante(){
     clearInterval(pollingAutorizacao);
     pollingAutorizacao=null;
     fecharTelaAutorizacao();
-    mostrar('⏱️ Tempo esgotado! Solicitação expirada.','erro');
+    mostrar('⏱️ Tempo esgotado! Solicitação expirada. Tente novamente.','erro');
     travarBotoes(false);
     return;
   }
+  
   if(pollingAutorizacao)setTimeout(atualizarTempoRestante,1000);
 }
 
@@ -1413,44 +824,67 @@ async function verificarStatusAutorizacao(){
     const d=await r.json();
     
     if(d.status==='aprovado'){
-      clearInterval(pollingAutorizacao);pollingAutorizacao=null;
+      clearInterval(pollingAutorizacao);
+      pollingAutorizacao=null;
+      
+      // Mostra resposta do admin se houver
       if(d.resposta_admin){
         const respEl=document.getElementById('autResposta');
         respEl.textContent='📝 Admin: '+d.resposta_admin;
         respEl.className='resposta-admin visivel';
       }
+      
       document.querySelector('.status-aguardando .texto').innerHTML='✅ <strong style="color:#2e7d32;">AUTORIZADO!</strong> Registrando...';
-      document.getElementById('autIcone').style.background='linear-gradient(135deg,#4CAF50,#81c784)';
-      document.getElementById('autIcone').textContent='✅';
-      setTimeout(async ()=>{await finalizarRegistroComAutorizacao(idSolicitacaoAtual,d.resposta_admin||'');},1000);
+      document.querySelector('.autorizacao-icone').style.background='linear-gradient(135deg,#4CAF50,#81c784)';
+      document.querySelector('.autorizacao-icone').textContent='✅';
+      
+      setTimeout(async ()=>{
+        await finalizarRegistroComAutorizacao(idSolicitacaoAtual,d.resposta_admin||'');
+      },1000);
+      
     }else if(d.status==='rejeitado'){
-      clearInterval(pollingAutorizacao);pollingAutorizacao=null;
+      clearInterval(pollingAutorizacao);
+      pollingAutorizacao=null;
+      
       document.querySelector('.status-aguardando .texto').innerHTML='❌ <strong style="color:#c62828;">NEGADO!</strong>';
-      document.getElementById('autIcone').style.background='linear-gradient(135deg,#f44336,#e57373)';
-      document.getElementById('autIcone').textContent='❌';
+      document.querySelector('.autorizacao-icone').style.background='linear-gradient(135deg,#f44336,#e57373)';
+      document.querySelector('.autorizacao-icone').textContent='❌';
+      
       if(d.resposta_admin){
         const respEl=document.getElementById('autResposta');
         respEl.textContent='📝 Motivo: '+d.resposta_admin;
         respEl.className='resposta-admin visivel';
       }
+      
       setTimeout(()=>{
         fecharTelaAutorizacao();
         mostrar('❌ Solicitação negada pelo administrador.'+(d.resposta_admin?'\\nMotivo: '+d.resposta_admin:''),'erro');
         travarBotoes(false);
       },2500);
+      
     }else if(d.status==='expirado'){
-      clearInterval(pollingAutorizacao);pollingAutorizacao=null;
+      clearInterval(pollingAutorizacao);
+      pollingAutorizacao=null;
       fecharTelaAutorizacao();
-      mostrar('⏱️ Solicitação expirada!','erro');
+      mostrar('⏱️ Solicitação expirada! Tente novamente.','erro');
       travarBotoes(false);
     }
   }catch(e){}
 }
 
+async function cancelarAutorizacao(){
+  if(pollingAutorizacao){clearInterval(pollingAutorizacao);pollingAutorizacao=null;}
+  idSolicitacaoAtual=null;
+  tempoInicioAutorizacao=null;
+  fecharTelaAutorizacao();
+  travarBotoes(false);
+  mostrar('Solicitação cancelada.','erro');
+}
+
 function fecharTelaAutorizacao(){
   document.getElementById('telaAutorizacao').classList.remove('ativa');
-  document.getElementById('autIcone').style.background='';
-  document.getElementById('autIcone').textContent='⏰';
+  document.querySelector('.autorizacao-icone').style.background='';
+  document.querySelector('.autorizacao-icone').textContent='⏰';
 }
 
 async function finalizarRegistro(registroId){
@@ -1479,9 +913,10 @@ async function finalizarRegistroComAutorizacao(solicitacaoId,respostaAdmin){
       if(d.mensagem.includes('Banco'))t='banco-horas';
       mostrar(d.mensagem+'\\n\\n✅ COM AUTORIZAÇÃO DO ADMINISTRADOR',t);
     }else{
-      mostrar(d.detail||'Erro','erro');
+      mostrar(d.detail||'Erro ao registrar','erro');
     }
   }catch(e){mostrar('Erro de conexão!','erro');}
+  
   setTimeout(()=>{fecharTelaAutorizacao();travarBotoes(false);},1500);
 }
 
@@ -1489,12 +924,13 @@ function mostrar(texto,tipo){
   const m=document.getElementById('mensagem');
   m.textContent=texto;
   m.className='mensagem '+tipo;
-  setTimeout(()=>m.className='mensagem',15000);
+  setTimeout(()=>m.className='mensagem',12000);
 }
 </script>
 </body>
 </html>"""
 
+# ===================== HTML - PAINEL ADMIN (COM ALERTAS DE AUTORIZACAO) =====================
 def gerar_html_admin():
     ts = str(int(agora_brasilia().timestamp()))
     return """<!DOCTYPE html>
@@ -1515,11 +951,13 @@ body { background:#f0f2f5; min-height:100vh; }
 .logout { position:absolute; right:20px; top:50%; transform:translateY(-50%); background:rgba(255,255,255,0.2); padding:9px 18px; border-radius:25px; cursor:pointer; font-size:13px; border:1px solid rgba(255,255,255,0.35); backdrop-filter:blur(5px); transition:all 0.3s; font-weight:bold; }
 .logout:hover { background:rgba(255,255,255,0.35); transform:translateY(-50%) scale(1.05); }
 
+/* ===== ALERTA DE AUTORIZACOES PENDENTES ===== */
 .alerta-autorizacoes { display:none; background:linear-gradient(135deg,#ff5722,#ff9800); color:white; padding:15px 25px; text-align:center; cursor:pointer; position:relative; overflow:hidden; box-shadow:0 4px 20px rgba(255,87,34,0.4); }
 .alerta-autorizacoes.visivel { display:block; animation:entrar-cima 0.4s ease; }
 .alerta-autorizacoes .conteudo { display:flex; align-items:center; justify-content:center; gap:12px; font-weight:bold; font-size:15px; }
 .alerta-autorizacoes .icone { font-size:24px; }
 .alerta-autorizacoes .badge { background:white; color:#ff5722; padding:3px 12px; border-radius:20px; font-weight:bold; font-size:13px; }
+.alerta-autorizacoes:hover { filter:brightness(1.1); }
 
 .container { max-width:1250px; margin:25px auto; padding:0 20px; }
 .tabs { display:flex; gap:6px; margin-bottom:20px; flex-wrap:wrap; }
@@ -1545,15 +983,12 @@ button:active { transform:translateY(0); }
 table { width:100%; border-collapse:collapse; margin-top:15px; display:block; overflow-x:auto; }
 th, td { padding:11px 13px; text-align:left; border-bottom:1px solid #eee; font-size:13px; white-space:nowrap; }
 th { background:linear-gradient(135deg,#f8f9fa,#eef2f7); font-weight:bold; color:#555; }
-.linha-bloqueada { background-color:#ffebee !important; }
-.linha-bloqueada td { color:#b71c1c; }
-.badge-status { padding:3px 10px; border-radius:12px; font-size:11px; font-weight:bold; }
-.badge-ativo { background:#e8f5e9; color:#2e7d32; }
-.badge-bloqueado { background:#ffebee; color:#b71c1c; }
-.badge-sem-foto { background:#fff3e0; color:#e65100; }
-.foto-miniatura { width:36px; height:36px; border-radius:50%; object-fit:cover; border:2px solid #ddd; }
-.sem-foto { width:36px; height:36px; border-radius:50%; background:#eee; display:flex; align-items:center; justify-content:center; font-size:14px; color:#999; font-weight:bold; }
-
+.atrasado { color:#f44336; font-weight:bold; }
+.banco-horas { color:#0c5460; font-weight:bold; }
+.tipo-entrada { color:#4CAF50; font-weight:bold; }
+.tipo-saida-almoco { color:#ff9800; font-weight:bold; }
+.tipo-retorno-almoco { color:#2196F3; font-weight:bold; }
+.tipo-saida { color:#f44336; font-weight:bold; }
 .grid-2 { display:grid; grid-template-columns:1fr 1fr; gap:22px; }
 @media(max-width:700px){.grid-2{grid-template-columns:1fr}}
 .mensagem { padding:14px; border-radius:12px; margin:12px 0; display:none; font-weight:bold; font-size:14px; }
@@ -1563,19 +998,16 @@ th { background:linear-gradient(135deg,#f8f9fa,#eef2f7); font-weight:bold; color
 .card { background:linear-gradient(135deg,#fafafa,#f5f7fa); padding:18px; border-radius:14px; margin:12px 0; border-left:4px solid #667eea; box-shadow:0 3px 10px rgba(0,0,0,0.05); }
 .horarios-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
 .info-box { background:linear-gradient(135deg,#fff8e1,#ffecb3); border-left:4px solid #ffc107; padding:14px; border-radius:8px; margin:15px 0; font-size:13px; color:#856404; }
+.justificativa-cell { max-width:180px; font-size:11px; color:#666; font-style:italic; overflow:hidden; text-overflow:ellipsis; }
+.minutos-cell { color:#f44336; font-weight:bold; }
+.banco-cell { color:#0c5460; font-weight:bold; }
+.fim-semana { background-color:#fffde7 !important; }
+.fim-semana td { color:#e65100; }
 .filtros { display:flex; gap:10px; margin-bottom:15px; flex-wrap:wrap; align-items:center; }
 .filtros input, .filtros select { margin:0; width:auto; min-width:150px; }
 label { font-size:13px; color:#555; font-weight:bold; display:block; margin-top:8px; }
 
-/* Upload de foto */
-.upload-foto { border:3px dashed #ccc; border-radius:14px; padding:20px; text-align:center; cursor:pointer; transition:all 0.3s; margin:10px 0; }
-.upload-foto:hover { border-color:#667eea; background:#f5f7fa; }
-.upload-foto.drag { border-color:#667eea; background:#e8f0fe; }
-.upload-foto .icone { font-size:40px; color:#999; margin-bottom:8px; }
-.upload-foto .texto { color:#666; font-size:13px; }
-.preview-foto { max-width:150px; max-height:150px; border-radius:12px; margin:10px auto; display:none; border:3px solid #667eea; }
-.preview-foto.visivel { display:block; }
-
+/* ===== CARDS DE AUTORIZACAO PENDENTE ===== */
 .lista-autorizacoes { display:grid; gap:15px; margin-top:15px; }
 .card-autorizacao { background:linear-gradient(135deg,#fff8e1,#ffe0b2); border-left:5px solid #ff9800; border-radius:14px; padding:20px; box-shadow:0 4px 15px rgba(255,152,0,0.15); position:relative; }
 .card-autorizacao.urgente { animation:pulsar-alerta 1.5s infinite; }
@@ -1604,10 +1036,11 @@ label { font-size:13px; color:#555; font-weight:bold; display:block; margin-top:
 <div class="logout" onclick="sair()">🚪 Sair</div>
 </div>
 
+<!-- ===== BARRA DE ALERTA DE AUTORIZACOES ===== -->
 <div class="alerta-autorizacoes" id="alertaAut" onclick="abrir('autorizacoes',this)">
 <div class="conteudo">
 <span class="icone">⏰</span>
-<span><span id="qtdAut">0</span> SOLICITAÇÃO(ÕES) PENDENTE(S)!</span>
+<span><span id="qtdAut">0</span> SOLICITAÇÃO(ÕES) DE AUTORIZAÇÃO PENDENTE(S)!</span>
 <span class="badge" id="badgeAut">0</span>
 <span style="margin-left:10px;font-size:12px;opacity:0.9;">→ Clique para ver</span>
 </div>
@@ -1618,15 +1051,18 @@ label { font-size:13px; color:#555; font-weight:bold; display:block; margin-top:
 <button class="tab ativo" onclick="abrir('cadastro',this)">👤 Cadastrar</button>
 <button class="tab" onclick="abrir('funcionarios',this)">📋 Funcionários</button>
 <button class="tab" onclick="abrir('registros',this)">📊 Registros</button>
-<button class="tab" onclick="abrir('autorizacoes',this)">⏰ Autorizações<span class="badge-aut" id="tabBadgeAut">0</span></button>
-<button class="tab" onclick="abrir('relatorios',this)">📄 Relatórios</button>
+<button class="tab" onclick="abrir('autorizacoes',this)">
+⏰ Autorizações
+<span class="badge-aut" id="tabBadgeAut">0</span>
+</button>
+<button class="tab" onclick="abrir('relatorios',this)">📄 Relatórios PDF</button>
 <button class="tab" onclick="abrir('qrcode',this)">📱 QR Code</button>
 <button class="tab" onclick="abrir('acessos',this)">📡 Acessos</button>
 <button class="tab" onclick="abrir('config',this)">🔧 Configurações</button>
 </div>
 
 <div id="cadastro" class="painel ativo">
-<h2>👤 Cadastrar Novo Funcionário</h2>
+<h2>Cadastrar Novo Funcionário</h2>
 <div class="mensagem" id="msgCad"></div>
 <label>Nome Completo:</label>
 <input type="text" id="nome" placeholder="Ex: Maria da Silva">
@@ -1638,26 +1074,17 @@ label { font-size:13px; color:#555; font-weight:bold; display:block; margin-top:
 <div><label>Retorno do Almoço:</label><input type="text" id="hRetornoAlmoco" value="13:00:00"></div>
 <div><label>Horário de Saída:</label><input type="text" id="hSaida" value="18:00:00"></div>
 </div>
-
-<label style="margin-top:18px;">📸 Foto de Rosto (OBRIGATÓRIA para reconhecimento facial):</label>
-<div class="upload-foto" id="uploadFoto" onclick="document.getElementById('fotoInput').click()">
-<div class="icone">📷</div>
-<div class="texto">Clique para enviar uma foto de rosto<br><small style="color:#999;">Formatos: JPG, PNG | Use foto bem iluminada, só o rosto</small></div>
-</div>
-<input type="file" id="fotoInput" accept="image/*" style="display:none;">
-<img id="previewFoto" class="preview-foto" alt="Preview">
-
 <button class="btn-success" onclick="cadastrar()">💾 Salvar Cadastro</button>
 </div>
 
 <div id="funcionarios" class="painel">
-<h2>📋 Funcionários Cadastrados</h2>
+<h2>Funcionários Cadastrados</h2>
 <button onclick="carregarFuncs()">🔄 Atualizar Lista</button>
-<table><thead><tr><th>Foto</th><th>ID</th><th>Nome</th><th>CPF</th><th>Entrada</th><th>Status</th><th>Tentativas</th><th>Ações</th></tr></thead><tbody id="tbodyFunc"></tbody></table>
+<table><thead><tr><th>ID</th><th>Nome</th><th>CPF</th><th>Entrada</th><th>Saída Almoço</th><th>Retorno</th><th>Saída</th><th>Ação</th></tr></thead><tbody id="tbodyFunc"></tbody></table>
 </div>
 
 <div id="registros" class="painel">
-<h2>📊 Todos os Registros de Ponto</h2>
+<h2>Todos os Registros de Ponto</h2>
 <div class="filtros">
 <input type="text" id="filtroNome" placeholder="Filtrar por nome..." oninput="carregarRegs()">
 <select id="filtroTipo" onchange="carregarRegs()">
@@ -1669,22 +1096,22 @@ label { font-size:13px; color:#555; font-weight:bold; display:block; margin-top:
 </select>
 <button onclick="carregarRegs()">🔄 Atualizar</button>
 </div>
-<table><thead><tr><th>Funcionário</th><th>CPF</th><th>Data</th><th>Hora</th><th>Tipo</th><th>Atrasado</th><th>Min.</th><th>Banco</th><th>Face</th><th>Aut.</th><th>IP</th></tr></thead><tbody id="tbodyReg"></tbody></table>
+<table><thead><tr><th>Funcionário</th><th>CPF</th><th>Data</th><th>Hora</th><th>Tipo</th><th>Atrasado</th><th>Min.</th><th>Banco</th><th>Justificativa</th><th>Aut.</th><th>IP</th></tr></thead><tbody id="tbodyReg"></tbody></table>
 </div>
 
 <div id="autorizacoes" class="painel">
 <h2>⏰ Solicitações de Autorização Pendentes</h2>
 <div class="info-box">
-<strong>ℹ️ Como funciona:</strong> Quando um funcionário tenta registrar ponto fora do horário padrão, sua tela fica bloqueada até que você aprove ou rejeite.
+<strong>ℹ️ Como funciona:</strong> Quando um funcionário tenta registrar ponto fora do horário padrão (entrando mais cedo ou saindo mais tarde), sua tela fica bloqueada até que você aprove ou rejeite a solicitação.
 </div>
 <button onclick="carregarAutorizacoes()">🔄 Atualizar</button>
 <div class="lista-autorizacoes" id="listaAut">
-<div class="vazio-aut"><div class="icone">✅</div>Nenhuma solicitação pendente.</div>
+<div class="vazio-aut"><div class="icone">✅</div>Nenhuma solicitação pendente no momento.</div>
 </div>
 </div>
 
 <div id="relatorios" class="painel">
-<h2>📄 Gerar Relatórios em PDF</h2>
+<h2>Gerar Relatórios em PDF</h2>
 <div class="grid-2">
 <div class="card">
 <h3 style="margin:10px 0;color:#555;">📄 Relatório Geral do Mês</h3>
@@ -1710,7 +1137,7 @@ label { font-size:13px; color:#555; font-weight:bold; display:block; margin-top:
 </div>
 
 <div id="acessos" class="painel">
-<h2>📡 Registros de Acesso</h2>
+<h2>📡 Registros de Acesso de Dispositivos</h2>
 <button onclick="carregarAcessos()">🔄 Atualizar</button>
 <table><thead><tr><th>Data/Hora</th><th>CPF</th><th>Funcionário</th><th>IP</th><th>Dispositivo</th><th>Tipo</th></tr></thead><tbody id="tbodyAcessos"></tbody></table>
 </div>
@@ -1718,58 +1145,41 @@ label { font-size:13px; color:#555; font-weight:bold; display:block; margin-top:
 <div id="config" class="painel">
 <h2>🔧 Configurações</h2>
 <div class="card">
-<h3 style="margin-bottom:10px;">👤 Reconhecimento Facial</h3>
-<p style="font-size:14px;line-height:1.6;">
-• <strong>Obrigatório</strong> para todos os registros de ponto<br>
-• Algoritmo: LBPH (OpenCV)<br>
-• Limite de confiança: <strong>""" + str(LIMIAR_CONFIANCA_FACIAL) + """</strong><br>
-• Tentativas antes do bloqueio: <strong>""" + str(MAX_TENTATIVAS_FACIAIS) + """</strong><br>
-• Funcionários bloqueados só podem ser desbloqueados pelo admin
-</p>
+<h3 style="margin-bottom:10px;">🖼️ Logo da Clínica</h3>
+<p style="font-size:14px;line-height:1.6;">Coloque sua logo em <strong>static/logo.png</strong> (formato PNG).<br>Se não aparecer, pressione <strong>Ctrl+F5</strong>.</p>
 </div>
 <div class="card">
-<h3 style="margin-bottom:10px;">🔐 Credenciais</h3>
+<h3 style="margin-bottom:10px;">🔐 Credenciais de Acesso</h3>
 <p style="font-size:14px;"><strong>Usuário:</strong> admin<br><strong>Senha:</strong> 3223ronte</p>
 </div>
 <div class="card">
-<h3 style="margin-bottom:10px;">⏰ Horário do Servidor</h3>
-<p style="font-size:14px;"><strong>Horário de Brasília:</strong> """ + agora_brasilia().strftime("%d/%m/%Y %H:%M:%S") + """</p>
+<h3 style="margin-bottom:10px;">⏰ Sistema de Autorização</h3>
+<p style="font-size:14px;line-height:1.6;">
+• Funcionários que registram <strong>fora do horário</strong> precisam de sua autorização<br>
+• A tela do funcionário fica <strong>bloqueada</strong> até sua resposta<br>
+• Solicitações expiram após <strong>5 minutos</strong><br>
+• Você recebe <strong>alertas em tempo real</strong> nesta página
+</p>
+</div>
+<div class="card">
+<h3 style="margin-bottom:10px;">🛡️ Segurança</h3>
+<p style="font-size:14px;line-height:1.6;">
+• Rate limiting contra brute force<br>
+• Cabeçalhos de segurança anti-XSS<br>
+• Sanitização de todas as entradas<br>
+• Registro de IP e dispositivo em cada acesso<br>
+• Cookies HttpOnly e SameSite
+</p>
 </div>
 """ + RODAPE_WELL + """
 </div>
 </div>
 </div>
-
 <script>
 const h=new Date();const ma=h.toISOString().slice(0,7);
 document.getElementById('mesAno').value=ma;document.getElementById('mesAnoFunc').value=ma;
 document.getElementById('urlLocal').textContent=window.location.origin+'/';
 document.getElementById('cpfCad').addEventListener('input',function(){this.value=this.value.replace(/\\D/g,'');});
-
-let fotoBase64=null;
-const fotoInput=document.getElementById('fotoInput');
-const uploadFoto=document.getElementById('uploadFoto');
-const previewFoto=document.getElementById('previewFoto');
-
-fotoInput.addEventListener('change',function(e){
-  const f=e.target.files[0];
-  if(!f)return;
-  if(f.size>5*1024*1024){alert('Arquivo muito grande! Máximo 5MB');return;}
-  const r=new FileReader();
-  r.onload=function(ev){
-    fotoBase64=ev.target.result.split(',')[1];
-    previewFoto.src=ev.target.result;
-    previewFoto.classList.add('visivel');
-  };
-  r.readAsDataURL(f);
-});
-
-['dragenter','dragover'].forEach(ev=>uploadFoto.addEventListener(ev,e=>{e.preventDefault();uploadFoto.classList.add('drag');}));
-['dragleave','drop'].forEach(ev=>uploadFoto.addEventListener(ev,e=>{e.preventDefault();uploadFoto.classList.remove('drag');}));
-uploadFoto.addEventListener('drop',e=>{
-  const f=e.dataTransfer.files[0];
-  if(f){fotoInput.files=e.dataTransfer.files;fotoInput.dispatchEvent(new Event('change'));}
-});
 
 let audioAlerta=null;
 try{audioAlerta=new Audio('data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2teleQkFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYIG2m98OScTgwOUarm7blmFgU7k9n1unEiBC13yO/eizEIHWq+8+OWT');}catch(e){}
@@ -1779,6 +1189,7 @@ function abrir(n,btn){
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('ativo'));
   document.getElementById(n).classList.add('ativo');
   if(btn)btn.classList.add('ativo');
+  else{document.querySelectorAll('.tab').forEach(t=>{if(t.textContent.includes(n.substring(0,4).toUpperCase()))t.classList.add('ativo');});}
   if(n==='funcionarios')carregarFuncs();
   if(n==='registros')carregarRegs();
   if(n==='relatorios')carregarSel();
@@ -1790,62 +1201,22 @@ function sair(){document.cookie='sessao_admin=; expires=Thu, 01 Jan 1970 00:00:0
 function msg(id,texto,tipo){const e=document.getElementById(id);e.textContent=texto;e.className='mensagem '+tipo;setTimeout(()=>e.className='mensagem',4000);}
 
 async function cadastrar(){
-  const d={
-    nome:document.getElementById('nome').value.trim(),
-    cpf:document.getElementById('cpfCad').value.replace(/\\D/g,''),
-    horario_entrada:document.getElementById('hEntrada').value.trim()||'08:00:00',
-    horario_saida_almoco:document.getElementById('hSaidaAlmoco').value.trim()||'12:00:00',
-    horario_retorno_almoco:document.getElementById('hRetornoAlmoco').value.trim()||'13:00:00',
-    horario_saida:document.getElementById('hSaida').value.trim()||'18:00:00',
-    foto_base64:fotoBase64
-  };
+  const d={nome:document.getElementById('nome').value.trim(),cpf:document.getElementById('cpfCad').value.replace(/\\D/g,''),horario_entrada:document.getElementById('hEntrada').value.trim()||'08:00:00',horario_saida_almoco:document.getElementById('hSaidaAlmoco').value.trim()||'12:00:00',horario_retorno_almoco:document.getElementById('hRetornoAlmoco').value.trim()||'13:00:00',horario_saida:document.getElementById('hSaida').value.trim()||'18:00:00'};
   if(!d.nome||!d.cpf){msg('msgCad','Preencha nome e CPF!','erro');return;}
   if(d.cpf.length!==11){msg('msgCad','CPF deve ter 11 dígitos!','erro');return;}
-  if(!d.foto_base64){msg('msgCad','📸 A foto de rosto é OBRIGATÓRIA!','erro');return;}
-  
   const r=await fetch('/api/funcionarios',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});
-  if(r.ok){
-    msg('msgCad','✅ Funcionário cadastrado com foto!','sucesso');
-    document.getElementById('nome').value='';document.getElementById('cpfCad').value='';
-    document.getElementById('fotoInput').value='';previewFoto.classList.remove('visivel');fotoBase64=null;
-  }else{const e=await r.json();msg('msgCad','❌ '+(e.detail||'Erro'),'erro');}
+  if(r.ok){msg('msgCad','✅ Funcionário cadastrado!','sucesso');document.getElementById('nome').value='';document.getElementById('cpfCad').value='';}
+  else{const e=await r.json();msg('msgCad','❌ '+(e.detail||'Erro'),'erro');}
 }
 
 async function carregarFuncs(){
   const r=await fetch('/api/funcionarios');if(r.status===401){window.location.href='/admin';return;}
   const d=await r.json();const tb=document.getElementById('tbodyFunc');
   if(d.length===0){tb.innerHTML='<tr><td colspan="8" style="text-align:center;color:#999;padding:20px;">Nenhum cadastrado.</td></tr>';return;}
-  tb.innerHTML=d.map(f=>{
-    const fotoHtml=f.foto_perfil
-      ?'<img src="'+f.foto_perfil+'?t='+Date.now()+'" class="foto-miniatura">'
-      :'<div class="sem-foto">📷</div>';
-    let statusBadge='';
-    if(f.bloqueado)statusBadge='<span class="badge-status badge-bloqueado">🚫 BLOQUEADO</span>';
-    else if(!f.face_treinada && !f.foto_perfil)statusBadge='<span class="badge-status badge-sem-foto">📷 Sem foto</span>';
-    else if(!f.face_treinada && f.foto_perfil)statusBadge='<span class="badge-status badge-sem-foto" style="background:#e3f2fd;color:#1565c0;">📷 Foto cadastrada</span>';
-    else statusBadge='<span class="badge-status badge-ativo">✅ Ativo</span>';
-    
-    const linhaClasse=f.bloqueado?'linha-bloqueada':'';
-    const tentativas=f.tentativas_reconhecimento||0;
-    const tentHtml=tentativas>0?'<strong style="color:#f44336;">'+tentativas+'/""" + str(MAX_TENTATIVAS_FACIAIS) + """</strong>':'0/""" + str(MAX_TENTATIVAS_FACIAIS) + """';
-    
-    const acoes=f.bloqueado
-      ?'<button class="btn-success btn-small" onclick="desbloquear('+f.id+')">🔓 Desbloquear</button>'
-      :'<button class="btn-danger btn-small" onclick="excluir('+f.id+')">Excluir</button>';
-    
-    return '<tr class="'+linhaClasse+'"><td>'+fotoHtml+'</td><td>'+f.id+'</td><td><strong>'+f.nome+'</strong></td><td>'+f.cpf+'</td><td>'+f.horario_entrada+'</td><td>'+statusBadge+'</td><td>'+tentHtml+'</td><td>'+acoes+'</td></tr>';
-  }).join('');
+  tb.innerHTML=d.map(f=>'<tr><td>'+f.id+'</td><td>'+f.nome+'</td><td>'+f.cpf+'</td><td><strong>'+f.horario_entrada+'</strong></td><td>'+f.horario_saida_almoco+'</td><td>'+f.horario_retorno_almoco+'</td><td><strong>'+f.horario_saida+'</strong></td><td><button class="btn-danger btn-small" onclick="excluir('+f.id+')">Excluir</button></td></tr>').join('');
 }
 
 async function excluir(id){if(confirm('Tem CERTEZA? Todos os registros serão APAGADOS!')){const r=await fetch('/api/funcionarios/'+id,{method:'DELETE'});if(r.status===401){window.location.href='/admin';return;}carregarFuncs();}}
-
-async function desbloquear(id){
-  if(!confirm('Deseja realmente DESBLOQUEAR este funcionário?\\nAs tentativas de reconhecimento serão resetadas.'))return;
-  const r=await fetch('/api/funcionarios/desbloquear/'+id,{method:'POST'});
-  if(r.status===401){window.location.href='/admin';return;}
-  if(r.ok)carregarFuncs();
-  else{const e=await r.json();alert('Erro: '+(e.detail||''));}
-}
 
 async function carregarRegs(){
   const r=await fetch('/api/registros');if(r.status===401){window.location.href='/admin';return;}
@@ -1859,12 +1230,12 @@ async function carregarRegs(){
   tb.innerHTML=d.map(function(r){
     const ct='tipo-'+r.tipo.toLowerCase().replace(/_/g,'-');
     const cf=r.dia_semana>=5?' fim-semana':'';
-    const mh=r.minutos_atraso>0?'<span style="color:#f44336;font-weight:bold;">'+r.minutos_atraso+'</span>':'-';
-    const bh=r.minutos_banco_horas>0?'<span style="color:#0c5460;font-weight:bold;">+'+r.minutos_banco_horas+'</span>':'-';
-    const face=r.confianca_facial>0?'<span style="color:#4CAF50;font-weight:bold;">'+r.confianca_facial.toFixed(0)+'</span>':'-';
+    const mh=r.minutos_atraso>0?'<span class="minutos-cell">'+r.minutos_atraso+'</span>':'-';
+    const bh=r.minutos_banco_horas>0?'<span class="banco-cell">+'+r.minutos_banco_horas+'</span>':'-';
+    const jt=r.justificativa?'<span class="justificativa-cell" title="'+r.justificativa.replace(/"/g,'&quot;')+'">'+r.justificativa+'</span>':'<span style="color:#ccc;">-</span>';
     const aut=r.autorizado_admin?'<span style="color:#4CAF50;font-weight:bold;">✅</span>':'-';
     const ip=r.ip_dispositivo||'<span style="color:#ccc;">-</span>';
-    return '<tr class="'+cf+'"><td><strong>'+r.nome+'</strong></td><td>'+r.cpf+'</td><td>'+r.data+'</td><td>'+r.hora+'</td><td class="'+ct+'">'+r.tipo_formatado+'</td><td>'+(r.atrasado?'⚠️':'✅')+'</td><td>'+mh+'</td><td>'+bh+'</td><td>'+face+'</td><td>'+aut+'</td><td style="font-size:11px;color:#888;">'+ip+'</td></tr>';
+    return '<tr class="'+cf+'"><td>'+r.nome+'</td><td>'+r.cpf+'</td><td>'+r.data+'</td><td>'+r.hora+'</td><td class="'+ct+'">'+r.tipo_formatado+'</td><td class="'+(r.atrasado?'atrasado':'')+'">'+(r.atrasado?'⚠️ SIM':'✅ NÃO')+'</td><td>'+mh+'</td><td>'+bh+'</td><td>'+jt+'</td><td>'+aut+'</td><td style="font-size:11px;color:#888;">'+ip+'</td></tr>';
   }).join('');
 }
 
@@ -1876,93 +1247,140 @@ async function carregarSel(){
 }
 
 function gerarGeral(){const m=document.getElementById('mesAno').value;if(!m){alert('Selecione o mês!');return;}window.open('/api/pdf/geral?mes='+m,'_blank');}
-function gerarInd(){const i=document.getElementById('selFunc').value;const m=document.getElementById('mesAnoFunc').value;if(!i||!m){alert('Preencha!');return;}window.open('/api/pdf/funcionario/'+i+'?mes='+m,'_blank');}
+function gerarInd(){const i=document.getElementById('selFunc').value;const m=document.getElementById('mesAnoFunc').value;if(!i||!m){alert('Preencha todos os campos!');return;}window.open('/api/pdf/funcionario/'+i+'?mes='+m,'_blank');}
 
 async function gerarQR(){
   const r=await fetch('/api/gerar_qrcode');if(r.status===401){window.location.href='/admin';return;}
   const d=await r.json();
   if(d.detail)document.getElementById('qrImg').innerHTML='<p style="color:#f44336;">❌ '+d.detail+'</p>';
-  else document.getElementById('qrImg').innerHTML='<img src="'+d.caminho+'?t='+Date.now()+'" style="max-width:250px;border:3px solid #ddd;border-radius:14px;">';
+  else document.getElementById('qrImg').innerHTML='<img src="'+d.caminho+'?t='+Date.now()+'" style="max-width:250px;border:3px solid #ddd;border-radius:14px;box-shadow:0 8px 25px rgba(0,0,0,0.15);">';
 }
 
 async function carregarAcessos(){
   const r=await fetch('/api/acessos');if(r.status===401){window.location.href='/admin';return;}
   const d=await r.json();const tb=document.getElementById('tbodyAcessos');
-  if(d.length===0){tb.innerHTML='<tr><td colspan="6" style="text-align:center;color:#999;padding:20px;">Nenhum acesso.</td></tr>';return;}
-  tb.innerHTML=d.map(a=>'<tr><td>'+a.data_hora+'</td><td>'+a.cpf+'</td><td>'+(a.nome||'-')+'</td><td style="font-size:11px;">'+a.ip+'</td><td style="font-size:10px;color:#888;max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="'+(a.user_agent||'').replace(/"/g,'&quot;')+'">'+(a.user_agent||'-')+'</td><td>'+a.tipo_acesso+'</td></tr>').join('');
+  if(d.length===0){tb.innerHTML='<tr><td colspan="6" style="text-align:center;color:#999;padding:20px;">Nenhum acesso registrado.</td></tr>';return;}
+  tb.innerHTML=d.map(a=>'<tr><td>'+a.data_hora+'</td><td>'+a.cpf+'</td><td>'+(a.nome||'<span style="color:#999;">-</span>')+'</td><td style="font-size:11px;color:#555;">'+a.ip+'</td><td style="font-size:10px;color:#888;max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="'+(a.user_agent||'').replace(/"/g,'&quot;')+'">'+(a.user_agent||'-')+'</td><td>'+a.tipo_acesso+'</td></tr>').join('');
 }
 
+// ===== SISTEMA DE AUTORIZACOES =====
 let qtdAnterior=0;
+
 async function verificarAutorizacoesPendentes(){
   try{
     const r=await fetch('/api/autorizacoes_pendentes');
     if(r.status===401){window.location.href='/admin';return;}
     const d=await r.json();
     const qtd=d.length||0;
+    
+    // Atualiza UI
     document.getElementById('qtdAut').textContent=qtd;
     document.getElementById('badgeAut').textContent=qtd;
     document.getElementById('tabBadgeAut').textContent=qtd;
+    
     const alerta=document.getElementById('alertaAut');
     const tabBadge=document.getElementById('tabBadgeAut');
+    
     if(qtd>0){
-      alerta.classList.add('visivel');tabBadge.classList.add('visivel');
-      if(qtd>qtdAnterior && audioAlerta){try{audioAlerta.play().catch(()=>{});}catch(e){}}
-    }else{alerta.classList.remove('visivel');tabBadge.classList.remove('visivel');}
+      alerta.classList.add('visivel');
+      tabBadge.classList.add('visivel');
+      // Toca som se for uma nova solicitacao
+      if(qtd>qtdAnterior && audioAlerta){
+        try{audioAlerta.play().catch(()=>{});}catch(e){}
+      }
+    }else{
+      alerta.classList.remove('visivel');
+      tabBadge.classList.remove('visivel');
+    }
+    
     qtdAnterior=qtd;
-    if(document.getElementById('autorizacoes').classList.contains('ativo'))renderizarAutorizacoes(d);
+    
+    // Atualiza lista se a aba estiver aberta
+    if(document.getElementById('autorizacoes').classList.contains('ativo')){
+      renderizarAutorizacoes(d);
+    }
   }catch(e){}
 }
 
-function carregarAutorizacoes(){verificarAutorizacoesPendentes();}
+function carregarAutorizacoes(){
+  verificarAutorizacoesPendentes();
+}
 
 function renderizarAutorizacoes(lista){
   const el=document.getElementById('listaAut');
   if(!lista||lista.length===0){
-    el.innerHTML='<div class="vazio-aut"><div class="icone">✅</div>Nenhuma solicitação pendente.</div>';
+    el.innerHTML='<div class="vazio-aut"><div class="icone">✅</div>Nenhuma solicitação pendente no momento.</div>';
     return;
   }
-  const coresTipo={'ENTRADA':'linear-gradient(135deg,#4CAF50,#66bb6a)','SAIDA_ALMOCO':'linear-gradient(135deg,#ff9800,#ffb74d)','RETORNO_ALMOCO':'linear-gradient(135deg,#2196F3,#64b5f6)','SAIDA':'linear-gradient(135deg,#f44336,#ef5350)'};
+  
+  const coresTipo={
+    'ENTRADA':'linear-gradient(135deg,#4CAF50,#66bb6a)',
+    'SAIDA_ALMOCO':'linear-gradient(135deg,#ff9800,#ffb74d)',
+    'RETORNO_ALMOCO':'linear-gradient(135deg,#2196F3,#64b5f6)',
+    'SAIDA':'linear-gradient(135deg,#f44336,#ef5350)'
+  };
+  
   el.innerHTML=lista.map(s=>{
     const urgente=s.segundos_restantes<60;
     const textoDif=s.tipo_diferenca==='antecipado'
-      ? '⏰ '+s.minutos_diferenca+' MIN ANTES DO HORÁRIO'
+      ? '⏰ REGISTRANDO '+s.minutos_diferenca+' MIN ANTES DO HORÁRIO'
       : '⚠️ ATRASO DE '+s.minutos_diferenca+' MIN';
     return '<div class="card-autorizacao'+(urgente?' urgente':'')+'" id="card-'+s.id+'">'+
       '<div class="tempo-urgencia">⏱️ '+Math.floor(s.segundos_restantes/60)+':'+String(s.segundos_restantes%60).padStart(2,'0')+'</div>'+
-      '<div class="cabecalho"><div class="nome">👤 '+s.nome+'</div><span class="tipo" style="background:'+(coresTipo[s.tipo]||'#666')+'">'+s.tipo_formatado+'</span></div>'+
+      '<div class="cabecalho">'+
+        '<div class="nome">👤 '+s.nome+'</div>'+
+        '<span class="tipo" style="background:'+(coresTipo[s.tipo]||'#666')+'">'+s.tipo_formatado+'</span>'+
+      '</div>'+
       '<div class="detalhes">'+
         '<div class="det-item"><div class="det-label">CPF</div><div class="det-valor">'+s.cpf+'</div></div>'+
+        '<div class="det-item"><div class="det-label">Solicitado</div><div class="det-valor">'+s.criado_em+'</div></div>'+
         '<div class="det-item"><div class="det-label">Horário Padrão</div><div class="det-valor">🕐 '+s.horario_padrao+'</div></div>'+
         '<div class="det-item"><div class="det-label">Horário Atual</div><div class="det-valor">⏰ '+s.hora_registro+'</div></div>'+
-        '<div class="det-item"><div class="det-label">Solicitado</div><div class="det-valor">'+s.criado_em+'</div></div>'+
       '</div>'+
       '<div class="diferenca">'+textoDif+'</div>'+
       '<textarea id="resp-'+s.id+'" placeholder="📝 Observação para o funcionário (opcional)..."></textarea>'+
       '<div class="acoes">'+
-        '<button class="btn-danger" onclick="responderAut(\\''+s.id+'\\',false)">❌ NEGAR</button>'+
-        '<button class="btn-success" onclick="responderAut(\\''+s.id+'\\',true)">✅ APROVAR</button>'+
-      '</div></div>';
+        '<button class="btn-danger" onclick="responderAutorizacao(\\''+s.id+'\\',false)">❌ NEGAR</button>'+
+        '<button class="btn-success" onclick="responderAutorizacao(\\''+s.id+'\\',true)">✅ APROVAR</button>'+
+      '</div>'+
+    '</div>';
   }).join('');
 }
 
-async function responderAut(sid,aprovar){
+async function responderAutorizacao(sid,aprovar){
   const resp=document.getElementById('resp-'+sid);
   const observacao=resp?resp.value.trim():'';
-  if(!aprovar && !observacao){if(!confirm('Negar sem observação?'))return;}
+  
+  if(!aprovar && !observacao){
+    if(!confirm('Deseja realmente NEGAR sem deixar uma observação?'))return;
+  }
+  
   try{
     const r=await fetch('/api/responder_autorizacao',{
-      method:'POST',headers:{'Content-Type':'application/json'},
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
       body:JSON.stringify({solicitacao_id:sid,aprovar:aprovar,resposta:observacao})
     });
     if(r.status===401){window.location.href='/admin';return;}
+    const d=await r.json();
+    
     if(r.ok){
       const card=document.getElementById('card-'+sid);
-      if(card){card.style.opacity='0.5';card.style.transform='scale(0.98)';
-        setTimeout(()=>{carregarAutorizacoes();verificarAutorizacoesPendentes();},500);}
-    }else{const d=await r.json();alert('Erro: '+(d.detail||''));}
+      if(card){
+        card.style.opacity='0.5';
+        card.style.transform='scale(0.98)';
+        setTimeout(()=>{
+          carregarAutorizacoes();
+          verificarAutorizacoesPendentes();
+        },500);
+      }
+    }else{
+      alert('Erro: '+(d.detail||'Não foi possível responder'));
+    }
   }catch(e){alert('Erro de conexão!');}
 }
 
+// Polling a cada 3 segundos
 setInterval(verificarAutorizacoesPendentes,3000);
 verificarAutorizacoesPendentes();
 </script>
@@ -1979,45 +1397,85 @@ def salvar_historico_json():
         registros = conn.execute("SELECT * FROM registros_ponto ORDER BY data_hora").fetchall()
         acessos = conn.execute("SELECT * FROM acessos_dispositivos ORDER BY data_hora_acesso").fetchall()
         conn.close()
-        dados = {"meta":{"versao_sistema":"5.0 FACE ID","ultima_atualizacao":agora_brasilia().strftime("%Y-%m-%d %H:%M:%S"),"total_funcionarios":len(funcionarios),"total_registros_ponto":len(registros)},"funcionarios":[dict(f) for f in funcionarios],"registros_ponto":[dict(r) for r in registros],"acessos_dispositivos":[dict(a) for a in acessos]}
+        
+        dados_historico = {
+            "meta": {
+                "versao_sistema": "4.0 AUTORIZA",
+                "ultima_atualizacao": agora_brasilia().strftime("%Y-%m-%d %H:%M:%S"),
+                "total_funcionarios": len(funcionarios),
+                "total_registros_ponto": len(registros),
+                "total_acessos": len(acessos)
+            },
+            "funcionarios": [dict(f) for f in funcionarios],
+            "registros_ponto": [dict(r) for r in registros],
+            "acessos_dispositivos": [dict(a) for a in acessos]
+        }
+        
         caminho_temp = HISTORICO_JSON + ".tmp"
         with open(caminho_temp, "w", encoding="utf-8") as f:
-            json.dump(dados, f, ensure_ascii=False, indent=2, default=str)
+            json.dump(dados_historico, f, ensure_ascii=False, indent=2, default=str)
+        
         os.replace(caminho_temp, HISTORICO_JSON)
+        print(f"[HISTORICO] Arquivo {HISTORICO_JSON} atualizado | {len(registros)} registros")
         return True
     except Exception as e:
-        print(f"[ERRO HISTORICO] {e}")
+        print(f"[ERRO HISTORICO] Falha ao salvar historico JSON: {e}")
         return False
 
 def fazer_backup_db():
     try:
+        import shutil
         timestamp = agora_brasilia().strftime("%Y%m%d_%H%M%S")
         caminho_backup = os.path.join(BACKUP_DIR, f"ponto_backup_{timestamp}.db")
+        
         conn = get_db()
         conn.execute("VACUUM INTO ?", (caminho_backup,))
         conn.close()
-        print(f"[BACKUP] {caminho_backup}")
+        
+        print(f"[BACKUP] Banco copiado para: {caminho_backup}")
+        
+        try:
+            caminho_json_backup = os.path.join(BACKUP_DIR, f"historico_{timestamp}.json")
+            import shutil as _shutil
+            if os.path.exists(HISTORICO_JSON):
+                _shutil.copy2(HISTORICO_JSON, caminho_json_backup)
+        except: pass
+        
+        try:
+            backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith("ponto_backup_") and f.endswith(".db")])
+            for backup_antigo in backups[:-10]:
+                os.remove(os.path.join(BACKUP_DIR, backup_antigo))
+                json_antigo = backup_antigo.replace("ponto_backup_", "historico_").replace(".db", ".json")
+                json_caminho = os.path.join(BACKUP_DIR, json_antigo)
+                if os.path.exists(json_caminho): os.remove(json_caminho)
+        except: pass
+        
         return caminho_backup
     except Exception as e:
-        print(f"[ERRO BACKUP] {e}")
+        print(f"[ERRO BACKUP] Falha no backup: {e}")
         return None
 
 def verificar_backup_periodico():
     try:
         arquivo_controle = os.path.join(BACKUP_DIR, ".ultimo_backup")
         agora = agora_brasilia()
+        
         if os.path.exists(arquivo_controle):
             with open(arquivo_controle, "r") as f:
-                ultima_data = datetime.strptime(f.read().strip(), "%Y-%m-%d %H:%M:%S")
+                ultima_str = f.read().strip()
+            ultima_data = datetime.strptime(ultima_str, "%Y-%m-%d %H:%M:%S")
             if (agora - ultima_data).total_seconds() < BACKUP_INTERVAL_HORAS * 3600:
                 return False
+        
         caminho = fazer_backup_db()
         if caminho:
             with open(arquivo_controle, "w") as f:
                 f.write(agora.strftime("%Y-%m-%d %H:%M:%S"))
             return True
         return False
-    except: return False
+    except Exception as e:
+        print(f"[ERRO] Verificacao backup periodico: {e}")
+        return False
 
 salvar_historico_json()
 verificar_backup_periodico()
@@ -2034,31 +1492,40 @@ class ServidorPonto(BaseHTTPRequestHandler):
         params = parse_qs(url.query)
         
         if caminho == "/" or caminho == "/index.html":
-            responder_html(self, gerar_html_ponto()); return
+            responder_html(self, gerar_html_ponto())
+            return
         
         if caminho == "/funcionario":
-            responder_html(self, gerar_html_funcionario()); return
+            responder_html(self, gerar_html_funcionario())
+            return
         
         if caminho == "/admin":
-            if verificar_login(self): responder_html(self, gerar_html_admin())
-            else: responder_html(self, gerar_html_login())
+            if verificar_login(self):
+                responder_html(self, gerar_html_admin())
+            else:
+                responder_html(self, gerar_html_login())
             return
         
         if caminho == "/login":
-            responder_html(self, gerar_html_login()); return
+            responder_html(self, gerar_html_login())
+            return
         
         if caminho.startswith("/static/"):
             nome_arquivo = caminho.replace("/static/", "").split("?")[0]
             caminho_completo = os.path.join("static", nome_arquivo)
             if os.path.exists(caminho_completo):
                 self.send_response(200)
-                if nome_arquivo.endswith(".png"): self.send_header("Content-Type", "image/png")
-                elif nome_arquivo.endswith(".jpg") or nome_arquivo.endswith(".jpeg"): self.send_header("Content-Type", "image/jpeg")
-                else: self.send_header("Content-Type", "application/octet-stream")
-                self.send_header("Cache-Control", "no-cache")
+                if nome_arquivo.endswith(".png"):
+                    self.send_header("Content-Type", "image/png")
+                elif nome_arquivo.endswith(".jpg") or nome_arquivo.endswith(".jpeg"):
+                    self.send_header("Content-Type", "image/jpeg")
+                else:
+                    self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
                 for k,v in CABECALHOS_SEGURANCA.items(): self.send_header(k,v)
                 self.end_headers()
-                with open(caminho_completo, "rb") as f: self.wfile.write(f.read())
+                with open(caminho_completo, "rb") as f:
+                    self.wfile.write(f.read())
             else:
                 self.send_response(404)
                 for k,v in CABECALHOS_SEGURANCA.items(): self.send_header(k,v)
@@ -2068,21 +1535,20 @@ class ServidorPonto(BaseHTTPRequestHandler):
         if caminho.startswith("/api/buscar/"):
             cpf = formatar_cpf(caminho.replace("/api/buscar/", ""))
             if len(cpf) != 11:
-                responder_json(self, {"encontrado": False}); return
+                responder_json(self, {"encontrado": False})
+                return
             try:
                 conn = get_db()
                 func = conn.execute("SELECT * FROM funcionarios WHERE cpf = ?", (cpf,)).fetchone()
                 conn.close()
                 if func:
                     responder_json(self, {
-                        "encontrado": True, "id": func["id"], "nome": func["nome"],
+                        "encontrado": True, 
+                        "nome": func["nome"],
                         "horario_entrada": func["horario_entrada"],
                         "horario_saida_almoco": func["horario_saida_almoco"],
                         "horario_retorno_almoco": func["horario_retorno_almoco"],
-                        "horario_saida": func["horario_saida"],
-                        "foto_perfil": func["foto_perfil"] or "",
-                        "face_treinada": bool(func["face_treinada"] or 0),
-                        "bloqueado": bool(func["bloqueado"] or 0)
+                        "horario_saida": func["horario_saida"]
                     })
                 else:
                     responder_json(self, {"encontrado": False})
@@ -2090,19 +1556,24 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
             return
         
+        # Rotas de autorizacao - funcionario pode consultar status
         if caminho.startswith("/api/status_autorizacao/"):
             sid = caminho.replace("/api/status_autorizacao/", "")
-            responder_json(self, verificar_status_autorizacao(sid))
+            status = verificar_status_autorizacao(sid)
+            responder_json(self, status)
             return
         
         rotas_admin = ["/api/funcionarios", "/api/registros", "/api/gerar_qrcode", "/api/pdf/geral", "/api/logout", "/api/acessos", "/api/autorizacoes_pendentes"]
         precisa_login = (caminho in rotas_admin or caminho.startswith("/api/funcionarios/") or caminho.startswith("/api/pdf/funcionario/") or caminho.startswith("/api/obter_registro/"))
         
         if precisa_login and not verificar_login(self):
-            responder_json(self, {"detail": "Não autorizado."}, status=401); return
+            responder_json(self, {"detail": "Não autorizado. Faça login."}, status=401)
+            return
         
         if caminho == "/api/autorizacoes_pendentes":
-            responder_json(self, listar_autorizacoes_pendentes()); return
+            lista = listar_autorizacoes_pendentes()
+            responder_json(self, lista)
+            return
         
         if caminho == "/api/funcionarios":
             try:
@@ -2114,12 +1585,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
                     "horario_entrada": f["horario_entrada"],
                     "horario_saida_almoco": f["horario_saida_almoco"],
                     "horario_retorno_almoco": f["horario_retorno_almoco"],
-                    "horario_saida": f["horario_saida"],
-                    "foto_perfil": f["foto_perfil"] or "",
-                    "face_treinada": bool(f["face_treinada"] or 0),
-                    "bloqueado": bool(f["bloqueado"] or 0),
-                    "tentativas_reconhecimento": f["tentativas_reconhecimento"] or 0,
-                    "motivo_bloqueio": f["motivo_bloqueio"] or ""
+                    "horario_saida": f["horario_saida"]
                 } for f in funcs]
                 responder_json(self, resultado)
             except Exception as e:
@@ -2132,10 +1598,11 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 regs = conn.execute("""
                     SELECT r.*, f.nome, f.cpf FROM registros_ponto r 
                     JOIN funcionarios f ON r.funcionario_id = f.id 
-                    ORDER BY r.data_hora DESC LIMIT 500
+                    ORDER BY r.data_hora DESC
                 """).fetchall()
                 conn.close()
                 resultado = []
+                dias_semana = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]
                 for r in regs:
                     dh = datetime.strptime(r["data_hora"], "%Y-%m-%d %H:%M:%S")
                     resultado.append({
@@ -2145,9 +1612,9 @@ class ServidorPonto(BaseHTTPRequestHandler):
                         "atrasado": bool(r["atrasado"]),
                         "minutos_atraso": r["minutos_atraso"] or 0,
                         "minutos_banco_horas": r["minutos_banco_horas"] or 0,
-                        "autorizado_admin": bool(r["autorizado_admin"] or 0),
-                        "confianca_facial": r["confianca_facial"] or 0,
+                        "justificativa": r["justificativa"] or "",
                         "ip_dispositivo": r["ip_dispositivo"] or "",
+                        "autorizado_admin": bool(r["autorizado_admin"] or 0),
                         "dia_semana": dh.weekday()
                     })
                 responder_json(self, resultado)
@@ -2159,15 +1626,24 @@ class ServidorPonto(BaseHTTPRequestHandler):
             try:
                 reg_id = int(caminho.replace("/api/obter_registro/", ""))
                 conn = get_db()
-                r = conn.execute("SELECT r.*, f.nome FROM registros_ponto r JOIN funcionarios f ON r.funcionario_id=f.id WHERE r.id=?", (reg_id,)).fetchone()
+                r = conn.execute("""
+                    SELECT r.*, f.nome FROM registros_ponto r 
+                    JOIN funcionarios f ON r.funcionario_id = f.id 
+                    WHERE r.id = ?
+                """, (reg_id,)).fetchone()
                 conn.close()
+                
                 if not r:
-                    responder_json(self, {"detail": "Não encontrado"}, status=404); return
+                    responder_json(self, {"detail": "Registro não encontrado"}, status=404)
+                    return
+                
                 tipo_info = TIPOS_REGISTRO[r["tipo"]]
-                dh = datetime.strptime(r["data_hora"], "%Y-%m-%d %H:%M:%S")
-                msg = f"{tipo_info['icone']} {tipo_info['label']} registrada!\n👤 {r['nome']}\n📅 {dh.strftime('%d/%m/%Y')}\n⏰ {dh.strftime('%H:%M:%S')}"
+                agora = datetime.strptime(r["data_hora"], "%Y-%m-%d %H:%M:%S")
+                msg = f"{tipo_info['icone']} {tipo_info['label']} registrada!\n"
+                msg += f"👤 {r['nome']}\n📅 {agora.strftime('%d/%m/%Y')}\n⏰ {agora.strftime('%H:%M:%S')}"
                 if r["atrasado"]: msg += f"\n⚠️ Atraso: {r['minutos_atraso'] or 0} min"
-                if (r["minutos_banco_horas"] or 0) > 0: msg += f"\n⏱️ Banco: +{r['minutos_banco_horas']} min"
+                if (r["minutos_banco_horas"] or 0) > 0: msg += f"\n⏱️ Banco de horas: +{r['minutos_banco_horas']} min"
+                
                 responder_json(self, {"mensagem": msg})
             except Exception as e:
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
@@ -2178,14 +1654,20 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 conn = get_db()
                 acs = conn.execute("""
                     SELECT a.*, f.nome FROM acessos_dispositivos a 
-                    LEFT JOIN funcionarios f ON a.funcionario_id=f.id 
+                    LEFT JOIN funcionarios f ON a.funcionario_id = f.id 
                     ORDER BY a.data_hora_acesso DESC LIMIT 200
                 """).fetchall()
                 conn.close()
                 resultado = []
                 for a in acs:
                     dh = datetime.strptime(a["data_hora_acesso"], "%Y-%m-%d %H:%M:%S")
-                    resultado.append({"data_hora":dh.strftime("%d/%m/%Y %H:%M:%S"),"cpf":a["cpf"],"nome":a["nome"],"ip":a["ip_dispositivo"] or "","user_agent":a["user_agent"] or "","tipo_acesso":a["tipo_acesso"] or ""})
+                    resultado.append({
+                        "data_hora": dh.strftime("%d/%m/%Y %H:%M:%S"),
+                        "cpf": a["cpf"], "nome": a["nome"],
+                        "ip": a["ip_dispositivo"] or "",
+                        "user_agent": a["user_agent"] or "",
+                        "tipo_acesso": a["tipo_acesso"] or ""
+                    })
                 responder_json(self, resultado)
             except Exception as e:
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
@@ -2201,7 +1683,8 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 host = self.headers.get("Host", f"localhost:{PORTA}")
                 url = f"http://{host}/"
                 qr = qrcode.QRCode(version=1, box_size=10, border=5)
-                qr.add_data(url); qr.make(fit=True)
+                qr.add_data(url)
+                qr.make(fit=True)
                 img = qr.make_image(fill_color="black", back_color="white")
                 img.save("static/qrcode_empresa.png")
                 responder_json(self, {"status": "ok", "caminho": "/static/qrcode_empresa.png", "url": url})
@@ -2213,29 +1696,41 @@ class ServidorPonto(BaseHTTPRequestHandler):
         
         if caminho == "/api/pdf/geral":
             mes = params.get("mes", [""])[0]
-            if not mes: responder_json(self, {"detail": "Informe o mês"}, status=400); return
+            if not mes:
+                responder_json(self, {"detail": "Informe o mês"}, status=400)
+                return
             try:
                 pdf_bytes = gerar_pdf_geral(mes)
-                self.send_response(200); self.send_header("Content-Type","application/pdf")
-                self.send_header("Content-Disposition",f"attachment; filename=Relatorio_Geral_{mes}.pdf")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/pdf")
+                self.send_header("Content-Disposition", f"attachment; filename=Relatorio_Geral_{mes}.pdf")
                 for k,v in CABECALHOS_SEGURANCA.items(): self.send_header(k,v)
-                self.end_headers(); self.wfile.write(pdf_bytes.getvalue())
-            except ImportError: responder_html(self, "<h1>Erro</h1><p>Instale: pip install reportlab</p>")
-            except Exception as e: responder_json(self, {"detail": f"Erro PDF: {str(e)}"}, status=500)
+                self.end_headers()
+                self.wfile.write(pdf_bytes.getvalue())
+            except ImportError:
+                responder_html(self, "<h1>Erro</h1><p>Instale: pip install reportlab</p>")
+            except Exception as e:
+                responder_json(self, {"detail": f"Erro PDF: {str(e)}"}, status=500)
             return
         
         if caminho.startswith("/api/pdf/funcionario/"):
             func_id = int(caminho.replace("/api/pdf/funcionario/", ""))
             mes = params.get("mes", [""])[0]
-            if not mes: responder_json(self, {"detail": "Informe o mês"}, status=400); return
+            if not mes:
+                responder_json(self, {"detail": "Informe o mês"}, status=400)
+                return
             try:
                 pdf_bytes = gerar_pdf_individual(func_id, mes)
-                self.send_response(200); self.send_header("Content-Type","application/pdf")
-                self.send_header("Content-Disposition",f"attachment; filename=Relatorio_Func_{func_id}_{mes}.pdf")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/pdf")
+                self.send_header("Content-Disposition", f"attachment; filename=Relatorio_Func_{func_id}_{mes}.pdf")
                 for k,v in CABECALHOS_SEGURANCA.items(): self.send_header(k,v)
-                self.end_headers(); self.wfile.write(pdf_bytes.getvalue())
-            except ImportError: responder_html(self, "<h1>Erro</h1><p>Instale: pip install reportlab</p>")
-            except Exception as e: responder_json(self, {"detail": f"Erro PDF: {str(e)}"}, status=500)
+                self.end_headers()
+                self.wfile.write(pdf_bytes.getvalue())
+            except ImportError:
+                responder_html(self, "<h1>Erro</h1><p>Instale: pip install reportlab</p>")
+            except Exception as e:
+                responder_json(self, {"detail": f"Erro PDF: {str(e)}"}, status=500)
             return
         
         self.send_response(404)
@@ -2247,161 +1742,93 @@ class ServidorPonto(BaseHTTPRequestHandler):
         caminho = url.path
         
         tamanho = int(self.headers.get("Content-Length", 0))
-        if tamanho > 10000000:
-            responder_json(self, {"detail": "Requisição muito grande"}, status=413); return
+        if tamanho > 100000:
+            responder_json(self, {"detail": "Requisição muito grande"}, status=413)
+            return
         
         corpo = self.rfile.read(tamanho).decode("utf-8")
-        try: dados = json.loads(corpo) if corpo else {}
-        except: dados = {}
+        
+        try:
+            dados = json.loads(corpo) if corpo else {}
+        except:
+            dados = {}
         
         ip_cliente = obter_ip_cliente(self)
         user_agent = sanitizar_texto(self.headers.get("User-Agent", ""), 500)
         
         if caminho == "/api/login":
             if not verificar_rate_limit(ip_cliente):
-                responder_json(self, {"detail": "Muitas tentativas."}, status=429); return
+                responder_json(self, {"detail": "Muitas tentativas. Aguarde alguns minutos."}, status=429)
+                return
+            
             usuario = sanitizar_texto(dados.get("usuario", ""), 50)
             senha = sanitizar_texto(dados.get("senha", ""), 100)
+            
             if usuario == ADMIN_USUARIO and senha == ADMIN_SENHA:
                 token = gerar_sessao()
                 sessoes_admin[token] = agora_brasilia() + timedelta(hours=8)
                 cookie = f"sessao_admin={token}; Path=/; Max-Age=28800; HttpOnly; SameSite=Lax"
                 tentativas_login.pop(ip_cliente, None)
-                responder_json(self, {"status": "ok"}, cookies_extra=[cookie])
+                print(f"[LOGIN OK] Admin de {ip_cliente}")
+                responder_json(self, {"status": "ok", "mensagem": "Login realizado"}, cookies_extra=[cookie])
             else:
+                print(f"[LOGIN FALHA] {ip_cliente} user={usuario}")
                 responder_json(self, {"detail": "Usuário ou senha incorretos!"}, status=401)
             return
         
         if caminho == "/api/funcionario/acessar":
             cpf = formatar_cpf(dados.get("cpf", ""))
             if len(cpf) != 11:
-                responder_json(self, {"detail": "CPF inválido!"}, status=400); return
+                responder_json(self, {"detail": "CPF inválido! 11 dígitos."}, status=400)
+                return
+            
             try:
                 conn = get_db()
                 func = conn.execute("SELECT * FROM funcionarios WHERE cpf = ?", (cpf,)).fetchone()
                 if not func:
-                    conn.close(); responder_json(self, {"detail": "CPF não cadastrado!"}, status=404); return
-                if func["bloqueado"]:
-                    conn.close(); responder_json(self, {"detail": "🚫 Funcionário BLOQUEADO. Contate o administrador."}, status=403); return
-                func_id = func["id"]; conn.close()
+                    conn.close()
+                    responder_json(self, {"detail": "CPF não cadastrado!"}, status=404)
+                    return
+                
+                func_id = func["id"]
+                conn.close()
+                
                 registrar_acesso_dispositivo(cpf, func_id, ip_cliente, user_agent, "login_funcionario")
-                acessos_funcionarios[cpf] = {"funcionario_id": func_id, "ip": ip_cliente, "expira": agora_brasilia() + timedelta(hours=2)}
+                acessos_funcionarios[cpf] = {
+                    "funcionario_id": func_id,
+                    "ip": ip_cliente,
+                    "expira": agora_brasilia() + timedelta(hours=2)
+                }
+                
                 print(f"[ACESSO FUNC] {func['nome']} | IP: {ip_cliente}")
                 responder_json(self, {"status": "ok", "nome": func["nome"]})
             except Exception as e:
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
             return
         
-        # ===== NOVA ROTA: VERIFICACAO FACIAL =====
-        if caminho == "/api/verificar_face":
-            cpf = formatar_cpf(dados.get("cpf", ""))
-            funcionario_id = dados.get("funcionario_id")
-            imagem_b64 = dados.get("imagem", "")
-            
-            if len(cpf) != 11 or not funcionario_id:
-                responder_json(self, {"detail": "Dados inválidos"}, status=400); return
-            if not imagem_b64:
-                responder_json(self, {"detail": "Nenhuma imagem capturada"}, status=400); return
-            
-            try:
-                # Verifica se está bloqueado
-                bloqueado, motivo = funcionario_bloqueado(funcionario_id)
-                if bloqueado:
-                    responder_json(self, {"detail": f"🚫 BLOQUEADO! {motivo}", "bloqueado": True}, status=403); return
-                
-                img_bytes = base64.b64decode(imagem_b64)
-                reconhecido, confianca, msg = verificar_face(funcionario_id, img_bytes)
-                
-                if reconhecido:
-                    resetar_tentativas_face(funcionario_id)
-                    # Salva a foto de verificação
-                    caminho_foto_ver = os.path.join("static/fotos", f"verificacao_{funcionario_id}_{agora_brasilia().strftime('%Y%m%d_%H%M%S')}.jpg")
-                    try:
-                        with open(caminho_foto_ver, "wb") as f: f.write(img_bytes)
-                        foto_salva = f"/static/fotos/{os.path.basename(caminho_foto_ver)}"
-                    except:
-                        foto_salva = ""
-                    responder_json(self, {"reconhecido": True, "confianca": confianca, "foto_salva": foto_salva})
-                else:
-                    bloqueado_agora, msg_bloqueio = incrementar_tentativas_face(funcionario_id)
-                    conn = get_db()
-                    func = conn.execute("SELECT tentativas_reconhecimento FROM funcionarios WHERE id=?", (funcionario_id,)).fetchone()
-                    conn.close()
-                    tentativas_feitas = func["tentativas_reconhecimento"] or 0
-                    tentativas_restantes = MAX_TENTATIVAS_FACIAIS - tentativas_feitas
-                    responder_json(self, {
-                        "reconhecido": False, "detail": msg,
-                        "tentativas_restantes": tentativas_restantes,
-                        "bloqueado": bloqueado_agora
-                    }, status=400)
-            except Exception as e:
-                responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
-            return
-        
-        # ===== NOVA ROTA: VERIFICACAO FACIAL NO LOGIN =====
-        if caminho == "/api/verificar_face_login":
-            cpf = formatar_cpf(dados.get("cpf", ""))
-            funcionario_id = dados.get("funcionario_id")
-            imagem_b64 = dados.get("imagem", "")
-            
-            if len(cpf) != 11 or not funcionario_id:
-                responder_json(self, {"detail": "Dados inválidos"}, status=400); return
-            if not imagem_b64:
-                responder_json(self, {"detail": "Nenhuma imagem capturada"}, status=400); return
-            
-            try:
-                bloqueado, motivo = funcionario_bloqueado(funcionario_id)
-                if bloqueado:
-                    responder_json(self, {"detail": f"🚫 BLOQUEADO! {motivo}", "bloqueado": True}, status=403); return
-                
-                img_bytes = base64.b64decode(imagem_b64)
-                reconhecido, confianca, msg = verificar_face(funcionario_id, img_bytes)
-                
-                if reconhecido:
-                    resetar_tentativas_face(funcionario_id)
-                    registrar_acesso_dispositivo(cpf, funcionario_id, ip_cliente, user_agent, "reconhecimento_face_login")
-                    print(f"[FACE LOGIN OK] ID:{funcionario_id} Confiança:{confianca:.1f}")
-                    responder_json(self, {"reconhecido": True, "confianca": confianca})
-                else:
-                    bloqueado_agora, msg_bloqueio = incrementar_tentativas_face(funcionario_id)
-                    conn = get_db()
-                    func = conn.execute("SELECT tentativas_reconhecimento FROM funcionarios WHERE id=?", (funcionario_id,)).fetchone()
-                    conn.close()
-                    tentativas_feitas = func["tentativas_reconhecimento"] or 0
-                    tentativas_restantes = MAX_TENTATIVAS_FACIAIS - tentativas_feitas
-                    responder_json(self, {
-                        "reconhecido": False, "detail": msg,
-                        "tentativas_restantes": tentativas_restantes,
-                        "bloqueado": bloqueado_agora
-                    }, status=400)
-            except Exception as e:
-                responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
-            return
-
-        # ===== NOVA ROTA: SOLICITAR PONTO =====
+        # ===== NOVA ROTA: SOLICITAR PONTO (verifica se precisa de autorizacao) =====
         if caminho == "/api/solicitar_ponto":
             cpf = formatar_cpf(dados.get("cpf", ""))
             tipo = dados.get("tipo", "ENTRADA")
             qr_code = dados.get("qr_code", "")
-            foto_verificacao = dados.get("foto_verificacao", "")
-            confianca_facial = float(dados.get("confianca_facial", 0) or 0)
             
             if qr_code != SEGREDO_QR:
-                responder_json(self, {"detail": "QR inválido!"}, status=400); return
+                responder_json(self, {"detail": "QR Code inválido!"}, status=400)
+                return
             if tipo not in TIPOS_REGISTRO:
-                responder_json(self, {"detail": "Tipo inválido!"}, status=400); return
+                responder_json(self, {"detail": "Tipo inválido!"}, status=400)
+                return
             if len(cpf) != 11:
-                responder_json(self, {"detail": "CPF inválido!"}, status=400); return
+                responder_json(self, {"detail": "CPF inválido! 11 dígitos."}, status=400)
+                return
             
             try:
                 conn = get_db()
                 func = conn.execute("SELECT * FROM funcionarios WHERE cpf = ?", (cpf,)).fetchone()
                 if not func:
-                    conn.close(); responder_json(self, {"detail": "CPF não cadastrado!"}, status=404); return
-                
-                bloqueado, motivo = funcionario_bloqueado(func["id"])
-                if bloqueado:
-                    conn.close(); responder_json(self, {"detail": f"🚫 BLOQUEADO! {motivo}"}, status=403); return
+                    conn.close()
+                    responder_json(self, {"detail": "CPF não cadastrado!"}, status=404)
+                    return
                 
                 agora = agora_brasilia()
                 data_str = agora.strftime("%Y-%m-%d")
@@ -2412,12 +1839,16 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 
                 valido, msg_erro = verificar_sequencia_valida(ultimo_tipo, tipo)
                 if not valido:
-                    conn.close(); responder_json(self, {"detail": "⛔ " + msg_erro}, status=400); return
+                    conn.close()
+                    responder_json(self, {"detail": "⛔ " + msg_erro}, status=400)
+                    return
                 
                 if verificar_registro_duplicado(func["id"], data_str, tipo):
-                    conn.close(); responder_json(self, {"detail": f"⛔ Já registrado hoje!"}, status=400); return
+                    conn.close()
+                    responder_json(self, {"detail": f"⛔ {TIPOS_REGISTRO[tipo]['label']} JÁ registrada hoje!"}, status=400)
+                    return
                 
-                # Verifica se precisa de autorizacao
+                # ===== VERIFICA SE PRECISA DE AUTORIZACAO =====
                 requer_autorizacao = False
                 tipo_diferenca = ""
                 minutos_diferenca = 0
@@ -2426,73 +1857,108 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 if tipo == "ENTRADA":
                     horario_padrao = func["horario_entrada"]
                     if verificar_atraso(hora_str, horario_padrao):
+                        # Atrasado na entrada
                         minutos_diferenca = calcular_minutos(hora_str, horario_padrao)
-                        if minutos_diferenca > 0: requer_autorizacao = True; tipo_diferenca = "atrasado"
+                        if minutos_diferenca > 0:
+                            requer_autorizacao = True
+                            tipo_diferenca = "atrasado"
                     else:
+                        # Entrando antes do horario
                         minutos_diferenca = calcular_minutos(hora_str, horario_padrao)
-                        if minutos_diferenca > 0: requer_autorizacao = True; tipo_diferenca = "antecipado"
+                        if minutos_diferenca > 0:
+                            requer_autorizacao = True
+                            tipo_diferenca = "antecipado"
+                
                 elif tipo == "SAIDA_ALMOCO":
                     horario_padrao = func["horario_saida_almoco"]
-                    minutos_diferenca = calcular_minutos(hora_str, horario_padrao)
-                    if minutos_diferenca > 0:
-                        requer_autorizacao = True
-                        tipo_diferenca = "antecipado" if not verificar_atraso(hora_str, horario_padrao) else "atrasado"
+                    if not verificar_atraso(hora_str, horario_padrao):
+                        # Saindo para almoco ANTES do horario
+                        minutos_diferenca = calcular_minutos(hora_str, horario_padrao)
+                        if minutos_diferenca > 0:
+                            requer_autorizacao = True
+                            tipo_diferenca = "antecipado"
+                    else:
+                        # Saindo para almoco DEPOIS (atrasado)
+                        minutos_diferenca = calcular_minutos(hora_str, horario_padrao)
+                        if minutos_diferenca > 0:
+                            requer_autorizacao = True
+                            tipo_diferenca = "atrasado"
+                
                 elif tipo == "RETORNO_ALMOCO":
                     horario_padrao = func["horario_retorno_almoco"]
                     if verificar_atraso(hora_str, horario_padrao):
+                        # Atrasado no retorno
                         minutos_diferenca = calcular_minutos(hora_str, horario_padrao)
-                        if minutos_diferenca > 0: requer_autorizacao = True; tipo_diferenca = "atrasado"
+                        if minutos_diferenca > 0:
+                            requer_autorizacao = True
+                            tipo_diferenca = "atrasado"
                     else:
+                        # Voltando antes do horario
                         minutos_diferenca = calcular_minutos(hora_str, horario_padrao)
-                        if minutos_diferenca > 0: requer_autorizacao = True; tipo_diferenca = "antecipado"
+                        if minutos_diferenca > 0:
+                            requer_autorizacao = True
+                            tipo_diferenca = "antecipado"
+                
                 elif tipo == "SAIDA":
                     horario_padrao = func["horario_saida"]
                     if verificar_atraso(func["horario_saida"], hora_str):
+                        # Saida ANTECIPADA (invertido)
                         minutos_diferenca = calcular_minutos(func["horario_saida"], hora_str)
-                        if minutos_diferenca > 0: requer_autorizacao = True; tipo_diferenca = "antecipado"
+                        if minutos_diferenca > 0:
+                            requer_autorizacao = True
+                            tipo_diferenca = "antecipado"
                     else:
+                        # Saindo DEPOIS do horario (hora extra)
                         minutos_diferenca = calcular_minutos(hora_str, func["horario_saida"])
-                        if minutos_diferenca > 0: requer_autorizacao = True; tipo_diferenca = "atrasado"
+                        if minutos_diferenca > 0:
+                            requer_autorizacao = True
+                            tipo_diferenca = "atrasado"
                 
                 conn.close()
                 
                 if requer_autorizacao and minutos_diferenca > 0:
+                    # Cria solicitacao de autorizacao
                     sid, criada = criar_solicitacao_autorizacao(
                         func, tipo, hora_str, horario_padrao,
                         minutos_diferenca, tipo_diferenca,
                         ip_cliente, user_agent
                     )
-                    # Armazena dados da verificacao facial na solicitacao
-                    if sid in autorizacoes_pendentes:
-                        autorizacoes_pendentes[sid]["foto_verificacao"] = foto_verificacao
-                        autorizacoes_pendentes[sid]["confianca_facial"] = confianca_facial
                     
                     responder_json(self, {
-                        "requer_autorizacao": True, "solicitacao_id": sid,
-                        "tipo": tipo, "tipo_diferenca": tipo_diferenca,
+                        "requer_autorizacao": True,
+                        "solicitacao_id": sid,
+                        "tipo": tipo,
+                        "tipo_diferenca": tipo_diferenca,
                         "minutos_diferenca": minutos_diferenca,
-                        "hora_registro": hora_str, "horario_padrao": horario_padrao,
+                        "hora_registro": hora_str,
+                        "horario_padrao": horario_padrao,
                         "nome": func["nome"]
                     })
                 else:
-                    registro_id = self._executar_registro(func, tipo, agora, hora_str, ip_cliente, user_agent, "", 0, "", foto_verificacao, confianca_facial)
-                    responder_json(self, {"requer_autorizacao": False, "registro_id": registro_id})
+                    # Registro normal - executa imediatamente
+                    registro_id = self._executar_registro_ponto(func, tipo, agora, hora_str, ip_cliente, user_agent, "", 0, "")
+                    responder_json(self, {
+                        "requer_autorizacao": False,
+                        "registro_id": registro_id
+                    })
                     
             except Exception as e:
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
             return
         
-        # ===== NOVA ROTA: EXECUTAR DEPOIS DE AUTORIZACAO =====
+        # ===== NOVA ROTA: EXECUTAR REGISTRO APOS AUTORIZACAO =====
         if caminho == "/api/executar_autorizado":
             solicitacao_id = dados.get("solicitacao_id", "")
             resposta_admin = sanitizar_texto(dados.get("resposta_admin", ""), 500)
             
             if not solicitacao_id or solicitacao_id not in autorizacoes_pendentes:
-                responder_json(self, {"detail": "Solicitação inválida ou expirada"}, status=400); return
+                responder_json(self, {"detail": "Solicitação inválida ou expirada"}, status=400)
+                return
             
             s = autorizacoes_pendentes[solicitacao_id]
             if s["status"] != "aprovado":
-                responder_json(self, {"detail": "Solicitação não foi aprovada"}, status=400); return
+                responder_json(self, {"detail": "Solicitação não foi aprovada"}, status=400)
+                return
             
             try:
                 conn = get_db()
@@ -2500,32 +1966,34 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 conn.close()
                 
                 if not func:
-                    responder_json(self, {"detail": "Funcionário não encontrado"}, status=404); return
+                    responder_json(self, {"detail": "Funcionário não encontrado"}, status=404)
+                    return
                 
                 agora = agora_brasilia()
                 hora_str = agora.strftime("%H:%M:%S")
-                foto_ver = s.get("foto_verificacao", "")
-                confianca = s.get("confianca_facial", 0)
                 
-                registro_id = self._executar_registro(
+                registro_id = self._executar_registro_ponto(
                     func, s["tipo"], agora, hora_str,
                     s["ip_cliente"], s["user_agent"],
-                    resposta_admin, 1, resposta_admin, foto_ver, confianca
+                    resposta_admin, 1, resposta_admin
                 )
                 
+                # Remove solicitacao
                 if solicitacao_id in autorizacoes_pendentes:
                     del autorizacoes_pendentes[solicitacao_id]
                 
+                # Busca dados do registro para mensagem
                 conn = get_db()
                 r = conn.execute("SELECT * FROM registros_ponto WHERE id = ?", (registro_id,)).fetchone()
                 conn.close()
                 
                 tipo_info = TIPOS_REGISTRO[s["tipo"]]
-                msg = f"{tipo_info['icone']} {tipo_info['label']} registrada!\n👤 {func['nome']}\n📅 {agora.strftime('%d/%m/%Y')}\n⏰ {hora_str}"
+                msg = f"{tipo_info['icone']} {tipo_info['label']} registrada!\n"
+                msg += f"👤 {func['nome']}\n📅 {agora.strftime('%d/%m/%Y')}\n⏰ {hora_str}"
                 if r["atrasado"]: msg += f"\n⚠️ Atraso: {r['minutos_atraso'] or 0} min"
-                if (r["minutos_banco_horas"] or 0) > 0: msg += f"\n⏱️ Banco: +{r['minutos_banco_horas']} min"
+                if (r["minutos_banco_horas"] or 0) > 0: msg += f"\n⏱️ Banco de horas: +{r['minutos_banco_horas']} min"
                 
-                print(f"[PONTO AUTORIZADO] {func['nome']} | {s['tipo']}")
+                print(f"[PONTO AUTORIZADO] {func['nome']} | {s['tipo']} | {hora_str}")
                 responder_json(self, {"mensagem": msg, "registro_id": registro_id})
                 
             except Exception as e:
@@ -2535,31 +2003,85 @@ class ServidorPonto(BaseHTTPRequestHandler):
         # ===== ROTA ADMIN: RESPONDER AUTORIZACAO =====
         if caminho == "/api/responder_autorizacao":
             if not verificar_login(self):
-                responder_json(self, {"detail": "Não autorizado"}, status=401); return
+                responder_json(self, {"detail": "Não autorizado"}, status=401)
+                return
             
             solicitacao_id = dados.get("solicitacao_id", "")
             aprovar = bool(dados.get("aprovar", False))
             resposta = sanitizar_texto(dados.get("resposta", ""), 500)
             
             resultado, erro = responder_autorizacao(solicitacao_id, aprovar, resposta)
-            if erro: responder_json(self, {"detail": erro}, status=400)
-            else: responder_json(self, {"status": "ok", "acao": "aprovado" if aprovar else "rejeitado"})
+            
+            if erro:
+                responder_json(self, {"detail": erro}, status=400)
+            else:
+                responder_json(self, {"status": "ok", "acao": "aprovado" if aprovar else "rejeitado"})
             return
         
-        # Rotas que precisam de login
-        if not verificar_login(self):
-            responder_json(self, {"detail": "Não autorizado"}, status=401); return
+        # Rota antiga mantida para compatibilidade
+        if caminho == "/api/bater_ponto":
+            cpf = formatar_cpf(dados.get("cpf", ""))
+            tipo = dados.get("tipo", "ENTRADA")
+            qr_code = dados.get("qr_code", "")
+            justificativa = sanitizar_texto(dados.get("justificativa", ""), 500)
+            
+            if qr_code != SEGREDO_QR:
+                responder_json(self, {"detail": "QR Code inválido!"}, status=400)
+                return
+            if tipo not in TIPOS_REGISTRO:
+                responder_json(self, {"detail": "Tipo inválido!"}, status=400)
+                return
+            if len(cpf) != 11:
+                responder_json(self, {"detail": "CPF inválido!"}, status=400)
+                return
+            
+            try:
+                conn = get_db()
+                func = conn.execute("SELECT * FROM funcionarios WHERE cpf = ?", (cpf,)).fetchone()
+                if not func:
+                    conn.close()
+                    responder_json(self, {"detail": "CPF não cadastrado!"}, status=404)
+                    return
+                
+                agora = agora_brasilia()
+                hora_str = agora.strftime("%H:%M:%S")
+                conn.close()
+                
+                registro_id = self._executar_registro_ponto(func, tipo, agora, hora_str, ip_cliente, user_agent, justificativa, 0, "")
+                
+                conn = get_db()
+                r = conn.execute("SELECT * FROM registros_ponto WHERE id = ?", (registro_id,)).fetchone()
+                conn.close()
+                
+                tipo_info = TIPOS_REGISTRO[tipo]
+                msg = f"{tipo_info['icone']} {tipo_info['label']} registrada!\n"
+                msg += f"👤 {func['nome']}\n📅 {agora.strftime('%d/%m/%Y')}\n⏰ {hora_str}"
+                if r["atrasado"]: msg += f"\n⚠️ Atraso: {r['minutos_atraso'] or 0} min"
+                if (r["minutos_banco_horas"] or 0) > 0: msg += f"\n⏱️ Banco de horas: +{r['minutos_banco_horas']} min"
+                if justificativa: msg += f"\n📝 Justificativa registrada"
+                
+                print(f"[PONTO] {func['nome']} | {tipo} | {hora_str} | IP:{ip_cliente}")
+                salvar_historico_json()
+                verificar_backup_periodico()
+                responder_json(self, {"mensagem": msg})
+            except Exception as e:
+                responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
+            return
         
-        # ===== CADASTRAR FUNCIONARIO COM FOTO =====
+        if not verificar_login(self):
+            responder_json(self, {"detail": "Não autorizado"}, status=401)
+            return
+        
         if caminho == "/api/funcionarios":
             nome = sanitizar_texto(dados.get("nome", ""), 150)
             cpf = formatar_cpf(dados.get("cpf", ""))
-            foto_base64 = dados.get("foto_base64", "")
             
             if not nome or not cpf:
-                responder_json(self, {"detail": "Preencha nome e CPF!"}, status=400); return
+                responder_json(self, {"detail": "Preencha nome e CPF!"}, status=400)
+                return
             if len(cpf) != 11:
-                responder_json(self, {"detail": "CPF deve ter 11 dígitos!"}, status=400); return
+                responder_json(self, {"detail": "CPF deve ter 11 dígitos!"}, status=400)
+                return
             
             h_entrada = sanitizar_texto(dados.get("horario_entrada", "08:00:00"), 20) or "08:00:00"
             h_saida_almoco = sanitizar_texto(dados.get("horario_saida_almoco", "12:00:00"), 20) or "12:00:00"
@@ -2570,55 +2092,36 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 conn = get_db()
                 existe = conn.execute("SELECT id FROM funcionarios WHERE cpf = ?", (cpf,)).fetchone()
                 if existe:
-                    conn.close(); responder_json(self, {"detail": "CPF já cadastrado!"}, status=400); return
+                    conn.close()
+                    responder_json(self, {"detail": "CPF já cadastrado!"}, status=400)
+                    return
                 
-                conn.execute("""INSERT INTO funcionarios 
-                    (nome, cpf, horario_entrada, horario_saida_almoco, horario_retorno_almoco, horario_saida)
-                    VALUES (?, ?, ?, ?, ?, ?)""",
-                    (nome, cpf, h_entrada, h_saida_almoco, h_retorno_almoco, h_saida))
+                conn.execute("""
+                    INSERT INTO funcionarios (nome, cpf, horario_entrada, horario_saida_almoco, horario_retorno_almoco, horario_saida)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (nome, cpf, h_entrada, h_saida_almoco, h_retorno_almoco, h_saida))
                 conn.commit()
                 
                 novo_id = conn.execute("SELECT last_insert_rowid() as id").fetchone()["id"]
                 conn.close()
                 
-                # Treina reconhecimento facial se houver foto
-                face_treinada = False
-                if foto_base64:
-                    try:
-                        img_bytes = base64.b64decode(foto_base64)
-                        sucesso, msg_face = treinar_modelo_face(novo_id, img_bytes)
-                        if sucesso:
-                            face_treinada = True
-                            print(f"[FACE ID] Treinado: {nome} (ID:{novo_id})")
-                        else:
-                            print(f"[FACE ID] Falha: {nome} - {msg_face}")
-                    except Exception as e:
-                        print(f"[FACE ID] Erro treinamento: {e}")
-                
-                print(f"[CADASTRO] {nome} | CPF: {cpf} | Face: {'OK' if face_treinada else 'FALHOU'}")
+                print(f"[CADASTRO] {nome} | CPF: {cpf}")
                 salvar_historico_json()
-                responder_json(self, {"status": "ok", "id": novo_id, "face_treinada": face_treinada})
+                verificar_backup_periodico()
+                responder_json(self, {"status": "ok", "id": novo_id})
             except Exception as e:
                 responder_json(self, {"detail": f"Erro BD: {str(e)}"}, status=500)
             return
         
-        # ===== DESBLOQUEAR FUNCIONARIO =====
-        if caminho.startswith("/api/funcionarios/desbloquear/"):
-            func_id = int(caminho.replace("/api/funcionarios/desbloquear/", ""))
-            if desbloquear_funcionario(func_id):
-                salvar_historico_json()
-                responder_json(self, {"status": "ok"})
-            else:
-                responder_json(self, {"detail": "Erro ao desbloquear"}, status=500)
-            return
-        
         responder_json(self, {"detail": "Rota não encontrada"}, status=404)
     
-    def _executar_registro(self, func, tipo, agora, hora_str, ip_cliente, user_agent, justificativa, autorizado_admin, admin_resposta, foto_verificacao="", confianca_facial=0):
+    def _executar_registro_ponto(self, func, tipo, agora, hora_str, ip_cliente, user_agent, justificativa, autorizado_admin, admin_resposta):
+        """Função interna para executar o registro no banco de dados"""
         data_hora_str = agora.strftime("%Y-%m-%d %H:%M:%S")
         horario_acesso = agora.strftime("%Y-%m-%d %H:%M:%S")
         
-        atrasado = 0; minutos_atraso = 0
+        atrasado = 0
+        minutos_atraso = 0
         
         if tipo == "ENTRADA":
             atrasado = 1 if verificar_atraso(hora_str, func["horario_entrada"]) else 0
@@ -2633,15 +2136,15 @@ class ServidorPonto(BaseHTTPRequestHandler):
         minutos_banco = calcular_banco_horas(tipo, hora_str, func)
         
         conn = get_db()
-        conn.execute("""INSERT INTO registros_ponto 
-            (funcionario_id, data_hora, tipo, atrasado, minutos_atraso, minutos_banco_horas, justificativa, 
-             ip_dispositivo, user_agent, horario_acesso, autorizado_admin, admin_resposta, foto_verificacao, confianca_facial)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (func["id"], data_hora_str, tipo, atrasado, minutos_atraso, minutos_banco, justificativa,
-             ip_cliente, user_agent, horario_acesso, autorizado_admin, admin_resposta, foto_verificacao, confianca_facial))
+        conn.execute("""
+            INSERT INTO registros_ponto 
+            (funcionario_id, data_hora, tipo, atrasado, minutos_atraso, minutos_banco_horas, justificativa, ip_dispositivo, user_agent, horario_acesso, autorizado_admin, admin_resposta)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (func["id"], data_hora_str, tipo, atrasado, minutos_atraso, minutos_banco, justificativa, ip_cliente, user_agent, horario_acesso, autorizado_admin, admin_resposta))
         
         novo_id = conn.execute("SELECT last_insert_rowid() as id").fetchone()["id"]
-        conn.commit(); conn.close()
+        conn.commit()
+        conn.close()
         
         salvar_historico_json()
         verificar_backup_periodico()
@@ -2649,7 +2152,8 @@ class ServidorPonto(BaseHTTPRequestHandler):
     
     def do_DELETE(self):
         if not verificar_login(self):
-            responder_json(self, {"detail": "Não autorizado"}, status=401); return
+            responder_json(self, {"detail": "Não autorizado"}, status=401)
+            return
         
         url = urlparse(self.path)
         caminho = url.path
@@ -2660,16 +2164,11 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 conn = get_db()
                 conn.execute("DELETE FROM registros_ponto WHERE funcionario_id = ?", (func_id,))
                 conn.execute("DELETE FROM funcionarios WHERE id = ?", (func_id,))
-                conn.commit(); conn.close()
-                
-                # Remove arquivos de foto e modelo
-                for f in [f"static/fotos/func_{func_id}.jpg", f"modelos_faciais/func_{func_id}.yml"]:
-                    try:
-                        if os.path.exists(f): os.remove(f)
-                    except: pass
-                
+                conn.commit()
+                conn.close()
                 print(f"[EXCLUSAO] Funcionário ID: {func_id}")
                 salvar_historico_json()
+                verificar_backup_periodico()
                 responder_json(self, {"status": "ok"})
             except Exception as e:
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
@@ -2706,34 +2205,42 @@ def desenhar_pagina_funcionario(c, func, registros, mes, dias_semana, altura, la
     c.rect(40, y - 14, largura - 80, 18, fill=True, stroke=False)
     c.setFillColor(colors.black)
     c.drawString(45, y - 9, "DATA")
-    c.drawString(95, y - 9, "HORA")
-    c.drawString(145, y - 9, "TIPO")
-    c.drawString(215, y - 9, "ATR")
-    c.drawString(255, y - 9, "MIN")
-    c.drawString(295, y - 9, "BANCO")
-    c.drawString(345, y - 9, "FACE")
-    c.drawString(385, y - 9, "DIA")
-    c.drawString(420, y - 9, "JUSTIFICATIVA")
+    c.drawString(100, y - 9, "HORA")
+    c.drawString(155, y - 9, "TIPO")
+    c.drawString(225, y - 9, "ATRASO")
+    c.drawString(275, y - 9, "MIN.")
+    c.drawString(320, y - 9, "BANCO")
+    c.drawString(375, y - 9, "DIA")
+    c.drawString(415, y - 9, "AUT")
+    c.drawString(445, y - 9, "JUSTIFICATIVA")
     y -= 32
     
     c.setFont("Helvetica", 7)
     contagem = {"ENTRADA": 0, "SAIDA_ALMOCO": 0, "RETORNO_ALMOCO": 0, "SAIDA": 0}
-    total_atrasos = 0; total_min_atraso = 0; total_banco_horas = 0
+    total_atrasos = 0
+    total_min_atraso = 0
+    total_banco_horas = 0
+    total_autorizados = 0
     
     for reg in registros:
         if y < 100:
-            c.showPage(); y = altura - 50; c.setFont("Helvetica", 7)
+            c.showPage()
+            y = altura - 50
+            c.setFont("Helvetica", 7)
         
         dh = datetime.strptime(reg["data_hora"], "%Y-%m-%d %H:%M:%S")
-        data = dh.strftime("%d/%m/%Y"); hora = dh.strftime("%H:%M:%S")
-        dia_semana = dias_semana[dh.weekday()]; tipo_fmt = reg["tipo"].replace("_", " ")
+        data = dh.strftime("%d/%m/%Y")
+        hora = dh.strftime("%H:%M:%S")
+        dia_semana = dias_semana[dh.weekday()]
+        tipo_fmt = reg["tipo"].replace("_", " ")
         
         if dh.weekday() >= 5:
             c.setFillColor(colors.HexColor("#fff3cd"))
             c.rect(40, y - 2, largura - 80, 12, fill=True, stroke=False)
             c.setFillColor(colors.black)
         
-        c.drawString(45, y, data); c.drawString(95, y, hora)
+        c.drawString(45, y, data)
+        c.drawString(100, y, hora)
         
         if reg["tipo"] == "ENTRADA": c.setFillColor(colors.HexColor("#4CAF50"))
         elif reg["tipo"] == "SAIDA_ALMOCO": c.setFillColor(colors.HexColor("#ff9800"))
@@ -2741,71 +2248,97 @@ def desenhar_pagina_funcionario(c, func, registros, mes, dias_semana, altura, la
         else: c.setFillColor(colors.HexColor("#f44336"))
         
         contagem[reg["tipo"]] += 1
-        c.drawString(145, y, tipo_fmt); c.setFillColor(colors.black)
+        c.drawString(155, y, tipo_fmt)
+        c.setFillColor(colors.black)
         
         if reg["atrasado"]:
-            c.setFillColor(colors.HexColor("#f44336")); c.drawString(215, y, "SIM")
-            c.setFillColor(colors.black); total_atrasos += 1
-        else: c.drawString(215, y, "Nao")
+            c.setFillColor(colors.HexColor("#f44336"))
+            c.drawString(225, y, "SIM")
+            c.setFillColor(colors.black)
+            total_atrasos += 1
+        else:
+            c.drawString(225, y, "Nao")
         
         min_atraso = reg["minutos_atraso"] or 0
         if min_atraso > 0:
-            c.setFillColor(colors.HexColor("#f44336")); c.drawString(255, y, str(min_atraso) + "m")
-            c.setFillColor(colors.black); total_min_atraso += min_atraso
-        else: c.drawString(255, y, "-")
+            c.setFillColor(colors.HexColor("#f44336"))
+            c.drawString(275, y, str(min_atraso) + "m")
+            c.setFillColor(colors.black)
+            total_min_atraso += min_atraso
+        else:
+            c.drawString(275, y, "-")
         
         min_banco = reg["minutos_banco_horas"] or 0
         if min_banco > 0:
-            c.setFillColor(colors.HexColor("#0c5460")); c.drawString(295, y, "+" + str(min_banco) + "m")
-            c.setFillColor(colors.black); total_banco_horas += min_banco
-        else: c.drawString(295, y, "-")
-        
-        conf = reg["confianca_facial"] or 0
-        if conf > 0:
-            c.setFillColor(colors.HexColor("#4CAF50")); c.drawString(345, y, f"{conf:.0f}")
+            c.setFillColor(colors.HexColor("#0c5460"))
+            c.drawString(320, y, "+" + str(min_banco) + "m")
             c.setFillColor(colors.black)
-        else: c.drawString(345, y, "-")
+            total_banco_horas += min_banco
+        else:
+            c.drawString(320, y, "-")
         
-        c.drawString(385, y, dia_semana[:3])
+        c.drawString(375, y, dia_semana[:3])
+        
+        if reg["autorizado_admin"]:
+            c.setFillColor(colors.HexColor("#4CAF50"))
+            c.drawString(415, y, "SIM")
+            c.setFillColor(colors.black)
+            total_autorizados += 1
+        else:
+            c.drawString(415, y, "-")
         
         justificativa = reg["justificativa"] or reg["admin_resposta"] or ""
         if justificativa:
             c.setFillColor(colors.HexColor("#666666"))
-            if len(justificativa) > 30: justificativa = justificativa[:27] + "..."
-            c.drawString(420, y, justificativa)
+            if len(justificativa) > 35: justificativa = justificativa[:32] + "..."
+            c.drawString(445, y, justificativa)
             c.setFillColor(colors.black)
         
         y -= 13
     
-    if y < 200: c.showPage(); y = altura - 50
+    if y < 200:
+        c.showPage()
+        y = altura - 50
     
     y -= 10
     c.setFillColor(colors.HexColor("#f5f5f5"))
-    c.rect(40, y - 100, largura - 80, 110, fill=True, stroke=False)
+    c.rect(40, y - 110, largura - 80, 120, fill=True, stroke=False)
     c.setFillColor(colors.black)
     c.setFont("Helvetica-Bold", 10)
     c.drawString(50, y - 15, "RESUMO DO MES:")
     c.setFont("Helvetica", 9)
     c.drawString(50, y - 35, "Total: " + str(len(registros)) + " registros")
-    c.drawString(170, y - 35, "Entradas: " + str(contagem["ENTRADA"]))
-    c.drawString(290, y - 35, "Saidas: " + str(contagem["SAIDA"]))
+    c.drawString(180, y - 35, "Entradas: " + str(contagem["ENTRADA"]))
+    c.drawString(310, y - 35, "Saida Almoco: " + str(contagem["SAIDA_ALMOCO"]))
     c.drawString(50, y - 50, "Retornos: " + str(contagem["RETORNO_ALMOCO"]))
-    c.drawString(170, y - 50, "Atrasos: " + str(total_atrasos))
-    c.drawString(290, y - 50, "Min. atraso: " + str(total_min_atraso))
+    c.drawString(180, y - 50, "Saidas: " + str(contagem["SAIDA"]))
+    c.drawString(310, y - 50, "Atrasos: " + str(total_atrasos))
+    c.drawString(50, y - 65, "Min. atrasados: " + str(total_min_atraso) + " min")
     
     c.setFillColor(colors.HexColor("#0c5460"))
     c.setFont("Helvetica-Bold", 9)
-    c.drawString(50, y - 65, "Banco horas: +" + str(total_banco_horas) + " min")
+    c.drawString(180, y - 65, "Banco: +" + str(total_banco_horas) + " min")
+    c.setFillColor(colors.HexColor("#4CAF50"))
+    c.drawString(310, y - 65, "Autorizados: " + str(total_autorizados))
     c.setFillColor(colors.black)
     
-    y -= 120
+    y -= 125
     c.setFont("Helvetica-Bold", 10)
     c.drawString(40, y, "_______________________________________________________")
     y -= 15
     c.setFont("Helvetica", 9)
-    c.drawString(40, y, "Assinatura Funcionario: ___________________________")
-    y -= 30
-    c.drawString(300, y, "Assinatura Responsavel: ___________________________")
+    c.drawString(40, y, "Assinatura do Funcionario: ___________________________")
+    y -= 15
+    c.drawString(40, y, "Data: ____/____/__________")
+    
+    y -= 40
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(300, y, "_______________________________________________________")
+    y -= 15
+    c.setFont("Helvetica", 9)
+    c.drawString(300, y, "Assinatura do Responsavel: ___________________________")
+    y -= 15
+    c.drawString(300, y, "Data: ____/____/__________")
     
     c.showPage()
 
@@ -2823,10 +2356,16 @@ def gerar_pdf_geral(mes):
     dias_semana = ["Segunda", "Terca", "Quarta", "Quinta", "Sexta", "Sabado", "Domingo"]
     
     for func in funcionarios:
-        registros = conn.execute("""SELECT * FROM registros_ponto WHERE funcionario_id = ? AND strftime('%Y-%m', data_hora) = ? ORDER BY data_hora""", (func["id"], mes)).fetchall()
+        registros = conn.execute("""
+            SELECT * FROM registros_ponto 
+            WHERE funcionario_id = ? AND strftime('%Y-%m', data_hora) = ?
+            ORDER BY data_hora
+        """, (func["id"], mes)).fetchall()
         desenhar_pagina_funcionario(c, func, registros, mes, dias_semana, altura, largura, colors)
     
-    conn.close(); c.save(); buffer.seek(0)
+    conn.close()
+    c.save()
+    buffer.seek(0)
     return buffer
 
 def gerar_pdf_individual(func_id, mes):
@@ -2838,12 +2377,19 @@ def gerar_pdf_individual(func_id, mes):
     func = conn.execute("SELECT * FROM funcionarios WHERE id = ?", (func_id,)).fetchone()
     
     if not func:
-        conn.close(); buffer = io.BytesIO()
+        conn.close()
+        buffer = io.BytesIO()
         c = canvas.Canvas(buffer, pagesize=A4)
         c.drawString(100, 400, "Funcionario nao encontrado")
-        c.save(); buffer.seek(0); return buffer
+        c.save()
+        buffer.seek(0)
+        return buffer
     
-    registros = conn.execute("""SELECT * FROM registros_ponto WHERE funcionario_id = ? AND strftime('%Y-%m', data_hora) = ? ORDER BY data_hora""", (func_id, mes)).fetchall()
+    registros = conn.execute("""
+        SELECT * FROM registros_ponto 
+        WHERE funcionario_id = ? AND strftime('%Y-%m', data_hora) = ?
+        ORDER BY data_hora
+    """, (func_id, mes)).fetchall()
     
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
@@ -2852,35 +2398,35 @@ def gerar_pdf_individual(func_id, mes):
     
     desenhar_pagina_funcionario(c, func, registros, mes, dias_semana, altura, largura, colors)
     
-    conn.close(); c.save(); buffer.seek(0)
+    conn.close()
+    c.save()
+    buffer.seek(0)
     return buffer
 
 # ===================== INICIAR SERVIDOR =====================
 if __name__ == "__main__":
     print("=" * 65)
-    print("   🚀 SISTEMA DE PONTO v5.0 FACE ID - FUNCIONANDO!")
+    print("   🚀 SISTEMA DE PONTO v4.0 AUTORIZA - FUNCIONANDO!")
     print("=" * 65)
-    print(f"📱 Pagina inicial:        http://localhost:{PORTA}")
-    print(f"👤 Painel Funcionario:    http://localhost:{PORTA}/funcionario")
-    print(f"🔐 Login Admin:           http://localhost:{PORTA}/admin")
+    print(f"📱 Pagina inicial (CPF):   http://localhost:{PORTA}")
+    print(f"👤 Painel Funcionario:     http://localhost:{PORTA}/funcionario")
+    print(f"🔐 Login Admin:            http://localhost:{PORTA}/admin")
     print(f"👤 Usuário: {ADMIN_USUARIO}   |   Senha: {ADMIN_SENHA}")
     print("=" * 65)
-    print("⭐ NOVAS FUNCIONALIDADES v5.0:")
-    print("   📸 Reconhecimento facial OBRIGATÓRIO")
-    print("   👤 Foto de perfil no cadastro")
-    print("   🚫 Bloqueio após " + str(MAX_TENTATIVAS_FACIAIS) + " tentativas faciais falhas")
-    print("   🔓 Desbloqueio somente pelo administrador")
-    print("   ⏰ Autorização de horário (SEM botão cancelar)")
-    print("   🕐 Horário fixo de Brasília (UTC-3)")
+    print("⭐ NOVO: SISTEMA DE AUTORIZAÇÃO DE HORÁRIO")
+    print("   • Funcionários fora do horário precisam de autorização")
+    print("   • Tela do funcionário fica BLOQUEADA até resposta")
+    print("   • Admin recebe alertas em tempo real com som")
+    print("   • Aprovar/Negar com um clique no painel admin")
+    print("   • Solicitações expiram após 5 minutos")
     print("=" * 65)
-    if FACE_REC_DISPONIVEL:
-        print("✅ Reconhecimento facial: ATIVO (OpenCV)")
-    else:
-        print("⚠️  Reconhecimento facial: DESATIVADO (instale opencv-python)")
+    print("📝 4 opções de registro:")
+    print("   ✅ ENTRADA  |  🍽️ SAÍDA ALMOÇO  |  ↩️ RETORNO ALMOÇO  |  🚪 SAÍDA")
     print("=" * 65)
-    print(f"🌐 WI-FI: http://SEU_IP:{PORTA}")
+    print(f"🌐 Acesso WI-FI: http://SEU_IP:{PORTA}")
+    print("   (descubra seu IP com: ipconfig / ifconfig)")
     print("=" * 65)
-    print("\nServidor rodando... Ctrl+C para parar.\n")
+    print("\nServidor rodando... Aperte Ctrl+C para parar.\n")
     
     try:
         servidor = HTTPServer(("0.0.0.0", PORTA), ServidorPonto)
