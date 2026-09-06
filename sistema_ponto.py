@@ -62,16 +62,31 @@ try:
                 return None, False, "Imagem inválida"
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             
+            face_detectada = False
+            face = None
+            
             if detector_faces is not None:
-                faces = detector_faces.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80))
-                if len(faces) == 0:
-                    return None, False, "Nenhum rosto detectado. Posicione-se melhor."
-                if len(faces) > 1:
-                    return None, False, "Múltiplos rostos detectados."
-                x, y, w, h = faces[0]
-                face = gray[y:y+h, x:x+w]
-            else:
+                # Tenta detecção normal primeiro
+                faces = detector_faces.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(60, 60))
+                if len(faces) > 0:
+                    # Pega a maior face detectada
+                    maior_face = max(faces, key=lambda f: f[2] * f[3])
+                    x, y, w, h = maior_face
+                    # Adiciona margem ao redor da face
+                    margem = int(0.1 * w)
+                    x1 = max(0, x - margem)
+                    y1 = max(0, y - margem)
+                    x2 = min(gray.shape[1], x + w + margem)
+                    y2 = min(gray.shape[0], y + h + margem)
+                    face = gray[y1:y2, x1:x2]
+                    face_detectada = True
+            
+            # Se não detectou face, usa a imagem toda (fallback)
+            if not face_detectada:
                 face = gray
+            
+            # Aplica equalização de histograma para melhorar contraste
+            face = cv2.equalizeHist(face)
             
             face_redimensionada = cv2.resize(face, tamanho_alvo)
             return face_redimensionada, True, "OK"
@@ -79,33 +94,75 @@ try:
             return None, False, f"Erro: {str(e)}"
     
     def treinar_modelo_face(funcionario_id, img_bytes):
-        face, sucesso, msg = detectar_face_opencv(img_bytes)
-        if not sucesso:
-            return False, msg
+        # Primeiro: SEMPRE salva a foto de perfil, independente da detecção
         try:
-            recognizer = cv2.face.LBPHFaceRecognizer_create(radius=1, neighbors=8, grid_x=8, grid_y=8)
-            recognizer.train([face], np.array([funcionario_id]))
-            caminho_modelo = os.path.join("modelos_faciais", f"func_{funcionario_id}.yml")
-            recognizer.save(caminho_modelo)
-            
             caminho_foto = os.path.join("static/fotos", f"func_{funcionario_id}.jpg")
             nparr = np.frombuffer(img_bytes, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            cv2.imwrite(caminho_foto, img)
+            if img is not None:
+                cv2.imwrite(caminho_foto, img)
+                foto_perfil_caminho = f"/static/fotos/func_{funcionario_id}.jpg"
+            else:
+                foto_perfil_caminho = ""
+        except:
+            foto_perfil_caminho = ""
+        
+        # Depois: tenta detectar face e extrair características
+        face, sucesso, msg = detectar_face_opencv(img_bytes)
+        if not sucesso:
+            # Atualiza banco com a foto, mas marca como não treinada
+            conn = get_db()
+            conn.execute("UPDATE funcionarios SET foto_perfil = ?, face_treinada = 0 WHERE id = ?",
+                        (foto_perfil_caminho, funcionario_id))
+            conn.commit()
+            conn.close()
+            return False, f"Foto salva, mas {msg}"
+        
+        try:
+            caminho_modelo = os.path.join("modelos_faciais", f"func_{funcionario_id}.yml")
+            caminho_hist = os.path.join("modelos_faciais", f"func_{funcionario_id}_hist.npy")
+            
+            usou_lbph = False
+            try:
+                if hasattr(cv2, 'face'):
+                    recognizer = cv2.face.LBPHFaceRecognizer_create(radius=1, neighbors=8, grid_x=8, grid_y=8)
+                    recognizer.train([face], np.array([funcionario_id]))
+                    recognizer.save(caminho_modelo)
+                    usou_lbph = True
+            except:
+                usou_lbph = False
+            
+            # SEMPRE salva também o histograma como fallback
+            hist = cv2.calcHist([face], [0], None, [256], [0, 256])
+            cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+            np.save(caminho_hist, hist)
             
             conn = get_db()
             conn.execute("UPDATE funcionarios SET foto_perfil = ?, face_treinada = 1 WHERE id = ?",
-                        (f"/static/fotos/func_{funcionario_id}.jpg", funcionario_id))
+                        (foto_perfil_caminho, funcionario_id))
             conn.commit()
             conn.close()
             
-            return True, "Modelo facial treinado com sucesso!"
+            metodo = "LBPH" if usou_lbph else "Histograma"
+            return True, f"Modelo facial treinado com sucesso! ({metodo})"
         except Exception as e:
-            return False, f"Erro treinamento: {str(e)}"
+            conn = get_db()
+            conn.execute("UPDATE funcionarios SET foto_perfil = ?, face_treinada = 0 WHERE id = ?",
+                        (foto_perfil_caminho, funcionario_id))
+            conn.commit()
+            conn.close()
+            return False, f"Foto salva, mas erro no treinamento: {str(e)}"
     
     def verificar_face(funcionario_id, img_bytes):
         caminho_modelo = os.path.join("modelos_faciais", f"func_{funcionario_id}.yml")
-        if not os.path.exists(caminho_modelo):
+        caminho_hist = os.path.join("modelos_faciais", f"func_{funcionario_id}_hist.npy")
+        caminho_foto = os.path.join("static/fotos", f"func_{funcionario_id}.jpg")
+        
+        tem_modelo = os.path.exists(caminho_modelo)
+        tem_hist = os.path.exists(caminho_hist)
+        tem_foto = os.path.exists(caminho_foto)
+        
+        if not tem_foto and not tem_modelo and not tem_hist:
             return False, 0, "Funcionário não tem foto cadastrada. Contate o admin."
         
         face, sucesso, msg = detectar_face_opencv(img_bytes)
@@ -113,19 +170,64 @@ try:
             return False, 0, msg
         
         try:
-            recognizer = cv2.face.LBPHFaceRecognizer_create()
-            recognizer.read(caminho_modelo)
-            label, confianca = recognizer.predict(face)
+            # Tenta 1: LBPH se disponível
+            if tem_modelo and hasattr(cv2, 'face'):
+                try:
+                    recognizer = cv2.face.LBPHFaceRecognizer_create()
+                    recognizer.read(caminho_modelo)
+                    label, confianca = recognizer.predict(face)
+                    if label == funcionario_id and confianca < LIMIAR_CONFIANCA_FACIAL:
+                        return True, confianca, f"Reconhecido! Confiança: {confianca:.1f}"
+                except:
+                    pass
             
-            if label == funcionario_id and confianca < LIMIAR_CONFIANCA_FACIAL:
-                return True, confianca, f"Reconhecido! Confiança: {confianca:.1f}"
-            else:
-                return False, confianca, f"Rosto não reconhecido."
+            # Tenta 2: Comparação de histograma (fallback)
+            if tem_hist:
+                hist_armazenado = np.load(caminho_hist)
+                hist_novo = cv2.calcHist([face], [0], None, [256], [0, 256])
+                cv2.normalize(hist_novo, hist_novo, 0, 1, cv2.NORM_MINMAX)
+                
+                # Compara usando correlação (quanto mais próximo de 1, melhor)
+                correlacao = cv2.compareHist(hist_armazenado, hist_novo, cv2.HISTCMP_CORREL)
+                
+                # Também compara com ORB para mais robustez
+                similaridade_orb = 0.5
+                try:
+                    img_original = cv2.imread(caminho_foto, cv2.IMREAD_GRAYSCALE)
+                    if img_original is not None:
+                        orb = cv2.ORB_create(nfeatures=100)
+                        kp1, des1 = orb.detectAndCompute(img_original, None)
+                        kp2, des2 = orb.detectAndCompute(face, None)
+                        if des1 is not None and des2 is not None and len(des1) > 0 and len(des2) > 0:
+                            bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+                            matches = bf.match(des1, des2)
+                            if len(kp1) > 0:
+                                similaridade_orb = min(1.0, len(matches) / max(len(kp1), len(kp2), 1))
+                except:
+                    pass
+                
+                # Score combinado
+                score = (correlacao * 0.7) + (similaridade_orb * 0.3)
+                confianca_calculada = (1.0 - score) * 100
+                
+                limiar_score = 0.55
+                
+                if score >= limiar_score:
+                    return True, confianca_calculada, f"Reconhecido! Similaridade: {score*100:.1f}%"
+                else:
+                    return False, confianca_calculada, f"Rosto não reconhecido. Similaridade: {score*100:.1f}%"
+            
+            if tem_foto:
+                return False, 0, "Foto cadastrada mas modelo não treinado. Contate o admin."
+            
+            return False, 0, "Modelo facial não disponível."
+            
         except Exception as e:
             return False, 0, f"Erro verificação: {str(e)}"
     
     def modelo_face_existe(funcionario_id):
-        return os.path.exists(os.path.join("modelos_faciais", f"func_{funcionario_id}.yml"))
+        return (os.path.exists(os.path.join("modelos_faciais", f"func_{funcionario_id}.yml")) or
+                os.path.exists(os.path.join("modelos_faciais", f"func_{funcionario_id}_hist.npy")))
     
     print("[FACE REC] OpenCV disponível - Reconhecimento facial ATIVO")
 
@@ -751,7 +853,8 @@ body { min-height:100vh; padding:15px; position:relative; overflow-x:hidden; }
 .horario-label { font-size:10px; color:#888; text-transform:uppercase; font-weight:bold; }
 .horario-valor { font-size:14px; color:#333; font-weight:bold; margin-top:3px; }
 .data-hora { background:linear-gradient(135deg,#e8f0fe,#f3e8ff); color:#667eea; padding:14px; border-radius:14px; font-weight:bold; font-size:13px; margin-bottom:20px; text-align:center; border:2px solid rgba(102,126,234,0.2); }
-.card-botoes { padding:25px; margin-bottom:20px; }
+.card-botoes { padding:25px; margin-bottom:20px; display:none; }
+.card-botoes.visivel { display:block; animation:entrar-cima 0.5s ease; }
 .card-botoes h2 { font-size:16px; color:#333; margin-bottom:18px; text-align:center; }
 .botoes { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
 .botoes button { padding:20px 10px; font-size:13px; }
@@ -767,7 +870,25 @@ body { min-height:100vh; padding:15px; position:relative; overflow-x:hidden; }
 .atencao { background:linear-gradient(135deg,#fff8e1,#ffecb3); color:#e65100; display:block; border:1px solid #ffcc80; }
 .disp-info { margin-top:15px; padding:12px; background:linear-gradient(135deg,#f3e5f5,#e1bee7); border-radius:12px; font-size:11px; color:#6a1b9a; text-align:center; border:1px solid #ce93d8; }
 
-/* ===== MODAL CAMERA ===== */
+/* ===== TELA DE RECONHECIMENTO FACIAL (LOGIN) ===== */
+.tela-face-login { display:block; }
+.tela-face-login.oculta { display:none; }
+.card-face-login { padding:30px 25px; margin-bottom:20px; text-align:center; }
+.card-face-login.animar-entrar { animation-delay:0.1s; }
+.card-face-login h2 { color:#333; font-size:20px; margin-bottom:8px; }
+.card-face-login .sub { color:#666; font-size:13px; margin-bottom:20px; line-height:1.5; }
+.camera-login-container { position:relative; width:100%; aspect-ratio:1; background:#000; border-radius:20px; overflow:hidden; margin:0 auto 18px; max-width:360px; box-shadow:0 15px 40px rgba(102,126,234,0.3); }
+.camera-login-container video, .camera-login-container canvas { width:100%; height:100%; object-fit:cover; }
+.camera-login-container .frame-overlay { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); width:75%; height:75%; border:4px dashed rgba(102,126,234,0.7); border-radius:50%; pointer-events:none; animation:pulsar-alerta 2s infinite; }
+.camera-login-status { padding:14px; border-radius:12px; margin-bottom:15px; font-size:14px; font-weight:bold; }
+.status-aguardando { background:linear-gradient(135deg,#e3f2fd,#bbdefb); color:#1565c0; }
+.status-sucesso { background:linear-gradient(135deg,#e8f5e9,#c8e6c9); color:#2e7d32; }
+.status-erro { background:linear-gradient(135deg,#ffebee,#ffcdd2); color:#b71c1c; }
+.tentativas-info { text-align:center; font-size:13px; color:#888; margin-top:10px; }
+.tentativas-info .restantes { color:#f44336; font-weight:bold; font-size:16px; }
+.auto-capture-info { font-size:11px; color:#999; margin-top:12px; font-style:italic; }
+
+/* ===== MODAL CAMERA PARA REGISTRO ===== */
 .modal-overlay { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); backdrop-filter:blur(8px); z-index:1000; align-items:center; justify-content:center; padding:15px; }
 .modal-overlay.ativo { display:flex; }
 .modal-camera { background:white; border-radius:22px; padding:25px; width:100%; max-width:420px; box-shadow:0 30px 70px rgba(0,0,0,0.5); animation:entrar-cima 0.4s ease; }
@@ -776,18 +897,12 @@ body { min-height:100vh; padding:15px; position:relative; overflow-x:hidden; }
 .camera-container { position:relative; width:100%; aspect-ratio:1; background:#000; border-radius:16px; overflow:hidden; margin-bottom:15px; }
 .camera-container video, .camera-container canvas { width:100%; height:100%; object-fit:cover; }
 .camera-container .frame-overlay { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); width:70%; height:70%; border:3px dashed rgba(102,126,234,0.6); border-radius:50%; pointer-events:none; animation:pulsar-alerta 2s infinite; }
-.camera-status { text-align:center; padding:12px; border-radius:10px; margin-bottom:12px; font-size:13px; font-weight:bold; }
-.status-aguardando { background:linear-gradient(135deg,#e3f2fd,#bbdefb); color:#1565c0; }
-.status-sucesso { background:linear-gradient(135deg,#e8f5e9,#c8e6c9); color:#2e7d32; }
-.status-erro { background:linear-gradient(135deg,#ffebee,#ffcdd2); color:#b71c1c; }
 .modal-botoes { display:flex; gap:10px; }
 .modal-botoes button { flex:1; padding:14px; border:none; border-radius:12px; font-weight:bold; cursor:pointer; font-size:14px; transition:all 0.3s; }
 .btn-capturar { background:linear-gradient(135deg,#667eea,#764ba2); color:white; }
 .btn-fechar { background:linear-gradient(135deg,#e0e0e0,#bdbdbd); color:#333; }
-.tentativas-info { text-align:center; font-size:12px; color:#888; margin-top:10px; }
-.tentativas-info .restantes { color:#f44336; font-weight:bold; font-size:14px; }
 
-/* ===== TELA DE AUTORIZACAO (SEM BOTAO CANCELAR) ===== */
+/* ===== TELA DE AUTORIZACAO ===== */
 .tela-autorizacao { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:linear-gradient(135deg,rgba(102,126,234,0.97),rgba(118,75,162,0.97)); z-index:9999; align-items:center; justify-content:center; padding:20px; backdrop-filter:blur(10px); }
 .tela-autorizacao.ativa { display:flex; }
 .autorizacao-box { background:white; border-radius:28px; padding:35px 30px; width:100%; max-width:420px; text-align:center; box-shadow:0 30px 80px rgba(0,0,0,0.4); animation:entrar-cima 0.5s ease; }
@@ -805,21 +920,44 @@ body { min-height:100vh; padding:15px; position:relative; overflow-x:hidden; }
 .barra-progresso .preenchimento { height:100%; background:linear-gradient(90deg,#2196F3,#667eea); border-radius:4px; transition:width 1s linear; }
 .resposta-admin { padding:15px; border-radius:12px; margin-top:15px; font-size:13px; font-style:italic; color:#555; background:#f5f5f5; border-left:4px solid #667eea; display:none; }
 .resposta-admin.visivel { display:block; }
-.aviso-bloqueio { background:linear-gradient(135deg,#ffebee,#ffcdd2); padding:15px; border-radius:14px; margin-bottom:15px; border:2px solid #ef9a9a; color:#b71c1c; font-weight:bold; font-size:14px; text-align:center; }
 </style>
 </head>
 <body class="fundo-animado">
 <div class="wrapper">
-<div class="card-topo card-3d animar-entrar">
+
+<!-- ===== TELA 1: RECONHECIMENTO FACIAL LOGIN ===== -->
+<div class="tela-face-login" id="telaFaceLogin">
+<div class="card-face-login card-3d animar-entrar">
 <a href="/" class="voltar">← Trocar usuário</a>
+<div class="foto-perfil-container" id="fotoContainerLogin">👤</div>
+<h2 class="nome-func" id="nomeFuncLogin" style="font-size:20px;color:#333;margin-bottom:5px;">Carregando...</h2>
+<p class="cpf-func" id="cpfFuncLogin" style="color:#888;font-size:13px;margin-bottom:20px;">CPF: ---</p>
+<h2 style="color:#667eea;font-size:18px;">🔐 Verificação Facial</h2>
+<p class="sub">Posicione seu rosto dentro do círculo<br>para confirmar sua identidade</p>
+<div class="camera-login-container">
+<video id="videoLogin" autoplay playsinline muted></video>
+<canvas id="canvasLogin" style="display:none;"></canvas>
+<div class="frame-overlay"></div>
+</div>
+<div class="camera-login-status status-aguardando" id="cameraLoginStatus">
+<span class="spinner spinner-escuro"></span>Inicializando câmera...
+</div>
+<div class="tentativas-info" id="tentativasLoginInfo"></div>
+<p class="auto-capture-info">📸 A captura será feita automaticamente em instantes</p>
+</div>
+</div>
+
+<!-- ===== TELA 2: DADOS E BOTOES DE REGISTRO ===== -->
+<div id="conteudoPrincipal" style="display:none;">
+<div class="card-topo card-3d animar-entrar">
 <div class="foto-perfil-container" id="fotoContainer">👤</div>
-<h2 class="nome-func" id="nomeFunc" style="text-align:center;font-size:20px;color:#333;margin-bottom:5px;">Carregando...</h2>
-<p class="cpf-func" id="cpfFunc" style="text-align:center;color:#888;font-size:13px;margin-bottom:16px;">CPF: ---</p>
-<div class="status-wrapper" id="statusWrapper"><span class="status-acesso">✅ Sessão segura ativa</span></div>
+<h2 class="nome-func" id="nomeFunc" style="text-align:center;font-size:20px;color:#333;margin-bottom:5px;"></h2>
+<p class="cpf-func" id="cpfFunc" style="text-align:center;color:#888;font-size:13px;margin-bottom:16px;"></p>
+<div class="status-wrapper" id="statusWrapper"><span class="status-acesso">✅ Identidade confirmada</span></div>
 <div class="horarios-grid" id="horariosInfo"></div>
 </div>
 
-<div class="card-botoes card-3d animar-entrar" style="animation-delay:0.2s">
+<div class="card-botoes visivel">
 <div class="data-hora" id="dataHora">Carregando...</div>
 <h2>🎯 Selecione o Registro</h2>
 <div class="botoes" id="botoesRegistro">
@@ -829,22 +967,23 @@ body { min-height:100vh; padding:15px; position:relative; overflow-x:hidden; }
 <button class="btn-3d btn-saida" onclick="iniciarRegistro('SAIDA')"><span class="icone-btn">🚪</span>SAÍDA</button>
 </div>
 <div class="mensagem" id="mensagem"></div>
-<div class="disp-info">📸 Reconhecimento facial obrigatório</div>
+<div class="disp-info">📸 Reconhecimento facial obrigatório em cada registro</div>
 </div>
 """ + RODAPE_WELL + """
 </div>
+</div>
 
-<!-- ===== MODAL CAMERA ===== -->
+<!-- ===== MODAL CAMERA PARA REGISTROS ===== -->
 <div class="modal-overlay" id="modalCamera">
 <div class="modal-camera">
-<h2>📸 Reconhecimento Facial</h2>
-<p class="sub">Posicione seu rosto dentro do círculo</p>
+<h2>📸 Verificação Facial</h2>
+<p class="sub">Confirme sua identidade para registrar</p>
 <div class="camera-container">
 <video id="videoCamera" autoplay playsinline muted></video>
 <canvas id="canvasCamera" style="display:none;"></canvas>
 <div class="frame-overlay"></div>
 </div>
-<div class="camera-status status-aguardando" id="cameraStatus"><span class="spinner spinner-escuro"></span>Inicializando câmera...</div>
+<div class="camera-login-status status-aguardando" id="cameraStatus"><span class="spinner spinner-escuro"></span>Inicializando...</div>
 <div class="tentativas-info" id="tentativasInfo"></div>
 <div class="modal-botoes">
 <button class="btn-fechar" onclick="fecharCamera()">❌ Cancelar</button>
@@ -881,59 +1020,169 @@ const CPF=prm.get('cpf')||'';
 let FUNC_ID=null;
 let FUNC_NOME=null;
 let TEM_FOTO=false;
+let FACE_TREINADA=false;
 let TIPO_ATUAL=null;
 let streamCamera=null;
+let streamLogin=null;
 let idSolicitacaoAtual=null;
 let pollingAutorizacao=null;
 let tempoInicioAutorizacao=null;
+let autoCapturaTimer=null;
 const TEMPO_MAX_AUTORIZACAO=300;
 
 function atualizarDH(){
+  const el=document.getElementById('dataHora');
+  if(!el)return;
   const o={weekday:'long',day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'};
-  document.getElementById('dataHora').textContent='🕐 '+new Date().toLocaleDateString('pt-BR',o);
+  el.textContent='🕐 '+new Date().toLocaleDateString('pt-BR',o);
 }
-setInterval(atualizarDH,1000); atualizarDH();
+setInterval(atualizarDH,1000);
 
 async function carregar(){
   if(!CPF){window.location.href='/';return;}
   try{
     const r=await fetch('/api/buscar/'+CPF);const d=await r.json();
     if(!d.encontrado){window.location.href='/';return;}
-    FUNC_ID=d.id; FUNC_NOME=d.nome; TEM_FOTO=d.face_treinada;
+    FUNC_ID=d.id;FUNC_NOME=d.nome;TEM_FOTO=!!d.foto_perfil;FACE_TREINADA=d.face_treinada;
+    
+    document.getElementById('nomeFuncLogin').textContent=d.nome;
+    document.getElementById('cpfFuncLogin').textContent='CPF: '+CPF.replace(/(\\d{3})(\\d{3})(\\d{3})(\\d{2})/,'$1.$2.$3-$4');
+    
+    const fotoContainerLogin=document.getElementById('fotoContainerLogin');
+    if(d.foto_perfil){
+      fotoContainerLogin.innerHTML='<img src="'+d.foto_perfil+'?t='+Date.now()+'" class="foto-perfil" onerror="this.parentElement.innerHTML=\\''+d.nome.charAt(0).toUpperCase()+'\\'">';
+    }else{
+      fotoContainerLogin.textContent=d.nome.charAt(0).toUpperCase();
+    }
+    
+    if(d.bloqueado){
+      document.getElementById('cameraLoginStatus').className='camera-login-status status-erro';
+      document.getElementById('cameraLoginStatus').innerHTML='🚫 VOCÊ ESTÁ BLOQUEADO!<br><small>Contate o administrador para desbloquear.</small>';
+      return;
+    }
+    
+    if(!FACE_TREINADA){
+      document.getElementById('cameraLoginStatus').className='camera-login-status status-erro';
+      document.getElementById('cameraLoginStatus').innerHTML='📸 Sem reconhecimento facial cadastrado.<br><small>Contate o administrador.</small>';
+      return;
+    }
+    
+    // Preenche também os dados da tela principal
     document.getElementById('nomeFunc').textContent=d.nome;
     document.getElementById('cpfFunc').textContent='CPF: '+CPF.replace(/(\\d{3})(\\d{3})(\\d{3})(\\d{2})/,'$1.$2.$3-$4');
-    
     const fotoContainer=document.getElementById('fotoContainer');
     if(d.foto_perfil){
       fotoContainer.innerHTML='<img src="'+d.foto_perfil+'?t='+Date.now()+'" class="foto-perfil" onerror="this.parentElement.innerHTML=\\''+d.nome.charAt(0).toUpperCase()+'\\'">';
     }else{
       fotoContainer.textContent=d.nome.charAt(0).toUpperCase();
     }
-    
-    if(d.bloqueado){
-      document.getElementById('statusWrapper').innerHTML='<span class="status-bloqueado">🚫 BLOQUEADO</span>';
-      document.getElementById('botoesRegistro').innerHTML='<div class="aviso-bloqueio" style="grid-column:1/-1;">🚫 Você está bloqueado no sistema.<br>Contate o administrador para desbloquear.</div>';
-      document.querySelectorAll('#botoesRegistro button').forEach(b=>b.disabled=true);
-    }else if(!TEM_FOTO){
-      document.getElementById('statusWrapper').innerHTML='<span class="status-bloqueado">📸 Sem foto cadastrada</span>';
-      document.getElementById('botoesRegistro').innerHTML='<div class="aviso-bloqueio" style="grid-column:1/-1;">📸 Sua foto de rosto ainda não foi cadastrada.<br>Contate o administrador.</div>';
-    }
-    
     document.getElementById('horariosInfo').innerHTML=
       '<div class="horario-item"><div class="horario-label">Entrada</div><div class="horario-valor">🕐 '+d.horario_entrada+'</div></div>'+
       '<div class="horario-item"><div class="horario-label">Saída Almoço</div><div class="horario-valor">🍽️ '+d.horario_saida_almoco+'</div></div>'+
       '<div class="horario-item"><div class="horario-label">Retorno</div><div class="horario-valor">↩️ '+d.horario_retorno_almoco+'</div></div>'+
       '<div class="horario-item"><div class="horario-label">Saída</div><div class="horario-valor">🚪 '+d.horario_saida+'</div></div>';
+    
+    // Inicia a câmera de login automaticamente
+    setTimeout(iniciarCameraLogin, 500);
+    
   }catch(e){window.location.href='/';}
 }
 carregar();
+
+async function iniciarCameraLogin(){
+  const video=document.getElementById('videoLogin');
+  const status=document.getElementById('cameraLoginStatus');
+  
+  status.className='camera-login-status status-aguardando';
+  status.innerHTML='<span class="spinner spinner-escuro"></span>Solicitando acesso à câmera...';
+  
+  try{
+    streamLogin=await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:'user',width:{ideal:640},height:{ideal:640}},audio:false
+    });
+    video.srcObject=streamLogin;
+    await video.play();
+    
+    status.className='camera-login-status status-aguardando';
+    status.innerHTML='<span class="spinner spinner-escuro"></span>Câmera pronta! Capturando em 2 segundos...';
+    
+    // Captura automática após 2 segundos
+    autoCapturaTimer=setTimeout(capturarLogin, 2000);
+    
+  }catch(err){
+    status.className='camera-login-status status-erro';
+    status.innerHTML='❌ Erro ao acessar câmera: '+err.message+'<br><small>Verifique as permissões do navegador.</small>';
+  }
+}
+
+async function capturarLogin(){
+  const video=document.getElementById('videoLogin');
+  const canvas=document.getElementById('canvasLogin');
+  const status=document.getElementById('cameraLoginStatus');
+  const tentInfo=document.getElementById('tentativasLoginInfo');
+  
+  if(!streamLogin)return;
+  
+  canvas.width=video.videoWidth;
+  canvas.height=video.videoHeight;
+  canvas.getContext('2d').drawImage(video,0,0);
+  
+  const imagemBase64=canvas.toDataURL('image/jpeg',0.8).split(',')[1];
+  
+  status.className='camera-login-status status-aguardando';
+  status.innerHTML='<span class="spinner spinner-escuro"></span>Verificando identidade...';
+  
+  try{
+    const r=await fetch('/api/verificar_face_login',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({cpf:CPF,funcionario_id:FUNC_ID,imagem:imagemBase64})
+    });
+    const d=await r.json();
+    
+    if(r.ok && d.reconhecido){
+      status.className='camera-login-status status-sucesso';
+      status.innerHTML='✅ Identidade confirmada! Confiança: '+(d.confianca||0).toFixed(1);
+      
+      // Para a câmera e mostra a tela principal
+      setTimeout(()=>{
+        if(streamLogin){streamLogin.getTracks().forEach(t=>t.stop());streamLogin=null;}
+        document.getElementById('telaFaceLogin').classList.add('oculta');
+        document.getElementById('conteudoPrincipal').style.display='block';
+        atualizarDH();
+      },1000);
+      
+    }else{
+      status.className='camera-login-status status-erro';
+      status.innerHTML='❌ '+(d.detail||'Rosto não reconhecido');
+      
+      if(d.tentativas_restantes!==undefined){
+        tentInfo.innerHTML='Tentativas restantes: <span class="restantes">'+d.tentativas_restantes+'</span> de """ + str(MAX_TENTATIVAS_FACIAIS) + """';
+      }
+      
+      if(d.bloqueado){
+        setTimeout(()=>{
+          if(streamLogin){streamLogin.getTracks().forEach(t=>t.stop());streamLogin=null;}
+          status.innerHTML='🚫 BLOQUEADO!<br><small>Após """ + str(MAX_TENTATIVAS_FACIAIS) + """ tentativas falhas. Contate o administrador.</small>';
+        },1500);
+      }else{
+        // Tenta novamente automaticamente após 2 segundos
+        autoCapturaTimer=setTimeout(capturarLogin, 2500);
+      }
+    }
+  }catch(e){
+    status.className='camera-login-status status-erro';
+    status.innerHTML='❌ Erro de conexão';
+    autoCapturaTimer=setTimeout(capturarLogin, 3000);
+  }
+}
 
 function travarBotoes(travar){
   document.querySelectorAll('#botoesRegistro button').forEach(b=>b.disabled=travar);
 }
 
 async function iniciarRegistro(tipo){
-  if(!FUNC_ID||!TEM_FOTO)return;
+  if(!FUNC_ID)return;
   TIPO_ATUAL=tipo;
   await abrirCamera();
 }
@@ -945,7 +1194,7 @@ async function abrirCamera(){
   const btnCap=document.getElementById('btnCapturar');
   const tentInfo=document.getElementById('tentativasInfo');
   
-  status.className='camera-status status-aguardando';
+  status.className='camera-login-status status-aguardando';
   status.innerHTML='<span class="spinner spinner-escuro"></span>Solicitando acesso à câmera...';
   btnCap.disabled=true;
   tentInfo.innerHTML='';
@@ -953,18 +1202,17 @@ async function abrirCamera(){
   
   try{
     streamCamera=await navigator.mediaDevices.getUserMedia({
-      video:{facingMode:'user',width:{ideal:640},height:{ideal:640}},
-      audio:false
+      video:{facingMode:'user',width:{ideal:640},height:{ideal:640}},audio:false
     });
     video.srcObject=streamCamera;
     await video.play();
     
-    status.className='camera-status status-sucesso';
+    status.className='camera-login-status status-sucesso';
     status.innerHTML='✅ Câmera pronta! Posicione seu rosto e capture';
     btnCap.disabled=false;
     
   }catch(err){
-    status.className='camera-status status-erro';
+    status.className='camera-login-status status-erro';
     status.innerHTML='❌ Erro ao acessar câmera: '+err.message;
     setTimeout(fecharCamera,3000);
   }
@@ -972,10 +1220,7 @@ async function abrirCamera(){
 
 function fecharCamera(){
   const modal=document.getElementById('modalCamera');
-  if(streamCamera){
-    streamCamera.getTracks().forEach(t=>t.stop());
-    streamCamera=null;
-  }
+  if(streamCamera){streamCamera.getTracks().forEach(t=>t.stop());streamCamera=null;}
   modal.classList.remove('ativo');
   TIPO_ATUAL=null;
 }
@@ -988,7 +1233,7 @@ async function capturarEVerificar(){
   const tentInfo=document.getElementById('tentativasInfo');
   
   btnCap.disabled=true;
-  status.className='camera-status status-aguardando';
+  status.className='camera-login-status status-aguardando';
   status.innerHTML='<span class="spinner spinner-escuro"></span>Processando e verificando...';
   
   canvas.width=video.videoWidth;
@@ -1006,22 +1251,22 @@ async function capturarEVerificar(){
     const d=await r.json();
     
     if(r.ok && d.reconhecido){
-      status.className='camera-status status-sucesso';
+      status.className='camera-login-status status-sucesso';
       status.innerHTML='✅ Rosto reconhecido! Confiança: '+(d.confianca||0).toFixed(1);
       setTimeout(()=>{
         fecharCamera();
         continuarRegistroAposFace(d.foto_salva||'',d.confianca||0);
       },800);
     }else{
-      status.className='camera-status status-erro';
+      status.className='camera-login-status status-erro';
       status.innerHTML='❌ '+(d.detail||'Rosto não reconhecido');
       if(d.tentativas_restantes!==undefined){
-        tentInfo.innerHTML='Tentativas restantes: <span class="restantes">'+d.tentativas_restantes+'</span> de '+""" + str(MAX_TENTATIVAS_FACIAIS) + """;
+        tentInfo.innerHTML='Tentativas restantes: <span class="restantes">'+d.tentativas_restantes+'</span> de """ + str(MAX_TENTATIVAS_FACIAIS) + """';
       }
       if(d.bloqueado){
         setTimeout(()=>{
           fecharCamera();
-          mostrar('🚫 VOCÊ FOI BLOQUEADO!\\nApós 5 tentativas falhas de reconhecimento facial.\\n\\nContate o administrador para desbloquear.','erro');
+          mostrar('🚫 VOCÊ FOI BLOQUEADO!\\nApós """ + str(MAX_TENTATIVAS_FACIAIS) + """ tentativas falhas de reconhecimento facial.\\n\\nContate o administrador para desbloquear.','erro');
           setTimeout(()=>location.reload(),4000);
         },1500);
       }else{
@@ -1029,7 +1274,7 @@ async function capturarEVerificar(){
       }
     }
   }catch(e){
-    status.className='camera-status status-erro';
+    status.className='camera-login-status status-erro';
     status.innerHTML='❌ Erro de conexão';
     btnCap.disabled=false;
   }
@@ -1112,40 +1357,30 @@ async function verificarStatusAutorizacao(){
     
     if(d.status==='aprovado'){
       clearInterval(pollingAutorizacao);pollingAutorizacao=null;
-      
       if(d.resposta_admin){
         const respEl=document.getElementById('autResposta');
         respEl.textContent='📝 Admin: '+d.resposta_admin;
         respEl.className='resposta-admin visivel';
       }
-      
       document.querySelector('.status-aguardando .texto').innerHTML='✅ <strong style="color:#2e7d32;">AUTORIZADO!</strong> Registrando...';
       document.getElementById('autIcone').style.background='linear-gradient(135deg,#4CAF50,#81c784)';
       document.getElementById('autIcone').textContent='✅';
-      
-      setTimeout(async ()=>{
-        await finalizarRegistroComAutorizacao(idSolicitacaoAtual,d.resposta_admin||'');
-      },1000);
-      
+      setTimeout(async ()=>{await finalizarRegistroComAutorizacao(idSolicitacaoAtual,d.resposta_admin||'');},1000);
     }else if(d.status==='rejeitado'){
       clearInterval(pollingAutorizacao);pollingAutorizacao=null;
-      
       document.querySelector('.status-aguardando .texto').innerHTML='❌ <strong style="color:#c62828;">NEGADO!</strong>';
       document.getElementById('autIcone').style.background='linear-gradient(135deg,#f44336,#e57373)';
       document.getElementById('autIcone').textContent='❌';
-      
       if(d.resposta_admin){
         const respEl=document.getElementById('autResposta');
         respEl.textContent='📝 Motivo: '+d.resposta_admin;
         respEl.className='resposta-admin visivel';
       }
-      
       setTimeout(()=>{
         fecharTelaAutorizacao();
         mostrar('❌ Solicitação negada pelo administrador.'+(d.resposta_admin?'\\nMotivo: '+d.resposta_admin:''),'erro');
         travarBotoes(false);
       },2500);
-      
     }else if(d.status==='expirado'){
       clearInterval(pollingAutorizacao);pollingAutorizacao=null;
       fecharTelaAutorizacao();
@@ -1190,7 +1425,6 @@ async function finalizarRegistroComAutorizacao(solicitacaoId,respostaAdmin){
       mostrar(d.detail||'Erro','erro');
     }
   }catch(e){mostrar('Erro de conexão!','erro');}
-  
   setTimeout(()=>{fecharTelaAutorizacao();travarBotoes(false);},1500);
 }
 
@@ -1204,7 +1438,6 @@ function mostrar(texto,tipo){
 </body>
 </html>"""
 
-# ===================== HTML - PAINEL ADMIN =====================
 def gerar_html_admin():
     ts = str(int(agora_brasilia().timestamp()))
     return """<!DOCTYPE html>
@@ -2047,6 +2280,46 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
             return
         
+        # ===== NOVA ROTA: VERIFICACAO FACIAL NO LOGIN =====
+        if caminho == "/api/verificar_face_login":
+            cpf = formatar_cpf(dados.get("cpf", ""))
+            funcionario_id = dados.get("funcionario_id")
+            imagem_b64 = dados.get("imagem", "")
+            
+            if len(cpf) != 11 or not funcionario_id:
+                responder_json(self, {"detail": "Dados inválidos"}, status=400); return
+            if not imagem_b64:
+                responder_json(self, {"detail": "Nenhuma imagem capturada"}, status=400); return
+            
+            try:
+                bloqueado, motivo = funcionario_bloqueado(funcionario_id)
+                if bloqueado:
+                    responder_json(self, {"detail": f"🚫 BLOQUEADO! {motivo}", "bloqueado": True}, status=403); return
+                
+                img_bytes = base64.b64decode(imagem_b64)
+                reconhecido, confianca, msg = verificar_face(funcionario_id, img_bytes)
+                
+                if reconhecido:
+                    resetar_tentativas_face(funcionario_id)
+                    registrar_acesso_dispositivo(cpf, funcionario_id, ip_cliente, user_agent, "reconhecimento_face_login")
+                    print(f"[FACE LOGIN OK] ID:{funcionario_id} Confiança:{confianca:.1f}")
+                    responder_json(self, {"reconhecido": True, "confianca": confianca})
+                else:
+                    bloqueado_agora, msg_bloqueio = incrementar_tentativas_face(funcionario_id)
+                    conn = get_db()
+                    func = conn.execute("SELECT tentativas_reconhecimento FROM funcionarios WHERE id=?", (funcionario_id,)).fetchone()
+                    conn.close()
+                    tentativas_feitas = func["tentativas_reconhecimento"] or 0
+                    tentativas_restantes = MAX_TENTATIVAS_FACIAIS - tentativas_feitas
+                    responder_json(self, {
+                        "reconhecido": False, "detail": msg,
+                        "tentativas_restantes": tentativas_restantes,
+                        "bloqueado": bloqueado_agora
+                    }, status=400)
+            except Exception as e:
+                responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
+            return
+
         # ===== NOVA ROTA: SOLICITAR PONTO =====
         if caminho == "/api/solicitar_ponto":
             cpf = formatar_cpf(dados.get("cpf", ""))
