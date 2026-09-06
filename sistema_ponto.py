@@ -4,9 +4,18 @@ import os
 import io
 import hashlib
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+
+# ===================== HORARIO DE BRASILIA (UTC-3) =====================
+# Sempre retorna o horário correto de Brasília, independente do fuso do servidor
+FUSO_BRASILIA = timezone(timedelta(hours=-3))
+
+def agora_brasilia():
+    """Retorna datetime atual no horário de Brasília (UTC-3)"""
+    return datetime.now(timezone.utc).astimezone(FUSO_BRASILIA).replace(tzinfo=None)
+
 
 # ===================== CONFIGURACOES =====================
 SEGREDO_QR = "CLINICA_PONTO_2024"
@@ -40,7 +49,7 @@ def sanitizar_texto(texto, max_len=500):
     return texto
 
 def verificar_rate_limit(ip, max_tentativas=5, janela_segundos=300):
-    agora = datetime.now()
+    agora = agora_brasilia()
     if ip in tentativas_login:
         info = tentativas_login[ip]
         if (agora - info["ultima_tentativa"]).total_seconds() > janela_segundos:
@@ -198,7 +207,7 @@ def gerar_id_solicitacao():
     return hashlib.sha256(os.urandom(32)).hexdigest()[:16]
 
 def limpar_autorizacoes_expiradas():
-    agora = datetime.now()
+    agora = agora_brasilia()
     expiradas = [sid for sid, s in autorizacoes_pendentes.items() if s["expira"] <= agora]
     for sid in expiradas:
         del autorizacoes_pendentes[sid]
@@ -210,7 +219,7 @@ def criar_solicitacao_autorizacao(func, tipo, hora_registro, horario_padrao, min
     """
     limpar_autorizacoes_expiradas()
     sid = gerar_id_solicitacao()
-    agora = datetime.now()
+    agora = agora_brasilia()
     
     # Verifica se ja existe solicitacao pendente para este funcionario + tipo
     for s in autorizacoes_pendentes.values():
@@ -254,7 +263,7 @@ def listar_autorizacoes_pendentes():
                 "minutos_diferenca": s["minutos_diferenca"],
                 "tipo_diferenca": s["tipo_diferenca"],
                 "criado_em": s["criado_em"],
-                "segundos_restantes": max(0, int((s["expira"] - datetime.now()).total_seconds()))
+                "segundos_restantes": max(0, int((s["expira"] - agora_brasilia()).total_seconds()))
             })
     return resultado
 
@@ -268,7 +277,7 @@ def responder_autorizacao(sid, aprovar, resposta_admin=""):
     
     s["status"] = "aprovado" if aprovar else "rejeitado"
     s["resposta_admin"] = resposta_admin
-    s["respondido_em"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    s["respondido_em"] = agora_brasilia().strftime("%Y-%m-%d %H:%M:%S")
     
     acao = "APROVADA" if aprovar else "REJEITADA"
     print(f"[AUTORIZACAO] {acao} | {s['nome']} | {s['tipo']}")
@@ -284,7 +293,7 @@ def verificar_status_autorizacao(sid):
         return {
             "status": "pendente",
             "mensagem": "Aguardando autorização do administrador...",
-            "segundos_restantes": max(0, int((s["expira"] - datetime.now()).total_seconds()))
+            "segundos_restantes": max(0, int((s["expira"] - agora_brasilia()).total_seconds()))
         }
     
     return {
@@ -325,7 +334,7 @@ def gerar_sessao():
     return hashlib.sha256(os.urandom(64)).hexdigest()
 
 def limpar_sessoes_expiradas():
-    agora = datetime.now()
+    agora = agora_brasilia()
     for token in [t for t,e in sessoes_admin.items() if e <= agora]: del sessoes_admin[token]
     for cpf in [c for c,i in acessos_funcionarios.items() if i["expira"] <= agora]: del acessos_funcionarios[cpf]
 
@@ -337,14 +346,14 @@ def verificar_login(handler):
             if cookie.startswith("sessao_admin="):
                 token = cookie.replace("sessao_admin=","").strip()
                 expira = sessoes_admin.get(token)
-                if expira and expira > datetime.now(): return True
+                if expira and expira > agora_brasilia(): return True
     except: pass
     return False
 
 def registrar_acesso_dispositivo(cpf, funcionario_id, ip, user_agent, tipo_acesso="pagina_inicial"):
     try:
         conn = get_db()
-        agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        agora = agora_brasilia().strftime("%Y-%m-%d %H:%M:%S")
         conn.execute("INSERT INTO acessos_dispositivos (funcionario_id, cpf, data_hora_acesso, ip_dispositivo, user_agent, tipo_acesso) VALUES (?, ?, ?, ?, ?, ?)", (funcionario_id, cpf, agora, ip, user_agent[:500], tipo_acesso))
         conn.commit(); conn.close()
         return True
@@ -443,7 +452,7 @@ SCRIPT_PARTICULAS = """
 
 # ===================== HTML - LOGIN ADMIN =====================
 def gerar_html_login():
-    ts = str(int(datetime.now().timestamp()))
+    ts = str(int(agora_brasilia().timestamp()))
     return """<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -508,7 +517,7 @@ async function logar(){
 
 # ===================== HTML - PAGINA PRINCIPAL (ENTRADA CPF) =====================
 def gerar_html_ponto():
-    ts = str(int(datetime.now().timestamp()))
+    ts = str(int(agora_brasilia().timestamp()))
     return """<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -923,7 +932,7 @@ function mostrar(texto,tipo){
 
 # ===================== HTML - PAINEL ADMIN (COM ALERTAS DE AUTORIZACAO) =====================
 def gerar_html_admin():
-    ts = str(int(datetime.now().timestamp()))
+    ts = str(int(agora_brasilia().timestamp()))
     return """<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -1392,7 +1401,7 @@ def salvar_historico_json():
         dados_historico = {
             "meta": {
                 "versao_sistema": "4.0 AUTORIZA",
-                "ultima_atualizacao": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "ultima_atualizacao": agora_brasilia().strftime("%Y-%m-%d %H:%M:%S"),
                 "total_funcionarios": len(funcionarios),
                 "total_registros_ponto": len(registros),
                 "total_acessos": len(acessos)
@@ -1416,7 +1425,7 @@ def salvar_historico_json():
 def fazer_backup_db():
     try:
         import shutil
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = agora_brasilia().strftime("%Y%m%d_%H%M%S")
         caminho_backup = os.path.join(BACKUP_DIR, f"ponto_backup_{timestamp}.db")
         
         conn = get_db()
@@ -1449,7 +1458,7 @@ def fazer_backup_db():
 def verificar_backup_periodico():
     try:
         arquivo_controle = os.path.join(BACKUP_DIR, ".ultimo_backup")
-        agora = datetime.now()
+        agora = agora_brasilia()
         
         if os.path.exists(arquivo_controle):
             with open(arquivo_controle, "r") as f:
@@ -1475,7 +1484,7 @@ verificar_backup_periodico()
 class ServidorPonto(BaseHTTPRequestHandler):
     
     def log_message(self, format, *args):
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] {args[0]}")
+        print(f"[{agora_brasilia().strftime('%H:%M:%S')}] {args[0]}")
     
     def do_GET(self):
         url = urlparse(self.path)
@@ -1757,7 +1766,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
             
             if usuario == ADMIN_USUARIO and senha == ADMIN_SENHA:
                 token = gerar_sessao()
-                sessoes_admin[token] = datetime.now() + timedelta(hours=8)
+                sessoes_admin[token] = agora_brasilia() + timedelta(hours=8)
                 cookie = f"sessao_admin={token}; Path=/; Max-Age=28800; HttpOnly; SameSite=Lax"
                 tentativas_login.pop(ip_cliente, None)
                 print(f"[LOGIN OK] Admin de {ip_cliente}")
@@ -1788,7 +1797,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 acessos_funcionarios[cpf] = {
                     "funcionario_id": func_id,
                     "ip": ip_cliente,
-                    "expira": datetime.now() + timedelta(hours=2)
+                    "expira": agora_brasilia() + timedelta(hours=2)
                 }
                 
                 print(f"[ACESSO FUNC] {func['nome']} | IP: {ip_cliente}")
@@ -1821,7 +1830,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
                     responder_json(self, {"detail": "CPF não cadastrado!"}, status=404)
                     return
                 
-                agora = datetime.now()
+                agora = agora_brasilia()
                 data_str = agora.strftime("%Y-%m-%d")
                 hora_str = agora.strftime("%H:%M:%S")
                 
@@ -1960,7 +1969,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
                     responder_json(self, {"detail": "Funcionário não encontrado"}, status=404)
                     return
                 
-                agora = datetime.now()
+                agora = agora_brasilia()
                 hora_str = agora.strftime("%H:%M:%S")
                 
                 registro_id = self._executar_registro_ponto(
@@ -2034,7 +2043,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
                     responder_json(self, {"detail": "CPF não cadastrado!"}, status=404)
                     return
                 
-                agora = datetime.now()
+                agora = agora_brasilia()
                 hora_str = agora.strftime("%H:%M:%S")
                 conn.close()
                 
