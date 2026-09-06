@@ -82,6 +82,9 @@ def criar_logo_padrao():
         return False
 
 DB_NOME = "ponto.db"
+HISTORICO_JSON = "historico_ponto.json"
+BACKUP_DIR = "backups"
+BACKUP_INTERVAL_HORAS = 24
 
 def get_db():
     conn = sqlite3.connect(DB_NOME)
@@ -541,13 +544,14 @@ body { min-height:100vh; padding:15px; position:relative; overflow-x:hidden; }
 </div>
 <div class="modal-overlay" id="modalJust">
 <div class="modal-box">
-<h2>⚠️ Atenção!</h2>
+<h2>⏰ Aviso de Horário</h2>
+<p style="color:#667eea;font-size:12px;font-weight:bold;margin-bottom:10px;">💡 Seu ponto será registrado normalmente. Informe uma justificativa se desejar.</p>
 <p id="modalTexto"></p>
 <div class="info-atraso" id="modalInfo"></div>
 <p style="font-weight:bold;color:#333;margin-bottom:8px;">📝 Informe a justificativa:</p>
 <textarea id="justificativa" placeholder="Descreva o motivo detalhadamente..."></textarea>
 <div class="modal-botoes">
-<button class="btn-cancelar" onclick="fecharModal()">Cancelar</button>
+<button class="btn-cancelar" onclick="fecharModal()">Registrar sem justificar</button>
 <button class="btn-confirmar" onclick="confirmar()">✅ Confirmar</button>
 </div>
 </div>
@@ -595,12 +599,22 @@ async function registrar(tipo){
     }else await executar(CPF,tipo,'');
   }catch(e){mostrar('Erro de conexão!','erro');}
 }
-function fecharModal(){document.getElementById('modalJust').classList.remove('ativo');pendente=null;}
+function fecharModal(){
+  if(pendente){
+    const p=pendente; pendente=null;
+    document.getElementById("modalJust").classList.remove("ativo");
+    executar(p.cpf,p.tipo,"");
+  } else {
+    document.getElementById("modalJust").classList.remove("ativo");
+  }
+}
 async function confirmar(){
   if(!pendente)return;
-  const j=document.getElementById('justificativa').value.trim();
-  if(!j){alert('Informe a justificativa!');document.getElementById('justificativa').focus();return;}
-  fecharModal(); await executar(pendente.cpf,pendente.tipo,j);
+  const j=document.getElementById("justificativa").value.trim();
+  // Justificativa opcional - registra com ou sem ela
+  const p=pendente; pendente=null;
+  document.getElementById("modalJust").classList.remove("ativo");
+  await executar(p.cpf,p.tipo,j);
 }
 async function executar(cpf,tipo,just){
   try{
@@ -862,6 +876,114 @@ async function carregarAcessos(){
 </html>"""
 
 # ===================== SERVIDOR HTTP =====================
+os.makedirs(BACKUP_DIR, exist_ok=True)
+
+def salvar_historico_json():
+    """Salva TODO o banco de dados em um arquivo JSON de histórico.
+    Chamado automaticamente a cada operação crítica para garantir redundância."""
+    try:
+        conn = get_db()
+        
+        funcionarios = conn.execute("SELECT * FROM funcionarios ORDER BY id").fetchall()
+        registros = conn.execute("SELECT * FROM registros_ponto ORDER BY data_hora").fetchall()
+        acessos = conn.execute("SELECT * FROM acessos_dispositivos ORDER BY data_hora_acesso").fetchall()
+        
+        conn.close()
+        
+        dados_historico = {
+            "meta": {
+                "versao_sistema": "3.0 SECURE",
+                "ultima_atualizacao": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "total_funcionarios": len(funcionarios),
+                "total_registros_ponto": len(registros),
+                "total_acessos": len(acessos)
+            },
+            "funcionarios": [dict(f) for f in funcionarios],
+            "registros_ponto": [dict(r) for r in registros],
+            "acessos_dispositivos": [dict(a) for a in acessos]
+        }
+        
+        # Salva com pretty-print para facilitar leitura humana
+        caminho_temp = HISTORICO_JSON + ".tmp"
+        with open(caminho_temp, "w", encoding="utf-8") as f:
+            json.dump(dados_historico, f, ensure_ascii=False, indent=2, default=str)
+        
+        # Substituição atômica - evita arquivo corrompido se servidor cair no meio da escrita
+        os.replace(caminho_temp, HISTORICO_JSON)
+        
+        print(f"[HISTORICO] Arquivo {HISTORICO_JSON} atualizado | {len(registros)} registros")
+        return True
+    except Exception as e:
+        print(f"[ERRO HISTORICO] Falha ao salvar historico JSON: {e}")
+        return False
+
+def fazer_backup_db():
+    """Faz uma cópia de segurança do arquivo SQLite completo."""
+    try:
+        import shutil
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        caminho_backup = os.path.join(BACKUP_DIR, f"ponto_backup_{timestamp}.db")
+        
+        # Fecha conexões abertas e faz backup
+        conn = get_db()
+        conn.execute("VACUUM INTO ?", (caminho_backup,))
+        conn.close()
+        
+        print(f"[BACKUP] Banco copiado para: {caminho_backup}")
+        
+        # Também salva o JSON junto com o backup
+        try:
+            caminho_json_backup = os.path.join(BACKUP_DIR, f"historico_{timestamp}.json")
+            import shutil as _shutil
+            if os.path.exists(HISTORICO_JSON):
+                _shutil.copy2(HISTORICO_JSON, caminho_json_backup)
+        except:
+            pass
+        
+        # Limpa backups antigos (mantem ultimos 10)
+        try:
+            backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith("ponto_backup_") and f.endswith(".db")])
+            for backup_antigo in backups[:-10]:
+                os.remove(os.path.join(BACKUP_DIR, backup_antigo))
+                json_antigo = backup_antigo.replace("ponto_backup_", "historico_").replace(".db", ".json")
+                json_caminho = os.path.join(BACKUP_DIR, json_antigo)
+                if os.path.exists(json_caminho):
+                    os.remove(json_caminho)
+        except:
+            pass
+        
+        return caminho_backup
+    except Exception as e:
+        print(f"[ERRO BACKUP] Falha no backup: {e}")
+        return None
+
+def verificar_backup_periodico():
+    """Verifica se ja passou o tempo de fazer um backup automatico."""
+    try:
+        arquivo_controle = os.path.join(BACKUP_DIR, ".ultimo_backup")
+        agora = datetime.now()
+        
+        if os.path.exists(arquivo_controle):
+            with open(arquivo_controle, "r") as f:
+                ultima_str = f.read().strip()
+            ultima_data = datetime.strptime(ultima_str, "%Y-%m-%d %H:%M:%S")
+            if (agora - ultima_data).total_seconds() < BACKUP_INTERVAL_HORAS * 3600:
+                return False
+        
+        caminho = fazer_backup_db()
+        if caminho:
+            with open(arquivo_controle, "w") as f:
+                f.write(agora.strftime("%Y-%m-%d %H:%M:%S"))
+            return True
+        return False
+    except Exception as e:
+        print(f"[ERRO] Verificacao backup periodico: {e}")
+        return False
+
+# Salva historico inicial ao carregar o sistema
+salvar_historico_json()
+verificar_backup_periodico()
+
 class ServidorPonto(BaseHTTPRequestHandler):
     
     def log_message(self, format, *args):
@@ -1305,6 +1427,8 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 if justificativa: msg += f"\n📝 Justificativa registrada"
                 
                 print(f"[PONTO] {func['nome']} | {tipo} | {hora_str} | IP:{ip_cliente}")
+                salvar_historico_json()
+                verificar_backup_periodico()
                 responder_json(self, {"mensagem": msg})
             except Exception as e:
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
@@ -1348,6 +1472,8 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 conn.close()
                 
                 print(f"[CADASTRO] {nome} | CPF: {cpf}")
+                salvar_historico_json()
+                verificar_backup_periodico()
                 responder_json(self, {"status": "ok", "id": novo_id})
             except Exception as e:
                 responder_json(self, {"detail": f"Erro BD: {str(e)}"}, status=500)
@@ -1373,6 +1499,8 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 conn.commit()
                 conn.close()
                 print(f"[EXCLUSAO] Funcionário ID: {func_id}")
+                salvar_historico_json()
+                verificar_backup_periodico()
                 responder_json(self, {"status": "ok"})
             except Exception as e:
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
@@ -1613,6 +1741,10 @@ if __name__ == "__main__":
     print("  - Justificativa flexivel para qualquer horario")
     print("  - Design moderno com efeitos 5D e animacoes")
     print("  - Desenvolvido por WELL")
+    print("  - Historico JSON automatico + backups periodicos do banco")
+    print("=" * 65)
+    print(f"Arquivo historico:    {HISTORICO_JSON}")
+    print(f"Pasta de backups:    {BACKUP_DIR}/")
     print("=" * 65)
     print(f"Acesso WI-FI: http://SEU_IP:{PORTA}")
     print("=" * 65)
