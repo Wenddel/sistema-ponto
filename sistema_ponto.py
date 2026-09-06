@@ -37,7 +37,7 @@ CABECALHOS_SEGURANCA = {
     "X-Frame-Options": "DENY",
     "X-XSS-Protection": "1; mode=block",
     "Referrer-Policy": "strict-origin-when-cross-origin",
-    "Permissions-Policy": "camera=(), microphone=(), geolocation=()"
+    "Permissions-Policy": "camera=self, microphone=(), geolocation=()"
 }
 
 # ===================== RECONHECIMENTO FACIAL =====================
@@ -1094,7 +1094,7 @@ async function iniciarCameraLogin(){
   const status=document.getElementById('cameraLoginStatus');
   
   status.className='camera-login-status status-aguardando';
-  status.innerHTML='<span class="spinner spinner-escuro"></span>Solicitando acesso à câmera...';
+  status.innerHTML='<span class="spinner spinner-escuro"></span>📷 Solicitando permissão para usar a câmera...<br><small style="font-size:11px;font-weight:normal;">No celular: toque em "PERMITIR" quando aparecer<br>No PC: clique em "Permitir" na barra superior</small>'
   
   try{
     streamLogin=await navigator.mediaDevices.getUserMedia({
@@ -1111,7 +1111,7 @@ async function iniciarCameraLogin(){
     
   }catch(err){
     status.className='camera-login-status status-erro';
-    status.innerHTML='❌ Erro ao acessar câmera: '+err.message+'<br><small>Verifique as permissões do navegador.</small>';
+    status.innerHTML='❌ Câmera bloqueada ou indisponível!<br><small style="font-size:11px;font-weight:normal;">📱 CELULAR: Toque no ícone de câmera 🔒 na barra de endereço e permita<br>💻 PC: Clique no cadeado 🔒 ao lado da URL → Configurações do site → Câmera → Permitir<br>⚠️ Use HTTPS ou http://localhost para funcionar</small>';
   }
 }
 
@@ -1195,7 +1195,7 @@ async function abrirCamera(){
   const tentInfo=document.getElementById('tentativasInfo');
   
   status.className='camera-login-status status-aguardando';
-  status.innerHTML='<span class="spinner spinner-escuro"></span>Solicitando acesso à câmera...';
+  status.innerHTML='<span class="spinner spinner-escuro"></span>📷 Solicitando permissão para usar a câmera...<br><small style="font-size:11px;font-weight:normal;">No celular: toque em "PERMITIR" quando aparecer<br>No PC: clique em "Permitir" na barra superior</small>'
   btnCap.disabled=true;
   tentInfo.innerHTML='';
   modal.classList.add('ativo');
