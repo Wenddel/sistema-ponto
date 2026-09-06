@@ -712,6 +712,7 @@ label { font-size:13px; color:#555; font-weight:bold; display:block; margin-top:
 <button class="tab" onclick="abrir('qrcode',this)">📱 QR Code</button>
 <button class="tab" onclick="abrir('acessos',this)">📡 Acessos</button>
 <button class="tab" onclick="abrir('config',this)">🔧 Configurações</button>
+<button class="tab" onclick="abrir('backup',this)">💾 Backup & Histórico</button>
 </div>
 <div id="cadastro" class="painel ativo">
 <h2>Cadastrar Novo Funcionário</h2>
@@ -814,6 +815,7 @@ function abrir(n,btn){
   if(n==='registros')carregarRegs();
   if(n==='relatorios')carregarSel();
   if(n==='acessos')carregarAcessos();
+  if(n==='backup')carregarBackup();
 }
 function sair(){document.cookie='sessao_admin=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';window.location.href='/admin';}
 function msg(id,texto,tipo){const e=document.getElementById(id);e.textContent=texto;e.className='mensagem '+tipo;setTimeout(()=>e.className='mensagem',4000);}
@@ -871,6 +873,95 @@ async function carregarAcessos(){
   if(d.length===0){tb.innerHTML='<tr><td colspan="6" style="text-align:center;color:#999;padding:20px;">Nenhum acesso registrado.</td></tr>';return;}
   tb.innerHTML=d.map(a=>'<tr><td>'+a.data_hora+'</td><td>'+a.cpf+'</td><td>'+(a.nome||'<span style="color:#999;">-</span>')+'</td><td style="font-size:11px;color:#555;">'+a.ip+'</td><td style="font-size:10px;color:#888;max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="'+(a.user_agent||'').replace(/"/g,'&quot;')+'">'+(a.user_agent||'-')+'</td><td>'+a.tipo_acesso+'</td></tr>').join('');
 }
+let dadosBackupCache=null;
+async function salvarHistoricoManual(){
+  const m=document.getElementById('msgBackup');
+  try{
+    const r=await fetch('/api/backup/salvar',{method:'POST'});
+    if(r.status===401){window.location.href='/admin';return;}
+    const d=await r.json();
+    if(r.ok){msg('msgBackup','✅ Histórico salvo com sucesso! '+d.mensagem,'sucesso');carregarBackup();}
+    else msg('msgBackup','❌ '+(d.detail||'Erro'),'erro');
+  }catch(e){msg('msgBackup','Erro de conexão!','erro');}
+}
+async function restaurarHistorico(){
+  if(!confirm('⚠️ ATENÇÃO: Isso irá SUBSTITUIR todos os dados do banco SQLite pelos dados do arquivo historico_ponto.json.\\n\\nDeseja continuar?'))return;
+  const m=document.getElementById('msgBackup');
+  try{
+    const r=await fetch('/api/backup/restaurar',{method:'POST'});
+    if(r.status===401){window.location.href='/admin';return;}
+    const d=await r.json();
+    if(r.ok){msg('msgBackup','✅ '+d.mensagem,'sucesso');carregarBackup();}
+    else msg('msgBackup','❌ '+(d.detail||'Erro'),'erro');
+  }catch(e){msg('msgBackup','Erro de conexão!','erro');}
+}
+async function carregarBackup(){
+  try{
+    const r=await fetch('/api/backup/dados');
+    if(r.status===401){window.location.href='/admin';return;}
+    const d=await r.json();
+    dadosBackupCache=d;
+    atualizarInfoBackup(d);
+    renderizarFuncsBackup(d.funcionarios||[]);
+    renderizarRegsBackup(d.registros_ponto||[],d.funcionarios||[]);
+  }catch(e){document.getElementById('statusArquivo').textContent='Erro ao carregar';document.getElementById('statusArquivo').style.color='#f44336';}
+}
+function atualizarInfoBackup(d){
+  const meta=d.meta||{};
+  document.getElementById('statusArquivo').textContent='✅ Arquivo OK';
+  document.getElementById('statusArquivo').style.color='#2e7d32';
+  document.getElementById('tamanhoArquivo').textContent=meta.tamanho_arquivo||'-';
+  document.getElementById('ultAtualizacao').textContent=meta.ultima_atualizacao||'-';
+  document.getElementById('totalFuncs').textContent=meta.total_funcionarios||0;
+  document.getElementById('totalRegs').textContent=meta.total_registros_ponto||0;
+}
+function renderizarFuncsBackup(funcs){
+  const tb=document.getElementById('tbodyBackupFuncs');
+  if(!funcs||funcs.length===0){tb.innerHTML='<tr><td colspan="7" style="text-align:center;color:#999;padding:20px;">Nenhum funcionário no histórico.</td></tr>';return;}
+  tb.innerHTML=funcs.map(f=>'<tr><td>'+(f.id||'-')+'</td><td><strong>'+(f.nome||'-')+'</strong></td><td>'+(f.cpf||'-')+'</td><td>'+(f.horario_entrada||'-')+'</td><td>'+(f.horario_saida_almoco||'-')+'</td><td>'+(f.horario_retorno_almoco||'-')+'</td><td>'+(f.horario_saida||'-')+'</td></tr>').join('');
+}
+function renderizarRegsBackup(regs,funcs){
+  const tb=document.getElementById('tbodyBackupRegs');
+  if(!regs||regs.length===0){tb.innerHTML='<tr><td colspan="9" style="text-align:center;color:#999;padding:20px;">Nenhum registro no histórico.</td></tr>';return;}
+  const mapaFuncs={};funcs.forEach(f=>mapaFuncs[f.id]=f.nome);
+  const ct={'ENTRADA':'tipo-entrada','SAIDA_ALMOCO':'tipo-saida-almoco','RETORNO_ALMOCO':'tipo-retorno-almoco','SAIDA':'tipo-saida'};
+  tb.innerHTML=regs.slice().reverse().map(r=>{
+    const atrasado=r.atrasado?'<span class="atrasado">⚠️ SIM</span>':'✅ NÃO';
+    const mh=r.minutos_atraso>0?'<span class="minutos-cell">'+r.minutos_atraso+'</span>':'-';
+    const bh=r.minutos_banco_horas>0?'<span class="banco-cell">+'+r.minutos_banco_horas+'</span>':'-';
+    const jt=r.justificativa?'<span class="justificativa-cell" title="'+(r.justificativa||'').replace(/"/g,'&quot;')+'">'+r.justificativa+'</span>':'<span style="color:#ccc;">-</span>';
+    const nome=mapaFuncs[r.funcionario_id]||('ID:'+r.funcionario_id);
+    const tipoClasse=ct[r.tipo]||'';
+    const tipoFmt=(r.tipo||'').replace('_',' ');
+    return '<tr data-id="'+r.id+'"><td>'+r.id+'</td><td>'+nome+'</td><td>'+(r.data_hora||'-')+'</td><td class="'+tipoClasse+'">'+tipoFmt+'</td><td>'+atrasado+'</td><td>'+mh+'</td><td>'+bh+'</td><td>'+jt+'</td><td><button class="btn-small btn-warning" onclick="editarRegistro('+r.id+')">✏️ Editar</button> <button class="btn-small" onclick="reimprimirRegistro('+r.funcionario_id+',\''+(r.data_hora||'').slice(0,7)+'\')">📄 PDF</button></td></tr>';
+  }).join('');
+}
+function filtrarBackup(){
+  if(!dadosBackupCache)return;
+  const fn=document.getElementById('filtroBackupNome').value.toLowerCase();
+  const ft=document.getElementById('filtroBackupTipo').value;
+  let regs=dadosBackupCache.registros_ponto||[];
+  const mapaFuncs={};(dadosBackupCache.funcionarios||[]).forEach(f=>mapaFuncs[f.id]=f.nome);
+  if(fn)regs=regs.filter(r=>(mapaFuncs[r.funcionario_id]||'').toLowerCase().includes(fn));
+  if(ft)regs=regs.filter(r=>r.tipo===ft);
+  renderizarRegsBackup(regs,dadosBackupCache.funcionarios||[]);
+}
+async function editarRegistro(id){
+  const r=prompt('Editar justificativa do registro ID '+id+':\\n\\nDeixe em branco para remover a justificativa.\\nDigite CANCELAR para cancelar a edição.');
+  if(r===null||r==='CANCELAR')return;
+  try{
+    const resp=await fetch('/api/backup/atualizar_registro',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id,justificativa:r})});
+    if(resp.status===401){window.location.href='/admin';return;}
+    const d=await resp.json();
+    if(resp.ok){msg('msgBackup','✅ Registro atualizado!','sucesso');carregarBackup();}
+    else msg('msgBackup','❌ '+(d.detail||'Erro'),'erro');
+  }catch(e){msg('msgBackup','Erro de conexão!','erro');}
+}
+function reimprimirRegistro(funcId,mes){
+  if(!mes){const h=prompt('Informe o mês (YYYY-MM) para o PDF:');if(!h)return;mes=h;}
+  window.open('/api/pdf/funcionario/'+funcId+'?mes='+mes,'_blank');
+}
+
 </script>
 </body>
 </html>"""
@@ -980,6 +1071,106 @@ def verificar_backup_periodico():
         print(f"[ERRO] Verificacao backup periodico: {e}")
         return False
 
+
+def carregar_historico_json():
+    """Carrega e retorna os dados completos do arquivo historico JSON."""
+    try:
+        if not os.path.exists(HISTORICO_JSON):
+            return None
+        
+        with open(HISTORICO_JSON, "r", encoding="utf-8") as f:
+            dados = json.load(f)
+        
+        # Adicionar informacoes do arquivo
+        stats = os.stat(HISTORICO_JSON)
+        tamanho_kb = round(stats.st_size / 1024, 2)
+        if "meta" not in dados:
+            dados["meta"] = {}
+        dados["meta"]["tamanho_arquivo"] = f"{tamanho_kb} KB"
+        dados["meta"]["arquivo_existe"] = True
+        
+        return dados
+    except Exception as e:
+        print(f"[ERRO] Carregar historico JSON: {e}")
+        return None
+
+def restaurar_do_historico():
+    """Restaura TODO o banco de dados SQLite a partir do arquivo historico JSON."""
+    try:
+        dados = carregar_historico_json()
+        if not dados:
+            return False, "Arquivo historico_ponto.json não encontrado ou inválido."
+        
+        conn = get_db()
+        
+        # Limpar tabelas existentes
+        conn.execute("DELETE FROM registros_ponto")
+        conn.execute("DELETE FROM acessos_dispositivos")
+        conn.execute("DELETE FROM funcionarios")
+        
+        # Resetar autoincrement
+        conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('funcionarios','registros_ponto','acessos_dispositivos')")
+        
+        # Restaurar funcionarios
+        for f in dados.get("funcionarios", []):
+            conn.execute("""
+                INSERT INTO funcionarios (id, nome, cpf, horario_entrada, horario_saida_almoco, horario_retorno_almoco, horario_saida)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (f.get("id"), f.get("nome"), f.get("cpf"), 
+                  f.get("horario_entrada", "08:00:00"),
+                  f.get("horario_saida_almoco", "12:00:00"),
+                  f.get("horario_retorno_almoco", "13:00:00"),
+                  f.get("horario_saida", "18:00:00")))
+        
+        # Restaurar registros de ponto
+        for r in dados.get("registros_ponto", []):
+            conn.execute("""
+                INSERT INTO registros_ponto 
+                (id, funcionario_id, data_hora, tipo, atrasado, minutos_atraso, minutos_banco_horas, justificativa, ip_dispositivo, user_agent, horario_acesso)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (r.get("id"), r.get("funcionario_id"), r.get("data_hora"), r.get("tipo"),
+                  r.get("atrasado", 0), r.get("minutos_atraso", 0), r.get("minutos_banco_horas", 0),
+                  r.get("justificativa", ""), r.get("ip_dispositivo", ""), 
+                  r.get("user_agent", ""), r.get("horario_acesso", "")))
+        
+        # Restaurar acessos
+        for a in dados.get("acessos_dispositivos", []):
+            conn.execute("""
+                INSERT INTO acessos_dispositivos (id, funcionario_id, cpf, data_hora_acesso, ip_dispositivo, user_agent, tipo_acesso)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (a.get("id"), a.get("funcionario_id"), a.get("cpf"), a.get("data_hora_acesso"),
+                  a.get("ip_dispositivo", ""), a.get("user_agent", ""), a.get("tipo_acesso", "pagina_inicial")))
+        
+        conn.commit()
+        conn.close()
+        
+        total_funcs = len(dados.get("funcionarios", []))
+        total_regs = len(dados.get("registros_ponto", []))
+        
+        return True, f"Banco restaurado! {total_funcs} funcionários, {total_regs} registros."
+    except Exception as e:
+        print(f"[ERRO] Restaurar do historico: {e}")
+        return False, f"Erro na restauração: {str(e)}"
+
+def atualizar_registro_justificativa(registro_id, nova_justificativa):
+    """Atualiza a justificativa de um registro específico no banco e no JSON."""
+    try:
+        conn = get_db()
+        conn.execute("UPDATE registros_ponto SET justificativa = ? WHERE id = ?", 
+                    (nova_justificativa, registro_id))
+        conn.commit()
+        conn.close()
+        
+        # Atualizar tambem o historico JSON
+        salvar_historico_json()
+        
+        return True, "Registro atualizado com sucesso."
+    except Exception as e:
+        print(f"[ERRO] Atualizar registro: {e}")
+        return False, f"Erro: {str(e)}"
+
+
+
 # Salva historico inicial ao carregar o sistema
 salvar_historico_json()
 verificar_backup_periodico()
@@ -1059,8 +1250,8 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
             return
         
-        rotas_admin = ["/api/funcionarios", "/api/registros", "/api/gerar_qrcode", "/api/pdf/geral", "/api/logout", "/api/acessos"]
-        precisa_login = (caminho in rotas_admin or caminho.startswith("/api/funcionarios/") or caminho.startswith("/api/pdf/funcionario/"))
+        rotas_admin = ["/api/funcionarios", "/api/registros", "/api/gerar_qrcode", "/api/pdf/geral", "/api/logout", "/api/acessos", "/api/backup/dados"]
+        precisa_login = (caminho in rotas_admin or caminho.startswith("/api/funcionarios/") or caminho.startswith("/api/pdf/funcionario/") or caminho.startswith("/api/backup/"))
         
         if precisa_login and not verificar_login(self):
             responder_json(self, {"detail": "Não autorizado. Faça login."}, status=401)
@@ -1136,6 +1327,17 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
             return
         
+        if caminho == "/api/backup/dados":
+            try:
+                dados = carregar_historico_json()
+                if not dados:
+                    responder_json(self, {"meta": {"arquivo_existe": False, "status": "Arquivo não encontrado"}}, status=404)
+                else:
+                    responder_json(self, dados)
+            except Exception as e:
+                responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
+            return
+
         if caminho == "/api/logout":
             responder_json(self, {"status": "ok"}, cookies_extra=['sessao_admin=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;'])
             return
@@ -1438,6 +1640,48 @@ class ServidorPonto(BaseHTTPRequestHandler):
             responder_json(self, {"detail": "Não autorizado"}, status=401)
             return
         
+        if caminho == "/api/backup/salvar":
+            try:
+                ok = salvar_historico_json()
+                caminho_backup = fazer_backup_db()
+                if ok:
+                    msg = "Histórico salvo em historico_ponto.json"
+                    if caminho_backup: msg += f" | Backup: {caminho_backup}"
+                    responder_json(self, {"status": "ok", "mensagem": msg})
+                else:
+                    responder_json(self, {"detail": "Falha ao salvar histórico"}, status=500)
+            except Exception as e:
+                responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
+            return
+
+        if caminho == "/api/backup/restaurar":
+            try:
+                ok, msg = restaurar_do_historico()
+                if ok:
+                    salvar_historico_json()
+                    responder_json(self, {"status": "ok", "mensagem": msg})
+                else:
+                    responder_json(self, {"detail": msg}, status=500)
+            except Exception as e:
+                responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
+            return
+
+        if caminho == "/api/backup/atualizar_registro":
+            try:
+                reg_id = dados.get("id")
+                justificativa = sanitizar_texto(dados.get("justificativa", ""), 500)
+                if not reg_id:
+                    responder_json(self, {"detail": "ID do registro não informado"}, status=400)
+                    return
+                ok, msg = atualizar_registro_justificativa(reg_id, justificativa)
+                if ok:
+                    responder_json(self, {"status": "ok", "mensagem": msg})
+                else:
+                    responder_json(self, {"detail": msg}, status=500)
+            except Exception as e:
+                responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
+            return
+
         if caminho == "/api/funcionarios":
             nome = sanitizar_texto(dados.get("nome", ""), 150)
             cpf = formatar_cpf(dados.get("cpf", ""))
