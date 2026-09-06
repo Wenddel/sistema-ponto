@@ -1,0 +1,12 @@
+{
+  "meta": {
+    "versao_sistema": "3.0 SECURE",
+    "ultima_atualizacao": "2026-09-06 14:23:06",
+    "total_funcionarios": 0,
+    "total_registros_ponto": 0,
+    "total_acessos": 0
+  },
+  "funcionarios": [],
+  "registros_ponto": [],
+  "acessos_dispositivos": []
+}
