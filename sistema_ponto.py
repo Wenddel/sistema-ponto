@@ -1092,26 +1092,55 @@ carregar();
 async function iniciarCameraLogin(){
   const video=document.getElementById('videoLogin');
   const status=document.getElementById('cameraLoginStatus');
-  
+
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    status.className='camera-login-status status-erro';
+    if(location.protocol!=='https:' && location.hostname!=='localhost' && location.hostname!=='127.0.0.1'){
+      status.innerHTML='❌ ACESSO BLOQUEADO PELO NAVEGADOR!<br><small style="font-size:11px;font-weight:normal;"><strong>Motivo:</strong> Acesso via HTTP não seguro.<br><br>✅ SOLUÇÕES:<br>💻 PC: Acesse <strong>http://localhost:8000</strong><br>📱 Ou use <strong>HTTPS</strong> com certificado SSL<br>🔧 Chrome: chrome://flags/#unsafely-treat-insecure-origin-as-secure</small>';
+    }else{
+      status.innerHTML='❌ Navegador não suporta acesso à câmera!';
+    }
+    return;
+  }
+
+  const ehSeguro=location.protocol==='https:' || location.hostname==='localhost' || location.hostname==='127.0.0.1';
+  if(!ehSeguro){
+    status.className='camera-login-status status-erro';
+    status.innerHTML='❌ ACESSO VIA HTTP NÃO SEGURO!<br><small style="font-size:11px;font-weight:normal;"><strong>Navegadores BLOQUEIAM câmera em HTTP.</strong><br><br>✅ Acesse: <strong>http://localhost:8000</strong> (no próprio PC)<br>✅ Ou configure <strong>HTTPS</strong> na rede<br>🔧 Chrome: ative flag de origem insegura</small>';
+    return;
+  }
+
   status.className='camera-login-status status-aguardando';
-  status.innerHTML='<span class="spinner spinner-escuro"></span>📷 Solicitando permissão para usar a câmera...<br><small style="font-size:11px;font-weight:normal;">No celular: toque em "PERMITIR" quando aparecer<br>No PC: clique em "Permitir" na barra superior</small>'
-  
+  status.innerHTML='<span class="spinner spinner-escuro"></span>📷 Pedindo permissão da câmera...<br><small style="font-size:11px;font-weight:normal;">👆 Procure o pop-up no topo → CLIQUE EM PERMITIR</small>';
+
   try{
-    streamLogin=await navigator.mediaDevices.getUserMedia({
-      video:{facingMode:'user',width:{ideal:640},height:{ideal:640}},audio:false
-    });
+    const opcoes=[
+      {video:{facingMode:'user',width:{ideal:640},height:{ideal:640}},audio:false},
+      {video:{facingMode:'user'},audio:false},
+      {video:true,audio:false}
+    ];
+    let erroUltimo=null;
+    for(let opcao of opcoes){
+      try{streamLogin=await navigator.mediaDevices.getUserMedia(opcao);break;}
+      catch(e){erroUltimo=e;streamLogin=null;}
+    }
+    if(!streamLogin) throw erroUltimo || new Error('Sem acesso');
+
     video.srcObject=streamLogin;
     await video.play();
-    
-    status.className='camera-login-status status-aguardando';
-    status.innerHTML='<span class="spinner spinner-escuro"></span>Câmera pronta! Capturando em 2 segundos...';
-    
-    // Captura automática após 2 segundos
+
+    status.className='camera-login-status status-sucesso';
+    status.innerHTML='✅ Câmera ativada! Capturando em 2s...<br><small style="font-size:11px;font-weight:normal;">Centralize seu rosto</small>';
+
     autoCapturaTimer=setTimeout(capturarLogin, 2000);
-    
+
   }catch(err){
     status.className='camera-login-status status-erro';
-    status.innerHTML='❌ Câmera bloqueada ou indisponível!<br><small style="font-size:11px;font-weight:normal;">📱 CELULAR: Toque no ícone de câmera 🔒 na barra de endereço e permita<br>💻 PC: Clique no cadeado 🔒 ao lado da URL → Configurações do site → Câmera → Permitir<br>⚠️ Use HTTPS ou http://localhost para funcionar</small>';
+    let dica='';
+    if(err.name==='NotAllowedError')dica='<br>👉 Você NEGOU a permissão. Clique no 🔒 ao lado da URL → Permitir câmera';
+    else if(err.name==='NotFoundError')dica='<br>👉 Nenhuma câmera encontrada';
+    else if(err.name==='NotReadableError')dica='<br>👉 Câmera em uso por outro app';
+    status.innerHTML='❌ '+err.message+dica;
   }
 }
 
@@ -1193,28 +1222,56 @@ async function abrirCamera(){
   const status=document.getElementById('cameraStatus');
   const btnCap=document.getElementById('btnCapturar');
   const tentInfo=document.getElementById('tentativasInfo');
-  
+
   status.className='camera-login-status status-aguardando';
-  status.innerHTML='<span class="spinner spinner-escuro"></span>📷 Solicitando permissão para usar a câmera...<br><small style="font-size:11px;font-weight:normal;">No celular: toque em "PERMITIR" quando aparecer<br>No PC: clique em "Permitir" na barra superior</small>'
   btnCap.disabled=true;
   tentInfo.innerHTML='';
+
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    status.className='camera-login-status status-erro';
+    status.innerHTML='❌ Navegador não suporta câmera! Use localhost ou HTTPS.';
+    modal.classList.add('ativo');
+    setTimeout(fecharCamera,4000);
+    return;
+  }
+
+  const ehSeguro=location.protocol==='https:' || location.hostname==='localhost' || location.hostname==='127.0.0.1';
+  if(!ehSeguro){
+    status.className='camera-login-status status-erro';
+    status.innerHTML='❌ HTTP bloqueia câmera! Use http://localhost:8000 ou HTTPS';
+    modal.classList.add('ativo');
+    return;
+  }
+
   modal.classList.add('ativo');
-  
+  status.innerHTML='<span class="spinner spinner-escuro"></span>📷 Pedindo permissão...';
+
   try{
-    streamCamera=await navigator.mediaDevices.getUserMedia({
-      video:{facingMode:'user',width:{ideal:640},height:{ideal:640}},audio:false
-    });
+    const opcoes=[
+      {video:{facingMode:'user',width:{ideal:640},height:{ideal:640}},audio:false},
+      {video:{facingMode:'user'},audio:false},
+      {video:true,audio:false}
+    ];
+    let erroUltimo=null;
+    for(let opcao of opcoes){
+      try{streamCamera=await navigator.mediaDevices.getUserMedia(opcao);break;}
+      catch(e){erroUltimo=e;streamCamera=null;}
+    }
+    if(!streamCamera) throw erroUltimo || new Error('Sem acesso');
+
     video.srcObject=streamCamera;
     await video.play();
-    
+
     status.className='camera-login-status status-sucesso';
-    status.innerHTML='✅ Câmera pronta! Posicione seu rosto e capture';
+    status.innerHTML='✅ Câmera pronta! Posicione e capture';
     btnCap.disabled=false;
-    
+
   }catch(err){
     status.className='camera-login-status status-erro';
-    status.innerHTML='❌ Erro ao acessar câmera: '+err.message;
-    setTimeout(fecharCamera,3000);
+    let dica='';
+    if(err.name==='NotAllowedError')dica=' - Permissão negada';
+    status.innerHTML='❌ '+err.message+dica;
+    setTimeout(fecharCamera,4000);
   }
 }
 
@@ -1764,7 +1821,8 @@ async function carregarFuncs(){
       :'<div class="sem-foto">📷</div>';
     let statusBadge='';
     if(f.bloqueado)statusBadge='<span class="badge-status badge-bloqueado">🚫 BLOQUEADO</span>';
-    else if(!f.face_treinada)statusBadge='<span class="badge-status badge-sem-foto">📷 Sem foto</span>';
+    else if(!f.face_treinada && !f.foto_perfil)statusBadge='<span class="badge-status badge-sem-foto">📷 Sem foto</span>';
+    else if(!f.face_treinada && f.foto_perfil)statusBadge='<span class="badge-status badge-sem-foto" style="background:#e3f2fd;color:#1565c0;">📷 Foto cadastrada</span>';
     else statusBadge='<span class="badge-status badge-ativo">✅ Ativo</span>';
     
     const linhaClasse=f.bloqueado?'linha-bloqueada':'';
