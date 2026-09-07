@@ -229,6 +229,11 @@ def formatar_cpf(cpf):
     return ''.join(filter(str.isdigit, str(cpf)))
 
 def verificar_atraso(hora_registro, horario_padrao, tolerancia_minutos=0):
+    """
+    Verifica se o registro está ATRASADO (passou do horário).
+    NOVA REGRA: Qualquer segundo que passe do horário já é considerado atraso.
+    A tolerância é usada apenas para verificar antecedência excessiva.
+    """
     try:
         hora_registro = str(hora_registro).strip()
         horario_padrao = str(horario_padrao).strip()
@@ -239,7 +244,25 @@ def verificar_atraso(hora_registro, horario_padrao, tolerancia_minutos=0):
         t_r = int(h_r[0])*3600 + int(h_r[1])*60 + (int(h_r[2]) if len(h_r)>2 else 0)
         t_p = int(h_p[0])*3600 + int(h_p[1])*60 + (int(h_p[2]) if len(h_p)>2 else 0)
         tolerancia_segundos = tolerancia_minutos * 60
-        return t_r > (t_p + tolerancia_segundos)
+        return t_r > t_p  # Qualquer coisa DEPOIS do horário já é atraso
+    except: return False
+
+def verificar_antecedencia_excessiva(hora_registro, horario_padrao, tolerancia_minutos=5):
+    """
+    Verifica se o registro está muito ANTES do horário (mais que a tolerância permitida).
+    Ex: horário 08:00, tolerância 5 min → registrar às 07:54 ou antes = excessivo.
+    """
+    try:
+        hora_registro = str(hora_registro).strip()
+        horario_padrao = str(horario_padrao).strip()
+        if not hora_registro or not horario_padrao:
+            return False
+        h_r = hora_registro.split(":")
+        h_p = horario_padrao.split(":")
+        t_r = int(h_r[0])*3600 + int(h_r[1])*60 + (int(h_r[2]) if len(h_r)>2 else 0)
+        t_p = int(h_p[0])*3600 + int(h_p[1])*60 + (int(h_p[2]) if len(h_p)>2 else 0)
+        tolerancia_segundos = tolerancia_minutos * 60
+        return t_r < (t_p - tolerancia_segundos)
     except: return False
 
 def calcular_minutos(hora1, hora2):
@@ -254,21 +277,30 @@ def calcular_minutos(hora1, hora2):
     except: return 0
 
 def calcular_banco_horas(tipo, hora_registro, func):
+    """
+    NOVA REGRA: Até 5 minutos de antecedência NÃO gera banco de horas.
+    É considerado registro normal, sem pontos extras.
+    """
     try:
+        tolerancia_seg = 5 * 60  # 5 minutos
         h_r = hora_registro.split(":")
         t_r = int(h_r[0])*3600 + int(h_r[1])*60 + (int(h_r[2]) if len(h_r)>2 else 0)
         if tipo == "ENTRADA":
             h_p = func["horario_entrada"].split(":"); t_p = int(h_p[0])*3600+int(h_p[1])*60
-            if t_r < t_p: return (t_p-t_r)//60
+            diferenca = t_p - t_r
+            if diferenca > tolerancia_seg: return (diferenca)//60
         elif tipo == "SAIDA_ALMOCO":
             h_p = func["horario_saida_almoco"].split(":"); t_p = int(h_p[0])*3600+int(h_p[1])*60
-            if t_r > t_p: return (t_r-t_p)//60
+            diferenca = t_r - t_p
+            if diferenca > tolerancia_seg: return (diferenca)//60
         elif tipo == "RETORNO_ALMOCO":
             h_p = func["horario_retorno_almoco"].split(":"); t_p = int(h_p[0])*3600+int(h_p[1])*60
-            if t_r < t_p: return (t_p-t_r)//60
+            diferenca = t_p - t_r
+            if diferenca > tolerancia_seg: return (diferenca)//60
         elif tipo == "SAIDA":
             h_p = func["horario_saida"].split(":"); t_p = int(h_p[0])*3600+int(h_p[1])*60
-            if t_r > t_p: return (t_r-t_p)//60
+            diferenca = t_r - t_p
+            if diferenca > tolerancia_seg: return (diferenca)//60
         return 0
     except: return 0
 
@@ -2073,35 +2105,45 @@ class ServidorPonto(BaseHTTPRequestHandler):
                     responder_json(self, {"detail": f"⚠️ Horário de {TIPOS_REGISTRO[tipo]['label']} não cadastrado para este funcionário. Contate o RH."}, status=400)
                     return
                 
-                if tipo == "ENTRADA":
-                    atrasado = 1 if verificar_atraso(hora_str, func["horario_entrada"], tolerancia_minutos=5) else 0
-                    if atrasado:
-                        minutos = calcular_minutos(hora_str, func["horario_entrada"])
-                        msg_just = f"Atraso na ENTRADA. Horário padrão: {func['horario_entrada']} (tolerância: 5 min)."
-                        info = f"Atraso de {minutos} minuto(s)"
-                elif tipo == "SAIDA_ALMOCO":
-                    minutos_antes = calcular_minutos(func["horario_saida_almoco"], hora_str)
-                    if not verificar_atraso(hora_str, func["horario_saida_almoco"]) and minutos_antes >= 30:
-                        minutos = minutos_antes
-                        msg_just = f"Saída para almoço com {minutos_antes} min de antecedência. Padrão: {func['horario_saida_almoco']}."
-                        info = f"Antecedência de {minutos_antes} min"
-                elif tipo == "RETORNO_ALMOCO":
-                    atrasado = 1 if verificar_atraso(hora_str, func["horario_retorno_almoco"], tolerancia_minutos=5) else 0
-                    if atrasado:
-                        minutos = calcular_minutos(hora_str, func["horario_retorno_almoco"])
-                        msg_just = f"Atraso no RETORNO. Padrão: {func['horario_retorno_almoco']} (tolerância: 5 min)."
-                        info = f"Atraso de {minutos} minuto(s)"
-                elif tipo == "SAIDA":
-                    atrasado = 1 if verificar_atraso(func["horario_saida"], hora_str, tolerancia_minutos=5) else 0
-                    if atrasado:
-                        minutos = calcular_minutos(func["horario_saida"], hora_str)
-                        msg_just = f"SAÍDA ANTECIPADA. Padrão: {func['horario_saida']} (tolerância: 5 min)."
-                        info = f"Antecipada em {minutos} minuto(s)"
+                # NOVA REGRA UNIFICADA para TODOS os 4 tipos:
+                # - Pode registrar até 5 minutos ANTES do horário → normal
+                # - Se passar do horário (qualquer segundo DEPOIS) → BLOQUEADO
+                # - Se chegar mais de 5 minutos ANTES → também BLOQUEADO (antecedência excessiva)
+                horario_ref = {
+                    "ENTRADA": func["horario_entrada"],
+                    "SAIDA_ALMOCO": func["horario_saida_almoco"],
+                    "RETORNO_ALMOCO": func["horario_retorno_almoco"],
+                    "SAIDA": func["horario_saida"]
+                }[tipo]
+                
+                tipo_label = TIPOS_REGISTRO[tipo]["label"]
+                esta_atrasado = verificar_atraso(hora_str, horario_ref)
+                esta_muito_cedo = verificar_antecedencia_excessiva(hora_str, horario_ref, tolerancia_minutos=5)
+                
+                if esta_atrasado:
+                    atrasado = 1
+                    minutos = calcular_minutos(hora_str, horario_ref)
+                    msg_just = f"Atraso no(a) {tipo_label}. Horário padrão: {horario_ref}. Não há tolerância para atrasos."
+                    info = f"Atraso de {minutos} minuto(s)"
+                elif esta_muito_cedo:
+                    atrasado = 1
+                    minutos = calcular_minutos(horario_ref, hora_str)
+                    msg_just = f"{tipo_label} com antecedência excessiva. Horário padrão: {horario_ref} (permitido até 5 min antes)."
+                    info = f"Antecedência de {minutos} minuto(s)"
+                else:
+                    atrasado = 0
+                    minutos = 0
                 
                 conn.close()
                 bloqueado = (atrasado == 1)
                 # Log de debug para verificar o que está acontecendo
-                print(f"[VERIFICAR] {func['nome']} | Tipo:{tipo} | Hora:{hora_str} | Padrão Retorno:{func['horario_retorno_almoco']} | Atrasado:{atrasado} | Bloqueado:{bloqueado} | Minutos:{minutos}")
+                print(f"[VERIFICAR] {func['nome']} | Tipo:{tipo} | Hora:{hora_str} | Padrão:{horario_padrao_debug} | Atrasado:{atrasado} | Bloqueado:{bloqueado} | Minutos:{minutos}")
+                horario_padrao_debug = {
+                    "ENTRADA": func["horario_entrada"],
+                    "SAIDA_ALMOCO": func["horario_saida_almoco"],
+                    "RETORNO_ALMOCO": func["horario_retorno_almoco"],
+                    "SAIDA": func["horario_saida"]
+                }.get(tipo, "")
                 responder_json(self, {
                     "precisa_justificativa": (minutos > 0 and not bloqueado),
                     "bloqueado": bloqueado,
@@ -2110,7 +2152,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
                     "minutos_atraso": minutos,
                     "atrasado": atrasado,
                     "hora_atual": hora_str,
-                    "horario_padrao": func["horario_retorno_almoco"] if tipo == "RETORNO_ALMOCO" else func["horario_entrada"] if tipo == "ENTRADA" else ""
+                    "horario_padrao": horario_padrao_debug
                 })
             except Exception as e:
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
