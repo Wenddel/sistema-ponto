@@ -579,28 +579,28 @@ def gerar_html_funcionario():
 <title>👤 Painel do Funcionário</title>
 <style>
 * { margin:0; padding:0; box-sizing:border-box; font-family:'Segoe UI',Arial,sans-serif; }
-body { min-height:100vh; padding:15px; position:relative; overflow-x:hidden; }
+body { min-height:100vh; display:flex; align-items:center; justify-content:center; padding:15px; position:relative; overflow-x:hidden; }
 """ + ESTILOS_5D + ESTILO_RODAPE_WELL + """
-.wrapper { position:relative; z-index:1; max-width:480px; margin:0 auto; }
-.card-topo { padding:25px; margin-bottom:20px; }
+.wrapper { position:relative; z-index:1; width:100%; max-width:480px; margin:0 auto; }
+.card-topo { padding:28px; margin-bottom:20px; }
 .card-topo.animar-entrar { animation-delay:0.1s; }
-.voltar { display:inline-flex; align-items:center; gap:5px; color:#667eea; text-decoration:none; font-size:13px; font-weight:bold; margin-bottom:15px; padding:6px 12px; background:rgba(102,126,234,0.1); border-radius:20px; transition:all 0.3s; }
+.voltar { display:inline-flex; align-items:center; gap:5px; color:#667eea; text-decoration:none; font-size:14px; font-weight:bold; margin-bottom:18px; padding:8px 14px; background:rgba(102,126,234,0.1); border-radius:20px; transition:all 0.3s; }
 .voltar:hover { background:rgba(102,126,234,0.2); transform:translateX(-3px); }
-.foto-func { width:72px; height:72px; border-radius:50%; background:linear-gradient(135deg,#667eea,#f093fb); display:flex; align-items:center; justify-content:center; color:white; font-size:30px; font-weight:bold; margin:0 auto 12px; box-shadow:0 10px 25px rgba(102,126,234,0.4); border:3px solid white; }
-.nome-func { text-align:center; font-size:20px; color:#333; margin-bottom:5px; }
-.cpf-func { text-align:center; color:#888; font-size:13px; margin-bottom:16px; }
-.status-wrapper { text-align:center; margin-bottom:15px; }
-.status-acesso { background:linear-gradient(135deg,#e8f5e9,#c8e6c9); color:#2e7d32; padding:10px 16px; border-radius:25px; font-size:12px; font-weight:bold; display:inline-block; }
-.horarios-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:18px; }
-.horario-item { background:linear-gradient(135deg,#f5f7fa,#e4e8ec); padding:10px; border-radius:10px; text-align:center; }
-.horario-label { font-size:10px; color:#888; text-transform:uppercase; font-weight:bold; }
-.horario-valor { font-size:14px; color:#333; font-weight:bold; margin-top:3px; }
-.data-hora { background:linear-gradient(135deg,#e8f0fe,#f3e8ff); color:#667eea; padding:14px; border-radius:14px; font-weight:bold; font-size:13px; margin-bottom:20px; text-align:center; border:2px solid rgba(102,126,234,0.2); }
-.card-botoes { padding:25px; margin-bottom:20px; }
-.card-botoes h2 { font-size:16px; color:#333; margin-bottom:18px; text-align:center; }
+.foto-func { width:80px; height:80px; border-radius:50%; background:linear-gradient(135deg,#667eea,#f093fb); display:flex; align-items:center; justify-content:center; color:white; font-size:34px; font-weight:bold; margin:0 auto 14px; box-shadow:0 10px 25px rgba(102,126,234,0.4); border:3px solid white; }
+.nome-func { text-align:center; font-size:22px; color:#333; margin-bottom:6px; font-weight:bold; }
+.cpf-func { text-align:center; color:#888; font-size:14px; margin-bottom:18px; }
+.status-wrapper { text-align:center; margin-bottom:18px; }
+.status-acesso { background:linear-gradient(135deg,#e8f5e9,#c8e6c9); color:#2e7d32; padding:10px 18px; border-radius:25px; font-size:13px; font-weight:bold; display:inline-block; }
+.horarios-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:20px; }
+.horario-item { background:linear-gradient(135deg,#f5f7fa,#e4e8ec); padding:12px; border-radius:12px; text-align:center; }
+.horario-label { font-size:12px; color:#888; text-transform:uppercase; font-weight:bold; letter-spacing:0.5px; }
+.horario-valor { font-size:16px; color:#333; font-weight:bold; margin-top:4px; }
+.data-hora { background:linear-gradient(135deg,#e8f0fe,#f3e8ff); color:#667eea; padding:16px; border-radius:14px; font-weight:bold; font-size:15px; margin-bottom:22px; text-align:center; border:2px solid rgba(102,126,234,0.2); }
+.card-botoes { padding:28px; margin-bottom:20px; }
+.card-botoes h2 { font-size:18px; color:#333; margin-bottom:20px; text-align:center; font-weight:bold; }
 .botoes { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
-.botoes button { padding:20px 10px; font-size:13px; }
-.icone-btn { font-size:28px; display:block; margin-bottom:6px; }
+.botoes button { padding:22px 12px; font-size:14px; font-weight:bold; }
+.icone-btn { font-size:30px; display:block; margin-bottom:8px; }
 .btn-entrada { background:linear-gradient(135deg,#4CAF50,#66bb6a,#43a047); }
 .btn-almoco { background:linear-gradient(135deg,#ff9800,#ffb74d,#f57c00); }
 .btn-retorno { background:linear-gradient(135deg,#2196F3,#64b5f6,#1976D2); }
