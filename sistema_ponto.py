@@ -622,6 +622,31 @@ body { min-height:100vh; display:flex; align-items:center; justify-content:cente
 .btn-cancelar { background:linear-gradient(135deg,#e0e0e0,#bdbdbd); color:#333; }
 .btn-confirmar { background:linear-gradient(135deg,#667eea,#764ba2); color:white; }
 .disp-info { margin-top:15px; padding:12px; background:linear-gradient(135deg,#f3e5f5,#e1bee7); border-radius:12px; font-size:11px; color:#6a1b9a; text-align:center; border:1px solid #ce93d8; }
+
+/* ===== CARD DE CONFIRMAÇÃO DE REGISTRO ===== */
+.registro-confirmacao { margin-top:20px; border-radius:22px; overflow:hidden; box-shadow:0 15px 40px rgba(0,0,0,0.15); animation:entrar-cima 0.5s cubic-bezier(0.175,0.885,0.32,1.275); display:none; }
+.registro-confirmacao.ativo { display:block; }
+.registro-topo { padding:25px; text-align:center; color:white; position:relative; overflow:hidden; }
+.registro-topo::before { content:""; position:absolute; top:-50%; left:-50%; width:200%; height:200%; background:radial-gradient(circle,rgba(255,255,255,0.2) 0%,transparent 60%); animation:brilho 3s ease-in-out infinite; }
+@keyframes brilho { 0%,100%{transform:translate(0,0)} 50%{transform:translate(10%,10%)} }
+.registro-icone { font-size:48px; margin-bottom:8px; position:relative; z-index:1; animation:pulse-registro 2s infinite; }
+@keyframes pulse-registro { 0%,100%{transform:scale(1)} 50%{transform:scale(1.1)} }
+.registro-tipo { font-size:20px; font-weight:bold; margin-bottom:4px; position:relative; z-index:1; text-shadow:0 2px 10px rgba(0,0,0,0.2); }
+.registro-status { font-size:13px; opacity:0.95; position:relative; z-index:1; }
+.registro-corpo { background:white; padding:25px; }
+.registro-hora-destaque { text-align:center; margin-bottom:20px; }
+.registro-hora-label { font-size:12px; color:#888; text-transform:uppercase; font-weight:bold; letter-spacing:1px; margin-bottom:5px; }
+.registro-hora { font-size:56px; font-weight:bold; background:linear-gradient(135deg,#667eea,#f093fb); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; line-height:1; letter-spacing:-2px; }
+.registro-data { font-size:15px; color:#666; margin-top:5px; font-weight:500; }
+.registro-info-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:18px; padding-top:18px; border-top:2px dashed #eee; }
+.registro-info-item { background:linear-gradient(135deg,#f8f9ff,#f0f4ff); padding:14px; border-radius:12px; text-align:center; }
+.registro-info-label { font-size:10px; color:#888; text-transform:uppercase; font-weight:bold; margin-bottom:4px; }
+.registro-info-valor { font-size:14px; color:#333; font-weight:bold; }
+.registro-info-valor.atraso { color:#f44336; }
+.registro-info-valor.banco { color:#4CAF50; }
+.registro-check { display:inline-flex; align-items:center; justify-content:center; width:28px; height:28px; background:#4CAF50; color:white; border-radius:50%; font-size:16px; margin-left:8px; animation:check-pop 0.5s cubic-bezier(0.175,0.885,0.32,1.275); }
+@keyframes check-pop { 0%{transform:scale(0)} 60%{transform:scale(1.2)} 100%{transform:scale(1)} }
+
 .tela-bloqueio { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); backdrop-filter:blur(10px); z-index:2000; align-items:center; justify-content:center; padding:20px; }
 .tela-bloqueio.ativa { display:flex; }
 .bloqueio-box { background:white; border-radius:28px; padding:40px 30px; width:100%; max-width:420px; text-align:center; box-shadow:0 30px 80px rgba(244,67,54,0.4); animation:entrar-cima 0.5s cubic-bezier(0.175,0.885,0.32,1.275); }
@@ -671,6 +696,41 @@ body { min-height:100vh; display:flex; align-items:center; justify-content:cente
 <button class="btn-3d btn-saida" onclick="registrar('SAIDA')"><span class="icone-btn">🚪</span>SAÍDA</button>
 </div>
 <div class="mensagem" id="mensagem"></div>
+
+<!-- CARD DE CONFIRMAÇÃO DE REGISTRO -->
+<div class="registro-confirmacao" id="registroConfirmacao">
+  <div class="registro-topo" id="registroTopo">
+    <div class="registro-icone" id="registroIcone">✅</div>
+    <div class="registro-tipo" id="registroTipo">ENTRADA</div>
+    <div class="registro-status">Registrado com sucesso <span class="registro-check">✓</span></div>
+  </div>
+  <div class="registro-corpo">
+    <div class="registro-hora-destaque">
+      <div class="registro-hora-label">Horário Registrado</div>
+      <div class="registro-hora" id="registroHora">--:--</div>
+      <div class="registro-data" id="registroData">--/--/----</div>
+    </div>
+    <div class="registro-info-grid">
+      <div class="registro-info-item">
+        <div class="registro-info-label">Funcionário</div>
+        <div class="registro-info-valor" id="registroNome">---</div>
+      </div>
+      <div class="registro-info-item">
+        <div class="registro-info-label">Dia</div>
+        <div class="registro-info-valor" id="registroDia">---</div>
+      </div>
+      <div class="registro-info-item" id="itemAtraso" style="display:none;">
+        <div class="registro-info-label">Atraso</div>
+        <div class="registro-info-valor atraso" id="registroAtraso">---</div>
+      </div>
+      <div class="registro-info-item" id="itemBanco" style="display:none;">
+        <div class="registro-info-label">Banco Horas</div>
+        <div class="registro-info-valor banco" id="registroBanco">---</div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="disp-info" id="dispInfo">📡 Dispositivo registrado com segurança</div>
 </div>
 """ + RODAPE_WELL + """
@@ -837,11 +897,44 @@ async function executar(cpf,tipo,just){
   try{
     const r=await fetch('/api/bater_ponto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cpf:cpf,tipo:tipo,qr_code:QR,justificativa:just})});
     const d=await r.json();
-    if(r.ok){let t='sucesso';if(d.mensagem.includes('Banco'))t='banco-horas';mostrar(d.mensagem,t);}
+    if(r.ok){
+      let t='sucesso';if(d.mensagem.includes('Banco'))t='banco-horas';
+      mostrar(d.mensagem,t);
+      if(d.registro)mostrarRegistro(d.registro);
+    }
     else mostrar(d.detail||'Erro','erro');
   }catch(e){mostrar('Erro de conexão!','erro');}
 }
 function mostrar(texto,tipo){const m=document.getElementById('mensagem');m.textContent=texto;m.className='mensagem '+tipo;setTimeout(()=>m.className='mensagem',10000);}
+function mostrarRegistro(reg){
+  const card=document.getElementById('registroConfirmacao');
+  const topo=document.getElementById('registroTopo');
+  const cores={
+    'ENTRADA':'linear-gradient(135deg,#4CAF50,#66bb6a,#43a047,#2e7d32)',
+    'SAIDA_ALMOCO':'linear-gradient(135deg,#ff9800,#ffb74d,#f57c00,#e65100)',
+    'RETORNO_ALMOCO':'linear-gradient(135deg,#2196F3,#64b5f6,#1976D2,#1565c0)',
+    'SAIDA':'linear-gradient(135deg,#f44336,#ef5350,#d32f2f,#c62828)'
+  };
+  topo.style.background=cores[reg.tipo]||'linear-gradient(135deg,#667eea,#764ba2)';
+  document.getElementById('registroIcone').textContent=reg.tipo_icone;
+  document.getElementById('registroTipo').textContent=reg.tipo_label;
+  document.getElementById('registroHora').textContent=reg.hora_simples;
+  document.getElementById('registroData').textContent=reg.data;
+  document.getElementById('registroNome').textContent=reg.nome;
+  document.getElementById('registroDia').textContent=reg.dia_semana.charAt(0).toUpperCase()+reg.dia_semana.slice(1);
+  const itemAtraso=document.getElementById('itemAtraso');
+  const itemBanco=document.getElementById('itemBanco');
+  if(reg.atrasado){
+    itemAtraso.style.display='block';
+    document.getElementById('registroAtraso').textContent=reg.minutos_atraso+' min';
+  }else itemAtraso.style.display='none';
+  if(reg.banco_horas>0){
+    itemBanco.style.display='block';
+    document.getElementById('registroBanco').textContent='+'+reg.banco_horas+' min';
+  }else itemBanco.style.display='none';
+  card.classList.add('ativo');
+  card.scrollIntoView({behavior:'smooth',block:'nearest'});
+}
 document.getElementById('modalJust').addEventListener('click',function(e){if(e.target===this)fecharModal();});
 </script>
 </body>
@@ -2132,7 +2225,23 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 if justificativa: msg += f"\\n📝 Justificativa registrada"
                 
                 print(f"[PONTO] {func['nome']} | {tipo} | {hora_str} | IP:{ip_cliente}")
-                responder_json(self, {"mensagem": msg})
+                responder_json(self, {
+                    "mensagem": msg,
+                    "registro": {
+                        "tipo": tipo,
+                        "tipo_label": tipo_info["label"],
+                        "tipo_icone": tipo_info["icone"],
+                        "nome": func["nome"],
+                        "data": agora.strftime("%d/%m/%Y"),
+                        "dia_semana": agora.strftime("%A"),
+                        "hora": hora_str,
+                        "hora_simples": agora.strftime("%H:%M"),
+                        "atrasado": bool(atrasado),
+                        "minutos_atraso": minutos_atraso,
+                        "banco_horas": minutos_banco,
+                        "tem_justificativa": bool(justificativa)
+                    }
+                })
             except Exception as e:
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
             return
