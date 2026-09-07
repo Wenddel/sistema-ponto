@@ -1,3 +1,32 @@
-qrcode
-pillow
-reportlab
+# ============================================
+#  REQUIREMENTS - SISTEMA DE PONTO v3.1
+# ============================================
+# Instale todas as dependências com:
+# pip install -r requirements.txt
+
+# Dependências OBRIGATÓRIAS (já vem com Python na maioria dos casos)
+# sqlite3 - nativo
+# json - nativo
+# os - nativo
+# io - nativo
+# hashlib - nativo
+# datetime - nativo
+# http.server - nativo
+# urllib.parse - nativo
+# re - nativo
+
+# Dependências OPCIONAIS (para funcionalidades extras):
+# --- QR Code ---
+qrcode>=7.4.2
+pillow>=10.0.0
+
+# --- Geração de PDF ---
+reportlab>=4.0.0
+
+# ============================================
+# COMO INSTALAR:
+# 1. Abra o terminal na pasta do projeto
+# 2. Execute: pip install -r requirements.txt
+# 3. Ou instale individualmente:
+#    pip install qrcode pillow reportlab
+# ============================================
