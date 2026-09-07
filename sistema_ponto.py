@@ -606,9 +606,7 @@ body { min-height:100vh; display:flex; align-items:center; justify-content:cente
 .btn-retorno { background:linear-gradient(135deg,#2196F3,#64b5f6,#1976D2); }
 .btn-saida { background:linear-gradient(135deg,#f44336,#ef5350,#d32f2f); }
 .mensagem { padding:16px; border-radius:14px; margin-top:18px; font-size:14px; font-weight:bold; white-space:pre-line; line-height:1.6; display:none; text-align:center; }
-.sucesso { background:linear-gradient(135deg,#e8f5e9,#c8e6c9); color:#1b5e20; display:block; border:1px solid #a5d6a7; }
-.erro { background:linear-gradient(135deg,#ffebee,#ffcdd2); color:#b71c1c; display:block; border:1px solid #ef9a9a; }
-.banco-horas { background:linear-gradient(135deg,#e0f7fa,#b2ebf2); color:#006064; display:block; border:1px solid #80deea; }
+.mensagem.erro { background:linear-gradient(135deg,#ffebee,#ffcdd2); color:#b71c1c; display:block; border:1px solid #ef9a9a; }
 .modal-overlay { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.6); backdrop-filter:blur(5px); z-index:1000; align-items:center; justify-content:center; padding:20px; }
 .modal-overlay.ativo { display:flex; }
 .modal-box { background:white; border-radius:22px; padding:30px; width:100%; max-width:420px; box-shadow:0 30px 70px rgba(0,0,0,0.4); animation:entrar-cima 0.4s cubic-bezier(0.175,0.885,0.32,1.275); }
@@ -866,8 +864,42 @@ function mostrarResultadoAprovacao(d){
   document.getElementById('bloqueioSub').textContent='O administrador aprovou seu registro. Ponto registrado com sucesso.';
   document.getElementById('bloqueioStatus').outerHTML=
     '<div class="bloqueio-aprovado"><h3>🎉 Ponto Registrado!</h3><p>Tipo: '+d.tipo_formatado+'<br>Horário: '+d.data_hora.split(' ')[1]+'</p></div>'+
-    '<button class="btn-continuar" onclick="fecharTelaBloqueio()">Continuar</button>';
+    '<button class="btn-continuar" onclick="fecharEMostrarCard()">Ver Registro</button>';
   document.removeEventListener('keydown',prevenirFechamento);
+  window._dadosAprovacao=d;
+}
+function fecharEMostrarCard(){
+  const d=window._dadosAprovacao;
+  const tiposMap={
+    'ENTRADA':{'label':'ENTRADA','icone':'✅'},
+    'SAIDA_ALMOCO':{'label':'SAÍDA ALMOÇO','icone':'🍽️'},
+    'RETORNO_ALMOCO':{'label':'RETORNO ALMOÇO','icone':'↩️'},
+    'SAIDA':{'label':'SAÍDA','icone':'🚪'}
+  };
+  const info=d.data_hora.split(' ');
+  const dataPartes=info[0].split('-');
+  const dataFormatada=dataPartes[2]+'/'+dataPartes[1]+'/'+dataPartes[0];
+  const horaCompleta=info[1];
+  const horaSimples=horaCompleta.substring(0,5);
+  const diasSemana=['Domingo','Segunda-feira','Terça-feira','Quarta-feira','Quinta-feira','Sexta-feira','Sábado'];
+  const dataObj=new Date(info[0]+'T'+horaCompleta);
+  const diaSemana=diasSemana[dataObj.getDay()];
+  const tipoInfo=tiposMap[d.tipo]||{'label':d.tipo_formatado,'icone':'📌'};
+  document.getElementById('telaBloqueio').classList.remove('ativa');
+  mostrarRegistro({
+    'tipo':d.tipo,
+    'tipo_label':tipoInfo.label,
+    'tipo_icone':tipoInfo.icone,
+    'nome':document.getElementById('nomeFunc').textContent,
+    'data':dataFormatada,
+    'dia_semana':diaSemana,
+    'hora':horaCompleta,
+    'hora_simples':horaSimples,
+    'atrasado':d.minutos_atraso>0,
+    'minutos_atraso':d.minutos_atraso||0,
+    'banco_horas':0,
+    'tem_justificativa':true
+  });
 }
 function mostrarResultadoNegacao(d){
   document.getElementById('bloqueioIcone').textContent='❌';
@@ -884,7 +916,6 @@ function mostrarResultadoNegacao(d){
 }
 function fecharTelaBloqueio(){
   document.getElementById('telaBloqueio').classList.remove('ativa');
-  location.reload();
 }
 function fecharModal(){document.getElementById('modalJust').classList.remove('ativo');pendente=null;}
 async function confirmar(){
@@ -898,8 +929,6 @@ async function executar(cpf,tipo,just){
     const r=await fetch('/api/bater_ponto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cpf:cpf,tipo:tipo,qr_code:QR,justificativa:just})});
     const d=await r.json();
     if(r.ok){
-      let t='sucesso';if(d.mensagem.includes('Banco'))t='banco-horas';
-      mostrar(d.mensagem,t);
       if(d.registro)mostrarRegistro(d.registro);
     }
     else mostrar(d.detail||'Erro','erro');
