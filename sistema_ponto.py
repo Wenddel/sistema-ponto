@@ -1339,7 +1339,6 @@ function renderizarAutorizacoes(lista){
         '<div class="det-item"><div class="det-label">Horário Atual</div><div class="det-valor">⏰ '+s.hora_registro+'</div></div>'+
       '</div>'+
       '<div class="diferenca">'+textoDif+'</div>'+
-      '<textarea id="resp-'+s.id+'" placeholder="📝 Observação para o funcionário (opcional)..."></textarea>'+
       '<div class="acoes">'+
         '<button class="btn-danger" onclick="responderAutorizacao(\\''+s.id+'\\',false)">❌ NEGAR</button>'+
         '<button class="btn-success" onclick="responderAutorizacao(\\''+s.id+'\\',true)">✅ APROVAR</button>'+
@@ -1349,18 +1348,11 @@ function renderizarAutorizacoes(lista){
 }
 
 async function responderAutorizacao(sid,aprovar){
-  const resp=document.getElementById('resp-'+sid);
-  const observacao=resp?resp.value.trim():'';
-  
-  if(!aprovar && !observacao){
-    if(!confirm('Deseja realmente NEGAR sem deixar uma observação?'))return;
-  }
-  
   try{
     const r=await fetch('/api/responder_autorizacao',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({solicitacao_id:sid,aprovar:aprovar,resposta:observacao})
+      body:JSON.stringify({solicitacao_id:sid,aprovar:aprovar,resposta:''})
     });
     if(r.status===401){window.location.href='/admin';return;}
     const d=await r.json();
