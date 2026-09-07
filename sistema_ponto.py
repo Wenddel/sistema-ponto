@@ -1506,22 +1506,6 @@ class ServidorPonto(BaseHTTPRequestHandler):
         
         if caminho.startswith("/static/"):
             nome_arquivo = caminho.replace("/static/", "").split("?")[0]
-
-        # Rota de Health Check para UptimeRobot
-        if caminho == "/health" or caminho == "/healthz":
-            try:
-                conn = get_db()
-                conn.execute("SELECT 1 FROM funcionarios LIMIT 1")
-                conn.close()
-                responder_json(self, {
-                    "status": "ok",
-                    "servico": "Sistema de Ponto v3.1",
-                    "timestamp": agora_brasilia().strftime("%Y-%m-%d %H:%M:%S"),
-                    "banco": "conectado"
-                })
-            except Exception as e:
-                responder_json(self, {"status": "erro", "detalhe": str(e)}, status=500)
-            return
             caminho_completo = os.path.join("static", nome_arquivo)
             if os.path.exists(caminho_completo):
                 self.send_response(200)
@@ -1540,6 +1524,22 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 self.send_response(404)
                 for k,v in CABECALHOS_SEGURANCA.items(): self.send_header(k,v)
                 self.end_headers()
+            return
+
+        # Rota de Health Check para UptimeRobot
+        if caminho == "/health" or caminho == "/healthz":
+            try:
+                conn = get_db()
+                conn.execute("SELECT 1 FROM funcionarios LIMIT 1")
+                conn.close()
+                responder_json(self, {
+                    "status": "ok",
+                    "servico": "Sistema de Ponto v3.1",
+                    "timestamp": agora_brasilia().strftime("%Y-%m-%d %H:%M:%S"),
+                    "banco": "conectado"
+                })
+            except Exception as e:
+                responder_json(self, {"status": "erro", "detalhe": str(e)}, status=500)
             return
         
         if caminho.startswith("/api/buscar/"):
@@ -1750,7 +1750,8 @@ class ServidorPonto(BaseHTTPRequestHandler):
             try:
                 import qrcode
                 host = self.headers.get("Host", f"localhost:{PORTA}")
-                url = f"http://{host}/"
+                proto = self.headers.get("X-Forwarded-Proto", "http")
+                url = f"{proto}://{host}/"
                 qr = qrcode.QRCode(version=1, box_size=10, border=5)
                 qr.add_data(url)
                 qr.make(fit=True)
