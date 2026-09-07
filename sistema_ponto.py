@@ -818,11 +818,11 @@ body { background:#f0f2f5; min-height:100vh; }
 .logout { position:absolute; right:20px; top:50%; transform:translateY(-50%); background:rgba(255,255,255,0.2); padding:9px 18px; border-radius:25px; cursor:pointer; font-size:13px; border:1px solid rgba(255,255,255,0.35); backdrop-filter:blur(5px); transition:all 0.3s; font-weight:bold; }
 .logout:hover { background:rgba(255,255,255,0.35); transform:translateY(-50%) scale(1.05); }
 .container { max-width:1250px; margin:25px auto; padding:0 20px; }
-.tabs { display:flex; gap:6px; margin-bottom:20px; flex-wrap:wrap; }
-.tab { padding:12px 20px; background:#dde2e8; border:none; border-radius:12px 12px 0 0; cursor:pointer; font-weight:bold; font-size:13px; color:#555; transition:all 0.3s; }
+.tabs { display:flex; gap:6px; margin-bottom:20px; flex-wrap:wrap; position:relative; z-index:10; }
+.tab { padding:12px 20px; background:#dde2e8; border:none; border-radius:12px 12px 0 0; cursor:pointer; font-weight:bold; font-size:13px; color:#555; transition:all 0.3s; position:relative; z-index:11; }
 .tab:hover { background:#cfd6de; transform:translateY(-2px); }
 .tab.ativo { background:white; color:#667eea; box-shadow:0 -4px 15px rgba(0,0,0,0.08); }
-.painel { background:white; border-radius:0 18px 18px 18px; padding:28px; box-shadow:0 10px 40px rgba(0,0,0,0.08); display:none; }
+.painel { background:white; border-radius:0 18px 18px 18px; padding:28px; box-shadow:0 10px 40px rgba(0,0,0,0.08); display:none; position:relative; z-index:1; }
 .painel.ativo { display:block; animation:entrar-cima 0.4s ease; }
 h2 { color:#333; margin-bottom:22px; font-size:21px; background:linear-gradient(135deg,#667eea,#764ba2); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; }
 input, select, textarea { width:100%; padding:12px; margin:8px 0; border:2px solid #e8e8e8; border-radius:10px; font-size:14px; font-family:'Segoe UI',Arial,sans-serif; transition:all 0.3s; background:#fafafa; }
@@ -1175,6 +1175,19 @@ class ServidorPonto(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         caminho = url.path
         params = parse_qs(url.query)
+        
+        # Rota de health check para monitoramento (UptimeBot / Render)
+        # Nao requer autenticacao, retorna rapido para manter o servidor acordado
+        if caminho == "/health" or caminho == "/healthz":
+            agora_ts = agora_brasilia().strftime("%Y-%m-%d %H:%M:%S")
+            responder_json(self, {
+                "status": "ok",
+                "servico": "sistema_ponto",
+                "versao": "3.0 SECURE",
+                "timestamp": agora_ts,
+                "uptime_config": "Monitorar a cada 5 minutos para evitar sleep no Render"
+            })
+            return
         
         if caminho == "/" or caminho == "/index.html":
             responder_html(self, gerar_html_ponto())
@@ -2173,7 +2186,14 @@ if __name__ == "__main__":
     print(f"Pagina inicial (CPF):   http://localhost:{PORTA}")
     print(f"Painel Funcionario:     http://localhost:{PORTA}/funcionario")
     print(f"Login Admin:            http://localhost:{PORTA}/admin")
+    print(f"Health Check:           http://localhost:{PORTA}/health")
     print(f"Usuario: {ADMIN_USUARIO} | Senha: {ADMIN_SENHA}")
+    print("=" * 65)
+    print("📡 MONITORAMENTO UPTIMEBOT (para Render 24h):")
+    print("   URL: https://SEU_DOMINIO.onrender.com/health")
+    print("   Intervalo: 5 minutos (evita sleep do plano gratuito)")
+    print("   O Render dorme apos 15 min sem atividade; ping de 5")
+    print("   minutos mantem o sistema ONLINE 24 horas gratuitamente.")
     print("=" * 65)
     print("NOVAS FUNCIONALIDADES v3.0:")
     print("  - Tela de login separada para funcionario")
