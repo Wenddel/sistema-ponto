@@ -30,8 +30,7 @@ def agora_brasilia():
 
 # ===================== CONFIGURACOES =====================
 SEGREDO_QR = "CLINICA_PONTO_2024"
-import os 
-PORTA = int(os.environ.get("PORT", 8000))
+PORTA = 8000
 ADMIN_USUARIO = "admin"
 ADMIN_SENHA = "3223ronte"
 sessoes_admin = {}
