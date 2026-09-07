@@ -2080,13 +2080,11 @@ class ServidorPonto(BaseHTTPRequestHandler):
                         msg_just = f"Atraso na ENTRADA. Horário padrão: {func['horario_entrada']} (tolerância: 5 min)."
                         info = f"Atraso de {minutos} minuto(s)"
                 elif tipo == "SAIDA_ALMOCO":
-                    # Verifica se está saindo ANTES do horário (mais de 5 min de antecedência)
-                    # Invertemos os parâmetros: se horario_padrao > hora_atual + tolerancia = saindo muito cedo
-                    atrasado = 1 if verificar_atraso(func["horario_saida_almoco"], hora_str, tolerancia_minutos=5) else 0
-                    if atrasado:
-                        minutos = calcular_minutos(func["horario_saida_almoco"], hora_str)
-                        msg_just = f"Saída para almoço ANTECIPADA. Padrão: {func['horario_saida_almoco']} (tolerância: 5 min)."
-                        info = f"Antecedência de {minutos} minuto(s)"
+                    minutos_antes = calcular_minutos(func["horario_saida_almoco"], hora_str)
+                    if not verificar_atraso(hora_str, func["horario_saida_almoco"]) and minutos_antes >= 30:
+                        minutos = minutos_antes
+                        msg_just = f"Saída para almoço com {minutos_antes} min de antecedência. Padrão: {func['horario_saida_almoco']}."
+                        info = f"Antecedência de {minutos_antes} min"
                 elif tipo == "RETORNO_ALMOCO":
                     atrasado = 1 if verificar_atraso(hora_str, func["horario_retorno_almoco"], tolerancia_minutos=5) else 0
                     if atrasado:
@@ -2103,13 +2101,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 conn.close()
                 bloqueado = (atrasado == 1)
                 # Log de debug para verificar o que está acontecendo
-                print(f"[VERIFICAR] {func['nome']} | Tipo:{tipo} | Hora:{hora_str} | Padrão:{horario_padrao_debug} | Atrasado:{atrasado} | Bloqueado:{bloqueado} | Minutos:{minutos}")
-                horario_padrao_debug = {
-                    "ENTRADA": func["horario_entrada"],
-                    "SAIDA_ALMOCO": func["horario_saida_almoco"],
-                    "RETORNO_ALMOCO": func["horario_retorno_almoco"],
-                    "SAIDA": func["horario_saida"]
-                }.get(tipo, "")
+                print(f"[VERIFICAR] {func['nome']} | Tipo:{tipo} | Hora:{hora_str} | Padrão Retorno:{func['horario_retorno_almoco']} | Atrasado:{atrasado} | Bloqueado:{bloqueado} | Minutos:{minutos}")
                 responder_json(self, {
                     "precisa_justificativa": (minutos > 0 and not bloqueado),
                     "bloqueado": bloqueado,
@@ -2118,7 +2110,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
                     "minutos_atraso": minutos,
                     "atrasado": atrasado,
                     "hora_atual": hora_str,
-                    "horario_padrao": horario_padrao_debug
+                    "horario_padrao": func["horario_retorno_almoco"] if tipo == "RETORNO_ALMOCO" else func["horario_entrada"] if tipo == "ENTRADA" else ""
                 })
             except Exception as e:
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
