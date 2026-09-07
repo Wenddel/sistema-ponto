@@ -4,38 +4,24 @@ import os
 import io
 import hashlib
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlparse as urlparse2
 
-# ===================== CONFIGURACAO FUSO HORARIO BRASILIA =====================
-import os
-os.environ["TZ"] = "America/Sao_Paulo"
-try:
-    import time
-    time.tzset()
-except:
-    pass
-try:
-    from zoneinfo import ZoneInfo
-    FUSO_BRASILIA = ZoneInfo("America/Sao_Paulo")
-except:
-    FUSO_BRASILIA = None
-
+# ===================== HORARIO DE BRASILIA (UTC-3) =====================
+FUSO_BRASILIA = timezone(timedelta(hours=-3))
 def agora_brasilia():
-    """Retorna datetime atual no fuso horário de Brasília (UTC-3)"""
-    if FUSO_BRASILIA:
-        return datetime.now(FUSO_BRASILIA).replace(tzinfo=None)
-    return datetime.now()
+    return datetime.now(timezone.utc).astimezone(FUSO_BRASILIA).replace(tzinfo=None)
 
 # ===================== CONFIGURACOES =====================
 SEGREDO_QR = "CLINICA_PONTO_2024"
-PORTA = 8000
-ADMIN_USUARIO = "admin"
-ADMIN_SENHA = "3223ronte"
-sessoes_admin = {}
-tentativas_login = {}
-acessos_funcionarios = {}
+PORTA = int(os.environ.get("PORT", 8000))
+ADMIN_USUARIO = os.environ.get("ADMIN_USUARIO", "admin")
+ADMIN_SENHA = os.environ.get("ADMIN_SENHA", "3223ronte")
+
+TIMEOUT_AUTORIZACAO_SEGUNDOS = 300
+TOLERANCIA_MINUTOS = 5
+
 os.makedirs("static", exist_ok=True)
 
 CABECALHOS_SEGURANCA = {
@@ -46,6 +32,179 @@ CABECALHOS_SEGURANCA = {
     "Permissions-Policy": "geolocation=(), microphone=(), camera=()"
 }
 
+# ===================== SISTEMA DE BANCO DE DADOS UNIFICADO =====================
+# Detecta automaticamente: PostgreSQL (via DATABASE_URL) ou SQLite local
+USAR_POSTGRES = False
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+if DATABASE_URL and DATABASE_URL.startswith("postgres"):
+    try:
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+        USAR_POSTGRES = True
+        print(f"[BD] Usando POSTGRESQL (persistente): {DATABASE_URL[:50]}...")
+    except ImportError:
+        print("[BD] AVISO: DATABASE_URL definido mas psycopg2 nao instalado. Usando SQLite.")
+        USAR_POSTGRES = False
+        DATABASE_URL = ""
+
+if not USAR_POSTGRES:
+    DB_NOME = "ponto.db"
+    print(f"[BD] Usando SQLITE local: {DB_NOME}")
+
+HISTORICO_JSON = "historico_ponto.json"
+BACKUP_DIR = "backups"
+BACKUP_INTERVAL_HORAS = 24
+
+def get_db():
+    """Retorna conexao com o banco (PostgreSQL ou SQLite)"""
+    if USAR_POSTGRES:
+        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+        conn.cursor_factory = RealDictCursor
+        return conn
+    else:
+        conn = sqlite3.connect(DB_NOME)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+def db_execute(conn, query, params=()):
+    """Executa query e retorna cursor. Funciona para ambos os bancos."""
+    cur = conn.cursor()
+    if USAR_POSTGRES:
+        # Converte ? para %s no PostgreSQL
+        query_pg = query.replace("?", "%s")
+        cur.execute(query_pg, params)
+    else:
+        cur.execute(query, params)
+    return cur
+
+def db_fetchone(conn, query, params=()):
+    cur = db_execute(conn, query, params)
+    return cur.fetchone()
+
+def db_fetchall(conn, query, params=()):
+    cur = db_execute(conn, query, params)
+    return cur.fetchall()
+
+def db_last_insert_id(conn, tabela):
+    """Retorna o ultimo ID inserido"""
+    if USAR_POSTGRES:
+        cur = conn.cursor()
+        cur.execute(f"SELECT currval(pg_get_serial_sequence('{tabela}','id')) as id")
+        return cur.fetchone()["id"]
+    else:
+        cur = conn.cursor()
+        cur.execute("SELECT last_insert_rowid() as id")
+        return cur.fetchone()["id"]
+
+def init_db():
+    """Inicializa todas as tabelas do banco de dados"""
+    conn = get_db()
+    
+    # Tabela FUNCIONARIOS
+    db_execute(conn, """CREATE TABLE IF NOT EXISTS funcionarios (
+        id SERIAL PRIMARY KEY,
+        nome TEXT NOT NULL,
+        cpf TEXT UNIQUE NOT NULL,
+        horario_entrada TEXT DEFAULT '08:00:00',
+        horario_saida_almoco TEXT DEFAULT '12:00:00',
+        horario_retorno_almoco TEXT DEFAULT '13:00:00',
+        horario_saida TEXT DEFAULT '18:00:00'
+    )""")
+    
+    # Tabela REGISTROS_PONTO
+    db_execute(conn, """CREATE TABLE IF NOT EXISTS registros_ponto (
+        id SERIAL PRIMARY KEY,
+        funcionario_id INTEGER NOT NULL,
+        data_hora TEXT NOT NULL,
+        tipo TEXT NOT NULL,
+        atrasado INTEGER DEFAULT 0,
+        minutos_atraso INTEGER DEFAULT 0,
+        minutos_banco_horas INTEGER DEFAULT 0,
+        justificativa TEXT DEFAULT '',
+        ip_dispositivo TEXT DEFAULT '',
+        user_agent TEXT DEFAULT '',
+        horario_acesso TEXT DEFAULT '',
+        autorizado_admin INTEGER DEFAULT 0,
+        admin_resposta TEXT DEFAULT ''
+    )""")
+    
+    # Tabela ACESSOS_DISPOSITIVOS
+    db_execute(conn, """CREATE TABLE IF NOT EXISTS acessos_dispositivos (
+        id SERIAL PRIMARY KEY,
+        funcionario_id INTEGER,
+        cpf TEXT NOT NULL,
+        data_hora_acesso TEXT NOT NULL,
+        ip_dispositivo TEXT DEFAULT '',
+        user_agent TEXT DEFAULT '',
+        tipo_acesso TEXT DEFAULT 'pagina_inicial'
+    )""")
+    
+    # ===== TABELAS PARA PERSISTENCIA DE DADOS QUE ERAM EM MEMORIA =====
+    
+    # Sessoes do Admin (antes: sessoes_admin = {})
+    db_execute(conn, """CREATE TABLE IF NOT EXISTS sessoes_admin (
+        token TEXT PRIMARY KEY,
+        expira TEXT NOT NULL
+    )""")
+    
+    # Tentativas de login (antes: tentativas_login = {})
+    db_execute(conn, """CREATE TABLE IF NOT EXISTS tentativas_login (
+        ip TEXT PRIMARY KEY,
+        tentativas INTEGER DEFAULT 1,
+        ultima_tentativa TEXT NOT NULL
+    )""")
+    
+    # Acessos de funcionarios (antes: acessos_funcionarios = {})
+    db_execute(conn, """CREATE TABLE IF NOT EXISTS acessos_funcionarios (
+        cpf TEXT PRIMARY KEY,
+        funcionario_id INTEGER,
+        ip TEXT,
+        expira TEXT NOT NULL
+    )""")
+    
+    # Autorizacoes pendentes (antes: autorizacoes_pendentes = {})
+    db_execute(conn, """CREATE TABLE IF NOT EXISTS autorizacoes_pendentes (
+        id TEXT PRIMARY KEY,
+        funcionario_id INTEGER NOT NULL,
+        nome TEXT NOT NULL,
+        cpf TEXT NOT NULL,
+        tipo TEXT NOT NULL,
+        hora_registro TEXT NOT NULL,
+        horario_padrao TEXT NOT NULL,
+        minutos_diferenca INTEGER DEFAULT 0,
+        tipo_diferenca TEXT NOT NULL,
+        status TEXT DEFAULT 'pendente',
+        resposta_admin TEXT DEFAULT '',
+        ip_cliente TEXT,
+        user_agent TEXT,
+        criado_em TEXT NOT NULL,
+        expira TEXT NOT NULL,
+        respondido_em TEXT
+    )""")
+    
+    # Migracoes de colunas (para SQLite)
+    if not USAR_POSTGRES:
+        for coluna, tipo in [
+            ("minutos_atraso","INTEGER DEFAULT 0"),
+            ("minutos_banco_horas","INTEGER DEFAULT 0"),
+            ("justificativa","TEXT DEFAULT ''"),
+            ("ip_dispositivo","TEXT DEFAULT ''"),
+            ("user_agent","TEXT DEFAULT ''"),
+            ("horario_acesso","TEXT DEFAULT ''"),
+            ("autorizado_admin","INTEGER DEFAULT 0"),
+            ("admin_resposta","TEXT DEFAULT ''")
+        ]:
+            try:
+                db_execute(conn, f"ALTER TABLE registros_ponto ADD COLUMN {coluna} {tipo}")
+                print(f"[MIGRACAO] Coluna {coluna} adicionada")
+            except: pass
+    
+    conn.commit()
+    conn.close()
+    print("[BD] Tabelas inicializadas com sucesso!")
+
 def sanitizar_texto(texto, max_len=500):
     if not texto: return ""
     texto = str(texto).strip()
@@ -53,18 +212,37 @@ def sanitizar_texto(texto, max_len=500):
     if len(texto) > max_len: texto = texto[:max_len]
     return texto
 
+# ===================== FUNCOES PERSISTENTES (substituem dicionarios em memoria) =====================
+
 def verificar_rate_limit(ip, max_tentativas=5, janela_segundos=300):
     agora = agora_brasilia()
-    if ip in tentativas_login:
-        info = tentativas_login[ip]
-        if (agora - info["ultima_tentativa"]).total_seconds() > janela_segundos:
-            tentativas_login[ip] = {"tentativas": 1, "ultima_tentativa": agora}
+    conn = get_db()
+    
+    registro = db_fetchone(conn, "SELECT * FROM tentativas_login WHERE ip = ?", (ip,))
+    
+    if registro:
+        ultima_str = registro["ultima_tentativa"]
+        ultima_data = datetime.strptime(ultima_str, "%Y-%m-%d %H:%M:%S")
+        
+        if (agora - ultima_data).total_seconds() > janela_segundos:
+            db_execute(conn, "UPDATE tentativas_login SET tentativas = 1, ultima_tentativa = ? WHERE ip = ?",
+                      (agora.strftime("%Y-%m-%d %H:%M:%S"), ip))
+            conn.commit()
+            conn.close()
             return True
-        if info["tentativas"] >= max_tentativas: return False
-        info["tentativas"] += 1
-        info["ultima_tentativa"] = agora
+        
+        if registro["tentativas"] >= max_tentativas:
+            conn.close()
+            return False
+        
+        db_execute(conn, "UPDATE tentativas_login SET tentativas = tentativas + 1, ultima_tentativa = ? WHERE ip = ?",
+                  (agora.strftime("%Y-%m-%d %H:%M:%S"), ip))
     else:
-        tentativas_login[ip] = {"tentativas": 1, "ultima_tentativa": agora}
+        db_execute(conn, "INSERT INTO tentativas_login (ip, tentativas, ultima_tentativa) VALUES (?, 1, ?)",
+                  (ip, agora.strftime("%Y-%m-%d %H:%M:%S")))
+    
+    conn.commit()
+    conn.close()
     return True
 
 def obter_ip_cliente(handler):
@@ -101,88 +279,18 @@ def criar_logo_padrao():
         print(f"[LOGO] Erro: {e}")
         return False
 
-DB_NOME = "ponto.db"
-
-def get_db():
-    conn = sqlite3.connect(DB_NOME)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
-
-def init_db():
-    conn = get_db()
-    conn.execute("""CREATE TABLE IF NOT EXISTS funcionarios (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        nome TEXT NOT NULL,
-        cpf TEXT UNIQUE NOT NULL,
-        horario_entrada TEXT DEFAULT '08:00:00',
-        horario_saida_almoco TEXT DEFAULT '12:00:00',
-        horario_retorno_almoco TEXT DEFAULT '13:00:00',
-        horario_saida TEXT DEFAULT '18:00:00'
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS registros_ponto (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        funcionario_id INTEGER NOT NULL,
-        data_hora TEXT NOT NULL,
-        tipo TEXT NOT NULL,
-        atrasado INTEGER DEFAULT 0,
-        minutos_atraso INTEGER DEFAULT 0,
-        minutos_banco_horas INTEGER DEFAULT 0,
-        justificativa TEXT DEFAULT '',
-        ip_dispositivo TEXT DEFAULT '',
-        user_agent TEXT DEFAULT '',
-        horario_acesso TEXT DEFAULT '',
-        FOREIGN KEY (funcionario_id) REFERENCES funcionarios(id) ON DELETE CASCADE
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS acessos_dispositivos (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        funcionario_id INTEGER,
-        cpf TEXT NOT NULL,
-        data_hora_acesso TEXT NOT NULL,
-        ip_dispositivo TEXT DEFAULT '',
-        user_agent TEXT DEFAULT '',
-        tipo_acesso TEXT DEFAULT 'pagina_inicial',
-        FOREIGN KEY (funcionario_id) REFERENCES funcionarios(id) ON DELETE SET NULL
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS solicitacoes_pendentes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        funcionario_id INTEGER NOT NULL,
-        cpf TEXT NOT NULL,
-        data_hora_solicitacao TEXT NOT NULL,
-        tipo TEXT NOT NULL,
-        atrasado INTEGER DEFAULT 0,
-        minutos_atraso INTEGER DEFAULT 0,
-        justificativa TEXT DEFAULT '',
-        status TEXT DEFAULT 'PENDENTE',
-        ip_dispositivo TEXT DEFAULT '',
-        user_agent TEXT DEFAULT '',
-        data_hora_aprovacao TEXT DEFAULT '',
-        admin_aprovador TEXT DEFAULT '',
-        motivo_negacao TEXT DEFAULT '',
-        FOREIGN KEY (funcionario_id) REFERENCES funcionarios(id) ON DELETE CASCADE
-    )""")
-    for coluna, tipo in [("minutos_atraso","INTEGER DEFAULT 0"),("minutos_banco_horas","INTEGER DEFAULT 0"),("justificativa","TEXT DEFAULT ''"),("ip_dispositivo","TEXT DEFAULT ''"),("user_agent","TEXT DEFAULT ''"),("horario_acesso","TEXT DEFAULT ''")]:
-        try:
-            conn.execute(f"ALTER TABLE registros_ponto ADD COLUMN {coluna} {tipo}")
-            print(f"[MIGRACAO] Coluna {coluna} adicionada")
-        except: pass
-    conn.commit()
-    conn.close()
-
-init_db()
-criar_logo_padrao()
+# ===================== FUNCOES AUXILIARES =====================
 
 def formatar_cpf(cpf):
     return ''.join(filter(str.isdigit, str(cpf)))
 
-def verificar_atraso(hora_registro, horario_padrao, tolerancia_minutos=0):
+def verificar_atraso(hora_registro, horario_padrao):
     try:
         h_r = hora_registro.split(":")
         h_p = horario_padrao.split(":")
         t_r = int(h_r[0])*3600 + int(h_r[1])*60 + (int(h_r[2]) if len(h_r)>2 else 0)
         t_p = int(h_p[0])*3600 + int(h_p[1])*60 + (int(h_p[2]) if len(h_p)>2 else 0)
-        tolerancia_segundos = tolerancia_minutos * 60
-        return t_r > (t_p + tolerancia_segundos)
+        return t_r > t_p
     except: return False
 
 def calcular_minutos(hora1, hora2):
@@ -212,15 +320,162 @@ def calcular_banco_horas(tipo, hora_registro, func):
         return 0
     except: return 0
 
+# ===== SISTEMA DE AUTORIZACAO (AGORA PERSISTENTE NO BANCO) =====
+
+def gerar_id_solicitacao():
+    return hashlib.sha256(os.urandom(32)).hexdigest()[:16]
+
+def limpar_autorizacoes_expiradas():
+    agora = agora_brasilia()
+    conn = get_db()
+    db_execute(conn, "DELETE FROM autorizacoes_pendentes WHERE expira <= ? AND status = 'pendente'",
+              (agora.strftime("%Y-%m-%d %H:%M:%S"),))
+    conn.commit()
+    conn.close()
+
+def criar_solicitacao_autorizacao(func, tipo, hora_registro, horario_padrao, minutos_diferenca, tipo_diferenca, ip_cliente, user_agent):
+    limpar_autorizacoes_expiradas()
+    sid = gerar_id_solicitacao()
+    agora = agora_brasilia()
+    
+    conn = get_db()
+    
+    # Verifica se ja existe solicitacao pendente
+    existente = db_fetchone(conn, """SELECT id FROM autorizacoes_pendentes 
+        WHERE funcionario_id = ? AND tipo = ? AND status = 'pendente'""",
+        (func["id"], tipo))
+    
+    if existente:
+        conn.close()
+        return existente["id"], False
+    
+    db_execute(conn, """INSERT INTO autorizacoes_pendentes 
+        (id, funcionario_id, nome, cpf, tipo, hora_registro, horario_padrao, 
+         minutos_diferenca, tipo_diferenca, status, resposta_admin, ip_cliente, 
+         user_agent, criado_em, expira, respondido_em)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pendente', '', ?, ?, ?, ?, NULL)""",
+        (sid, func["id"], func["nome"], func["cpf"], tipo, hora_registro, horario_padrao,
+         minutos_diferenca, tipo_diferenca, ip_cliente, user_agent,
+         agora.strftime("%Y-%m-%d %H:%M:%S"),
+         (agora + timedelta(seconds=TIMEOUT_AUTORIZACAO_SEGUNDOS)).strftime("%Y-%m-%d %H:%M:%S")))
+    
+    conn.commit()
+    conn.close()
+    
+    print(f"[AUTORIZACAO] Solicitacao {sid[:8]}... {func['nome']} | {tipo} | {tipo_diferenca} {minutos_diferenca}min")
+    return sid, True
+
+def listar_autorizacoes_pendentes():
+    limpar_autorizacoes_expiradas()
+    conn = get_db()
+    solicitacoes = db_fetchall(conn, """SELECT * FROM autorizacoes_pendentes WHERE status = 'pendente' ORDER BY criado_em""")
+    conn.close()
+    
+    agora = agora_brasilia()
+    resultado = []
+    for s in solicitacoes:
+        expira = datetime.strptime(s["expira"], "%Y-%m-%d %H:%M:%S")
+        resultado.append({
+            "id": s["id"],
+            "nome": s["nome"],
+            "cpf": s["cpf"],
+            "tipo": s["tipo"],
+            "tipo_formatado": s["tipo"].replace("_", " "),
+            "hora_registro": s["hora_registro"],
+            "horario_padrao": s["horario_padrao"],
+            "minutos_diferenca": s["minutos_diferenca"],
+            "tipo_diferenca": s["tipo_diferenca"],
+            "criado_em": s["criado_em"],
+            "segundos_restantes": max(0, int((expira - agora).total_seconds()))
+        })
+    return resultado
+
+def responder_autorizacao(sid, aprovar, resposta_admin=""):
+    conn = get_db()
+    s = db_fetchone(conn, "SELECT * FROM autorizacoes_pendentes WHERE id = ?", (sid,))
+    
+    if not s:
+        conn.close()
+        return None, "Solicitação não encontrada"
+    
+    if s["status"] != "pendente":
+        conn.close()
+        return None, "Solicitação já foi respondida"
+    
+    novo_status = "aprovado" if aprovar else "rejeitado"
+    agora = agora_brasilia().strftime("%Y-%m-%d %H:%M:%S")
+    
+    db_execute(conn, """UPDATE autorizacoes_pendentes 
+        SET status = ?, resposta_admin = ?, respondido_em = ? WHERE id = ?""",
+        (novo_status, resposta_admin, agora, sid))
+    
+    conn.commit()
+    
+    # Recarrega dados atualizados
+    s_atualizado = db_fetchone(conn, "SELECT * FROM autorizacoes_pendentes WHERE id = ?", (sid,))
+    conn.close()
+    
+    acao = "APROVADA" if aprovar else "REJEITADA"
+    print(f"[AUTORIZACAO] {acao} | {s_atualizado['nome']} | {s_atualizado['tipo']}")
+    return dict(s_atualizado), None
+
+def verificar_status_autorizacao(sid):
+    limpar_autorizacoes_expiradas()
+    conn = get_db()
+    s = db_fetchone(conn, "SELECT * FROM autorizacoes_pendentes WHERE id = ?", (sid,))
+    conn.close()
+    
+    if not s:
+        return {"status": "expirado", "mensagem": "Solicitação expirada. Tente novamente."}
+    
+    if s["status"] == "pendente":
+        expira = datetime.strptime(s["expira"], "%Y-%m-%d %H:%M:%S")
+        return {
+            "status": "pendente",
+            "mensagem": "Aguardando autorização do administrador...",
+            "segundos_restantes": max(0, int((expira - agora_brasilia()).total_seconds()))
+        }
+    
+    return {
+        "status": s["status"],
+        "resposta_admin": s["resposta_admin"],
+        "respondido_em": s["respondido_em"],
+        "dados": {
+            "funcionario_id": s["funcionario_id"],
+            "cpf": s["cpf"],
+            "tipo": s["tipo"],
+            "hora_registro": s["hora_registro"],
+            "horario_padrao": s["horario_padrao"],
+            "minutos_diferenca": s["minutos_diferenca"],
+            "tipo_diferenca": s["tipo_diferenca"]
+        }
+    }
+
+def obter_solicitacao_autorizacao(sid):
+    conn = get_db()
+    s = db_fetchone(conn, "SELECT * FROM autorizacoes_pendentes WHERE id = ?", (sid,))
+    conn.close()
+    return dict(s) if s else None
+
+def remover_solicitacao_autorizacao(sid):
+    conn = get_db()
+    db_execute(conn, "DELETE FROM autorizacoes_pendentes WHERE id = ?", (sid,))
+    conn.commit()
+    conn.close()
+
 def obter_ultimo_registro(funcionario_id, data_str):
     conn = get_db()
-    ultimo = conn.execute("SELECT * FROM registros_ponto WHERE funcionario_id = ? AND strftime('%Y-%m-%d', data_hora) = ? ORDER BY data_hora DESC LIMIT 1", (funcionario_id, data_str)).fetchone()
+    ultimo = db_fetchone(conn, """SELECT * FROM registros_ponto 
+        WHERE funcionario_id = ? AND strftime('%Y-%m-%d', data_hora) = ? 
+        ORDER BY data_hora DESC LIMIT 1""", (funcionario_id, data_str))
     conn.close()
     return ultimo
 
 def verificar_registro_duplicado(funcionario_id, data_str, tipo):
     conn = get_db()
-    existe = conn.execute("SELECT id FROM registros_ponto WHERE funcionario_id = ? AND strftime('%Y-%m-%d', data_hora) = ? AND tipo = ? LIMIT 1", (funcionario_id, data_str, tipo)).fetchone()
+    existe = db_fetchone(conn, """SELECT id FROM registros_ponto 
+        WHERE funcionario_id = ? AND strftime('%Y-%m-%d', data_hora) = ? AND tipo = ? LIMIT 1""",
+        (funcionario_id, data_str, tipo))
     conn.close()
     return existe is not None
 
@@ -236,8 +491,14 @@ def gerar_sessao():
 
 def limpar_sessoes_expiradas():
     agora = agora_brasilia()
-    for token in [t for t,e in sessoes_admin.items() if e <= agora]: del sessoes_admin[token]
-    for cpf in [c for c,i in acessos_funcionarios.items() if i["expira"] <= agora]: del acessos_funcionarios[cpf]
+    agora_str = agora.strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_db()
+    db_execute(conn, "DELETE FROM sessoes_admin WHERE expira <= ?", (agora_str,))
+    db_execute(conn, "DELETE FROM acessos_funcionarios WHERE expira <= ?", (agora_str,))
+    db_execute(conn, "DELETE FROM tentativas_login WHERE ultima_tentativa <= ?", 
+              ((agora - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S"),))
+    conn.commit()
+    conn.close()
 
 def verificar_login(handler):
     limpar_sessoes_expiradas()
@@ -246,17 +507,48 @@ def verificar_login(handler):
             cookie = cookie.strip()
             if cookie.startswith("sessao_admin="):
                 token = cookie.replace("sessao_admin=","").strip()
-                expira = sessoes_admin.get(token)
-                if expira and expira > agora_brasilia(): return True
+                conn = get_db()
+                sessao = db_fetchone(conn, "SELECT * FROM sessoes_admin WHERE token = ?", (token,))
+                conn.close()
+                if sessao:
+                    expira = datetime.strptime(sessao["expira"], "%Y-%m-%d %H:%M:%S")
+                    if expira > agora_brasilia():
+                        return True
     except: pass
     return False
+
+def criar_sessao_admin(token, expira):
+    conn = get_db()
+    db_execute(conn, "INSERT INTO sessoes_admin (token, expira) VALUES (?, ?)", 
+              (token, expira.strftime("%Y-%m-%d %H:%M:%S")))
+    conn.commit()
+    conn.close()
+
+def remover_tentativa_login(ip):
+    conn = get_db()
+    db_execute(conn, "DELETE FROM tentativas_login WHERE ip = ?", (ip,))
+    conn.commit()
+    conn.close()
+
+def criar_acesso_funcionario(cpf, funcionario_id, ip, expira):
+    conn = get_db()
+    db_execute(conn, """INSERT INTO acessos_funcionarios (cpf, funcionario_id, ip, expira)
+        VALUES (?, ?, ?, ?) ON CONFLICT(cpf) DO UPDATE SET 
+        funcionario_id=excluded.funcionario_id, ip=excluded.ip, expira=excluded.expira""",
+        (cpf, funcionario_id, ip, expira.strftime("%Y-%m-%d %H:%M:%S")))
+    conn.commit()
+    conn.close()
 
 def registrar_acesso_dispositivo(cpf, funcionario_id, ip, user_agent, tipo_acesso="pagina_inicial"):
     try:
         conn = get_db()
         agora = agora_brasilia().strftime("%Y-%m-%d %H:%M:%S")
-        conn.execute("INSERT INTO acessos_dispositivos (funcionario_id, cpf, data_hora_acesso, ip_dispositivo, user_agent, tipo_acesso) VALUES (?, ?, ?, ?, ?, ?)", (funcionario_id, cpf, agora, ip, user_agent[:500], tipo_acesso))
-        conn.commit(); conn.close()
+        db_execute(conn, """INSERT INTO acessos_dispositivos 
+            (funcionario_id, cpf, data_hora_acesso, ip_dispositivo, user_agent, tipo_acesso) 
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (funcionario_id, cpf, agora, ip, user_agent[:500], tipo_acesso))
+        conn.commit()
+        conn.close()
         return True
     except Exception as e:
         print(f"[ERRO ACESSO] {e}")
@@ -302,7 +594,7 @@ RODAPE_WELL = """
   <div class="rodape-content">
     <span class="rodape-icone">⚡</span>
     <span class="rodape-texto">Desenvolvido por <strong>WELL</strong></span>
-    <span class="rodape-versao">v3.0 SECURE</span>
+    <span class="rodape-versao">v4.2-PERSISTENTE</span>
   </div>
 </div>
 """
@@ -313,6 +605,7 @@ ESTILOS_5D = """
 .btn-3d:hover::before { left:100%; }
 .btn-3d:hover { transform: translateY(-4px); box-shadow: 0 10px 0 rgba(0,0,0,0.18), 0 18px 35px rgba(0,0,0,0.28), inset 0 2px 0 rgba(255,255,255,0.4); }
 .btn-3d:active { transform: translateY(2px); box-shadow: 0 2px 0 rgba(0,0,0,0.18), 0 4px 10px rgba(0,0,0,0.18), inset 0 2px 0 rgba(255,255,255,0.4); }
+.btn-3d:disabled { opacity: 0.5; cursor: not-allowed; transform: none !important; }
 .card-3d { background: white; border-radius: 22px; position: relative; transform-style: preserve-3d; transition: all 0.5s cubic-bezier(0.175,0.885,0.32,1.275); box-shadow: 0 25px 50px rgba(0,0,0,0.15), 0 10px 20px rgba(0,0,0,0.08), inset 0 1px 0 rgba(255,255,255,0.9); }
 .card-3d::before { content:''; position:absolute; top:0; left:0; right:0; height:5px; border-radius:22px 22px 0 0; background:linear-gradient(90deg,#667eea,#f093fb,#f5576c,#4facfe,#43e97b,#667eea); background-size:300% 100%; animation:arco-iris 6s linear infinite; }
 @keyframes arco-iris { 0%{background-position:0% 50%} 100%{background-position:300% 50%} }
@@ -325,6 +618,11 @@ ESTILOS_5D = """
 .particulas { position:fixed; top:0; left:0; width:100%; height:100%; pointer-events:none; overflow:hidden; z-index:0; }
 .particula { position:absolute; width:10px; height:10px; background:rgba(255,255,255,0.18); border-radius:50%; animation:flutuar 20s infinite linear; }
 @keyframes flutuar { 0%{transform:translateY(100vh) rotate(0deg);opacity:0} 10%{opacity:1} 90%{opacity:1} 100%{transform:translateY(-100px) rotate(720deg);opacity:0} }
+@keyframes pulsar-alerta { 0%,100%{box-shadow:0 0 0 0 rgba(255,87,34,0.7)} 50%{box-shadow:0 0 0 15px rgba(255,87,34,0)} }
+.alerta-pulsante { animation: pulsar-alerta 1.5s infinite; }
+@keyframes girar { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
+.spinner { display:inline-block; width:20px; height:20px; border:3px solid rgba(255,255,255,0.3); border-top-color:white; border-radius:50%; animation:girar 0.8s linear infinite; vertical-align:middle; margin-right:8px; }
+.spinner-escuro { border-color:rgba(102,126,234,0.2); border-top-color:#667eea; }
 """
 
 SCRIPT_PARTICULAS = """
@@ -461,7 +759,7 @@ body { min-height:100vh; display:flex; align-items:center; justify-content:cente
 <div class="info-func" id="infoFunc"></div>
 <button class="btn-3d btn-acessar" onclick="acessar()">🔓 ACESSAR MEU PAINEL</button>
 <div class="mensagem" id="mensagem"></div>
-<div class="dica">🔒 Seus dados estão protegidos. Acesso registrado por dispositivo.</div>
+<div class="dica">🔒 Seus dados estão protegidos e salvos permanentemente.</div>
 <div class="admin-link"><a href="/admin">🔐 Acesso Administrador</a></div>
 """ + RODAPE_WELL + """
 </div>
@@ -538,46 +836,26 @@ body { min-height:100vh; padding:15px; position:relative; overflow-x:hidden; }
 .sucesso { background:linear-gradient(135deg,#e8f5e9,#c8e6c9); color:#1b5e20; display:block; border:1px solid #a5d6a7; }
 .erro { background:linear-gradient(135deg,#ffebee,#ffcdd2); color:#b71c1c; display:block; border:1px solid #ef9a9a; }
 .banco-horas { background:linear-gradient(135deg,#e0f7fa,#b2ebf2); color:#006064; display:block; border:1px solid #80deea; }
-.modal-overlay { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.6); backdrop-filter:blur(5px); z-index:1000; align-items:center; justify-content:center; padding:20px; }
-.modal-overlay.ativo { display:flex; }
-.modal-box { background:white; border-radius:22px; padding:30px; width:100%; max-width:420px; box-shadow:0 30px 70px rgba(0,0,0,0.4); animation:entrar-cima 0.4s cubic-bezier(0.175,0.885,0.32,1.275); }
-.modal-box h2 { color:#f44336; font-size:20px; margin-bottom:10px; }
-.modal-box p { color:#555; font-size:14px; margin-bottom:15px; line-height:1.5; }
-.modal-box .info-atraso { background:linear-gradient(135deg,#fff3e0,#ffe0b2); padding:14px; border-radius:12px; margin-bottom:15px; font-weight:bold; color:#e65100; font-size:15px; border:1px solid #ffcc80; }
-.modal-box textarea { width:100%; padding:14px; border:3px solid #e8e8e8; border-radius:12px; font-size:14px; resize:vertical; min-height:90px; font-family:'Segoe UI',Arial,sans-serif; transition:all 0.3s; }
-.modal-box textarea:focus { border-color:#667eea; outline:none; box-shadow:0 0 0 5px rgba(102,126,234,0.12); }
-.modal-botoes { display:flex; gap:10px; margin-top:18px; }
-.modal-botoes button { flex:1; padding:14px; border:none; border-radius:12px; font-weight:bold; cursor:pointer; font-size:14px; transition:all 0.3s; }
-.btn-cancelar { background:linear-gradient(135deg,#e0e0e0,#bdbdbd); color:#333; }
-.btn-confirmar { background:linear-gradient(135deg,#667eea,#764ba2); color:white; }
 .disp-info { margin-top:15px; padding:12px; background:linear-gradient(135deg,#f3e5f5,#e1bee7); border-radius:12px; font-size:11px; color:#6a1b9a; text-align:center; border:1px solid #ce93d8; }
-.tela-bloqueio { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); backdrop-filter:blur(10px); z-index:2000; align-items:center; justify-content:center; padding:20px; }
-.tela-bloqueio.ativa { display:flex; }
-.bloqueio-box { background:white; border-radius:28px; padding:40px 30px; width:100%; max-width:420px; text-align:center; box-shadow:0 30px 80px rgba(244,67,54,0.4); animation:entrar-cima 0.5s cubic-bezier(0.175,0.885,0.32,1.275); }
-.bloqueio-icone { width:100px; height:100px; border-radius:50%; background:linear-gradient(135deg,#f44336,#ff5722); display:flex; align-items:center; justify-content:center; font-size:50px; margin:0 auto 20px; box-shadow:0 10px 30px rgba(244,67,54,0.5); animation:pulse-bloqueio 2s infinite; }
-@keyframes pulse-bloqueio { 0%,100%{transform:scale(1);box-shadow:0 10px 30px rgba(244,67,54,0.5)} 50%{transform:scale(1.08);box-shadow:0 15px 40px rgba(244,67,54,0.6)} }
-.bloqueio-box h2 { color:#f44336; font-size:22px; margin-bottom:10px; }
-.bloqueio-sub { color:#666; font-size:14px; margin-bottom:20px; line-height:1.6; }
-.bloqueio-info { background:linear-gradient(135deg,#fff3e0,#ffe0b2); border:2px solid #ff9800; border-radius:14px; padding:15px; margin-bottom:20px; text-align:left; }
-.bloqueio-info p { margin:5px 0; font-size:13px; color:#e65100; }
-.bloqueio-info strong { color:#bf360c; }
-.bloqueio-status { background:linear-gradient(135deg,#e3f2fd,#bbdefb); border-radius:14px; padding:15px; margin-bottom:15px; }
-.bloqueio-status .status-texto { color:#1565c0; font-weight:bold; font-size:14px; }
-.bloqueio-status .status-dots { display:inline-block; margin-left:8px; }
-.bloqueio-status .status-dots span { display:inline-block; width:8px; height:8px; background:#1565c0; border-radius:50%; margin:0 2px; animation:dots 1.4s infinite; }
-.bloqueio-status .status-dots span:nth-child(2){animation-delay:0.2s}
-.bloqueio-status .status-dots span:nth-child(3){animation-delay:0.4s}
-@keyframes dots { 0%,80%,100%{transform:scale(0);opacity:0.5} 40%{transform:scale(1);opacity:1} }
-.bloqueio-aprovado { background:linear-gradient(135deg,#e8f5e9,#c8e6c9); border:2px solid #4CAF50; border-radius:14px; padding:20px; margin-bottom:15px; }
-.bloqueio-aprovado h3 { color:#2e7d32; font-size:18px; margin-bottom:8px; }
-.bloqueio-aprovado p { color:#1b5e20; font-size:14px; }
-.bloqueio-negado { background:linear-gradient(135deg,#ffebee,#ffcdd2); border:2px solid #f44336; border-radius:14px; padding:20px; margin-bottom:15px; }
-.bloqueio-negado h3 { color:#b71c1c; font-size:18px; margin-bottom:8px; }
-.bloqueio-negado p { color:#c62828; font-size:14px; }
-.bloqueio-negado .motivo { background:white; padding:10px; border-radius:8px; margin-top:10px; font-style:italic; color:#555; font-size:13px; }
-.btn-continuar { width:100%; padding:14px; background:linear-gradient(135deg,#667eea,#764ba2); color:white; border:none; border-radius:12px; font-weight:bold; font-size:15px; cursor:pointer; transition:all 0.3s; }
-.btn-continuar:hover { transform:translateY(-2px); box-shadow:0 6px 20px rgba(102,126,234,0.4); }
-.bloqueio-aviso { background:linear-gradient(135deg,#fffde7,#fff9c4); border:1px solid #fbc02d; border-radius:10px; padding:10px; font-size:11px; color:#f57f17; margin-top:15px; }
+.tela-autorizacao { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:linear-gradient(135deg,rgba(102,126,234,0.95),rgba(118,75,162,0.95)); z-index:9999; align-items:center; justify-content:center; padding:20px; backdrop-filter:blur(10px); }
+.tela-autorizacao.ativa { display:flex; }
+.autorizacao-box { background:white; border-radius:28px; padding:35px 30px; width:100%; max-width:420px; text-align:center; box-shadow:0 30px 80px rgba(0,0,0,0.4); animation:entrar-cima 0.5s cubic-bezier(0.175,0.885,0.32,1.275); }
+.autorizacao-icone { width:100px; height:100px; border-radius:50%; background:linear-gradient(135deg,#ff9800,#ffc107); display:flex; align-items:center; justify-content:center; font-size:50px; margin:0 auto 20px; box-shadow:0 10px 30px rgba(255,152,0,0.4); animation:pulsar-alerta 2s infinite; }
+.autorizacao-box h2 { color:#333; font-size:22px; margin-bottom:10px; }
+.autorizacao-box .sub { color:#666; font-size:14px; margin-bottom:20px; line-height:1.5; }
+.info-destaque { background:linear-gradient(135deg,#fff3e0,#ffe0b2); padding:18px; border-radius:16px; margin-bottom:20px; border:2px solid #ffcc80; }
+.info-destaque .tipo-reg { font-size:18px; font-weight:bold; color:#e65100; margin-bottom:8px; }
+.info-destaque .detalhes { font-size:13px; color:#bf360c; line-height:1.6; }
+.info-destaque .minutos { font-size:28px; font-weight:bold; color:#f44336; margin:8px 0; }
+.status-aguardando { background:linear-gradient(135deg,#e3f2fd,#bbdefb); padding:15px; border-radius:14px; margin-bottom:15px; border:2px solid #90caf9; }
+.status-aguardando .texto { color:#1565c0; font-weight:bold; font-size:14px; }
+.tempo-restante { font-size:12px; color:#0d47a1; margin-top:5px; }
+.barra-progresso { width:100%; height:8px; background:#e3f2fd; border-radius:4px; margin-top:10px; overflow:hidden; }
+.barra-progresso .preenchimento { height:100%; background:linear-gradient(90deg,#2196F3,#667eea); border-radius:4px; transition:width 1s linear; }
+.btn-cancelar-aut { width:100%; padding:14px; margin-top:10px; background:linear-gradient(135deg,#e0e0e0,#bdbdbd); color:#333; border:none; border-radius:12px; font-weight:bold; font-size:14px; cursor:pointer; transition:all 0.3s; }
+.btn-cancelar-aut:hover { transform:translateY(-2px); box-shadow:0 5px 15px rgba(0,0,0,0.15); }
+.resposta-admin { padding:15px; border-radius:12px; margin-top:15px; font-size:13px; font-style:italic; color:#555; background:#f5f5f5; border-left:4px solid #667eea; display:none; }
+.resposta-admin.visivel { display:block; }
 </style>
 </head>
 <body class="fundo-animado">
@@ -600,49 +878,37 @@ body { min-height:100vh; padding:15px; position:relative; overflow-x:hidden; }
 <button class="btn-3d btn-saida" onclick="registrar('SAIDA')"><span class="icone-btn">🚪</span>SAÍDA</button>
 </div>
 <div class="mensagem" id="mensagem"></div>
-<div class="disp-info" id="dispInfo">📡 Dispositivo registrado com segurança</div>
+<div class="disp-info">📡 Dispositivo registrado com segurança</div>
 </div>
 """ + RODAPE_WELL + """
 </div>
-
-<!-- TELA DE BLOQUEIO - AGUARDANDO APROVAÇÃO ADMIN -->
-<div class="tela-bloqueio" id="telaBloqueio">
-  <div class="bloqueio-box" id="bloqueioConteudo">
-    <div class="bloqueio-icone" id="bloqueioIcone">🔒</div>
-    <h2 id="bloqueioTitulo">REGISTRO BLOQUEADO</h2>
-    <p class="bloqueio-sub" id="bloqueioSub">Seu registro está fora da tolerância de 5 minutos e requer aprovação do administrador.</p>
-    <div class="bloqueio-info" id="bloqueioInfo">
-      <p><strong>Tipo:</strong> <span id="bloqTipo">-</span></p>
-      <p><strong>Atraso:</strong> <span id="bloqAtraso">-</span> minuto(s)</p>
-      <p><strong>Solicitado em:</strong> <span id="bloqHora">-</span></p>
-    </div>
-    <div class="bloqueio-status" id="bloqueioStatus">
-      <span class="status-texto">⏳ Aguardando aprovação do administrador</span>
-      <span class="status-dots"><span></span><span></span><span></span></span>
-    </div>
-    <div class="bloqueio-aviso">⚠️ Esta tela não pode ser fechada. O sistema verificará automaticamente a aprovação.</div>
-  </div>
+<div class="tela-autorizacao" id="telaAutorizacao">
+<div class="autorizacao-box">
+<div class="autorizacao-icone">⏰</div>
+<h2 id="autTitulo">Atenção! Horário Diferenciado</h2>
+<p class="sub" id="autSubtitulo">Sua solicitação foi enviada para o administrador</p>
+<div class="info-destaque">
+<div class="tipo-reg" id="autTipoReg">ENTRADA</div>
+<div class="detalhes" id="autDetalhes">Horário padrão: 08:00:00<br>Horário atual: 07:55:00</div>
+<div class="minutos" id="autMinutos">5 min ANTES</div>
 </div>
-
-<div class="modal-overlay" id="modalJust">
-<div class="modal-box">
-<h2>⚠️ Atenção!</h2>
-<p id="modalTexto"></p>
-<div class="info-atraso" id="modalInfo"></div>
-<p style="font-weight:bold;color:#333;margin-bottom:8px;">📝 Informe a justificativa:</p>
-<textarea id="justificativa" placeholder="Descreva o motivo detalhadamente..."></textarea>
-<div class="modal-botoes">
-<button class="btn-cancelar" onclick="fecharModal()">Cancelar</button>
-<button class="btn-confirmar" onclick="confirmar()">✅ Confirmar</button>
+<div class="status-aguardando">
+<div class="texto"><span class="spinner spinner-escuro"></span>Aguardando autorização do administrador...</div>
+<div class="tempo-restante" id="autTempo">Tempo restante: 05:00</div>
+<div class="barra-progresso"><div class="preenchimento" id="autBarra" style="width:100%"></div></div>
 </div>
+<div class="resposta-admin" id="autResposta"></div>
 </div>
 </div>
 """ + SCRIPT_PARTICULAS + """
 <script>
 const QR="CLINICA_PONTO_2024";
-let pendente=null;
 const prm=new URLSearchParams(window.location.search);
 const CPF=prm.get('cpf')||'';
+let idSolicitacaoAtual=null;
+let pollingAutorizacao=null;
+let tempoInicioAutorizacao=null;
+const TEMPO_MAX_AUTORIZACAO=300;
 function atualizarDH(){
   const o={weekday:'long',day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'};
   document.getElementById('dataHora').textContent='🕐 '+new Date().toLocaleDateString('pt-BR',o);
@@ -664,135 +930,176 @@ async function carregar(){
   }catch(e){window.location.href='/';}
 }
 carregar();
-let pollingId=null;
+function travarBotoes(travar){
+  document.querySelectorAll('.botoes button').forEach(b=>b.disabled=travar);
+}
 async function registrar(tipo){
   if(!CPF)return;
+  travarBotoes(true);
   try{
-    const r=await fetch('/api/verificar_ponto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cpf:CPF,tipo:tipo,qr_code:QR})});
+    const r=await fetch('/api/solicitar_ponto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cpf:CPF,tipo:tipo,qr_code:QR})});
     const d=await r.json();
-    if(!r.ok){mostrar(d.detail||'Erro','erro');return;}
-    if(d.bloqueado){
-      // ATRASO ACIMA DE 5 MINUTOS: Bloquear e solicitar aprovação admin
-      await solicitarAprovacao(tipo,d);
-    }else if(d.precisa_justificativa){
-      // Atraso pequeno ou situação que pede justificativa mas não bloqueia
-      pendente={cpf:CPF,tipo:tipo};
-      document.getElementById('modalTexto').textContent=d.mensagem_justificativa;
-      document.getElementById('modalInfo').textContent='⏱️ '+d.info_atraso;
-      document.getElementById('justificativa').value='';
-      document.getElementById('modalJust').classList.add('ativo');
-      document.getElementById('justificativa').focus();
-    }else await executar(CPF,tipo,'');
-  }catch(e){mostrar('Erro de conexão!','erro');}
+    if(!r.ok){mostrar(d.detail||'Erro','erro');travarBotoes(false);return;}
+    
+    if(d.requer_autorizacao){
+      abrirTelaAutorizacao(d);
+    }else{
+      await finalizarRegistro(d.registro_id);
+    }
+  }catch(e){mostrar('Erro de conexão!','erro');travarBotoes(false);}
 }
-
-async function solicitarAprovacao(tipo,dados){
-  // Pede justificativa primeiro, depois envia solicitação
-  const just=prompt('📝 Descreva o motivo do atraso:\n(esta informação será enviada ao administrador)');
-  if(just===null)return; // Usuário não quer informar motivo, mas ainda assim envia
+function abrirTelaAutorizacao(dados){
+  idSolicitacaoAtual=dados.solicitacao_id;
+  tempoInicioAutorizacao=Date.now();
   
+  const tipoLabel=dados.tipo.replace('_',' ');
+  document.getElementById('autTipoReg').textContent=tipoLabel;
+  
+  let textoDiferenca='';
+  if(dados.tipo_diferenca==='antecipado'){
+    document.getElementById('autTitulo').textContent='⏰ Entrando Antes do Horário';
+    document.getElementById('autSubtitulo').textContent='Sua solicitação de registro antecipado foi enviada';
+    textoDiferenca=dados.minutos_diferenca+' min ANTES do horário';
+  }else{
+    document.getElementById('autTitulo').textContent='⚠️ Atraso Detectado';
+    document.getElementById('autSubtitulo').textContent='Sua solicitação de registro com atraso foi enviada';
+    textoDiferenca=dados.minutos_diferenca+' min ATRASADO';
+  }
+  
+  document.getElementById('autDetalhes').innerHTML=
+    'Horário padrão: <strong>'+dados.horario_padrao+'</strong><br>'+
+    'Horário atual: <strong>'+dados.hora_registro+'</strong>';
+  document.getElementById('autMinutos').textContent=textoDiferenca;
+  
+  document.getElementById('autResposta').className='resposta-admin';
+  document.getElementById('telaAutorizacao').classList.add('ativa');
+  
+  pollingAutorizacao=setInterval(verificarStatusAutorizacao,2000);
+  atualizarTempoRestante();
+}
+function atualizarTempoRestante(){
+  if(!tempoInicioAutorizacao)return;
+  const decorrido=(Date.now()-tempoInicioAutorizacao)/1000;
+  const restante=Math.max(0,TEMPO_MAX_AUTORIZACAO-decorrido);
+  const min=Math.floor(restante/60);
+  const seg=Math.floor(restante%60);
+  document.getElementById('autTempo').textContent='Tempo restante: '+String(min).padStart(2,'0')+':'+String(seg).padStart(2,'0');
+  document.getElementById('autBarra').style.width=(restante/TEMPO_MAX_AUTORIZACAO*100)+'%';
+  
+  if(restante<=0 && pollingAutorizacao){
+    clearInterval(pollingAutorizacao);
+    pollingAutorizacao=null;
+    fecharTelaAutorizacao();
+    mostrar('⏱️ Tempo esgotado! Solicitação expirada. Tente novamente.','erro');
+    travarBotoes(false);
+    return;
+  }
+  
+  if(pollingAutorizacao)setTimeout(atualizarTempoRestante,1000);
+}
+async function verificarStatusAutorizacao(){
+  if(!idSolicitacaoAtual)return;
   try{
-    const r=await fetch('/api/solicitar_ponto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cpf:CPF,tipo:tipo,qr_code:QR,justificativa:just||'Não informado'})});
+    const r=await fetch('/api/status_autorizacao/'+idSolicitacaoAtual);
     const d=await r.json();
-    if(!r.ok){mostrar(d.detail||'Erro','erro');return;}
     
-    // Mostrar tela de bloqueio - SEM OPÇÃO DE CANCELAR
-    mostrarTelaBloqueio(tipo,dados.minutos_atraso||0);
-    // Iniciar polling para verificar status
-    iniciarPolling();
-  }catch(e){mostrar('Erro ao enviar solicitação!','erro');}
-}
-
-function mostrarTelaBloqueio(tipo,minutos){
-  const tiposLabel={'ENTRADA':'✅ ENTRADA','SAIDA_ALMOCO':'🍽️ SAÍDA ALMOÇO','RETORNO_ALMOCO':'↩️ RETORNO ALMOÇO','SAIDA':'🚪 SAÍDA'};
-  document.getElementById('bloqTipo').textContent=tiposLabel[tipo]||tipo;
-  document.getElementById('bloqAtraso').textContent=minutos;
-  document.getElementById('bloqHora').textContent=new Date().toLocaleTimeString('pt-BR');
-  document.getElementById('telaBloqueio').classList.add('ativa');
-  // Prevenir ESC e outros métodos de fechamento
-  document.addEventListener('keydown',prevenirFechamento);
-}
-
-function prevenirFechamento(e){
-  if(e.key==='Escape'){e.preventDefault();e.stopPropagation();}
-}
-
-function iniciarPolling(){
-  pararPolling();
-  pollingId=setInterval(verificarStatusSolicitacao,3000);
-  verificarStatusSolicitacao();
-}
-
-function pararPolling(){
-  if(pollingId){clearInterval(pollingId);pollingId=null;}
-}
-
-async function verificarStatusSolicitacao(){
-  if(!CPF)return;
-  try{
-    const r=await fetch('/api/solicitacao_status/'+CPF);
-    const d=await r.json();
-    if(!d.encontrada)return;
-    
-    if(d.status==='APROVADA'){
-      pararPolling();
-      mostrarResultadoAprovacao(d);
-    }else if(d.status==='NEGADA'){
-      pararPolling();
-      mostrarResultadoNegacao(d);
+    if(d.status==='aprovado'){
+      clearInterval(pollingAutorizacao);
+      pollingAutorizacao=null;
+      
+      if(d.resposta_admin){
+        const respEl=document.getElementById('autResposta');
+        respEl.textContent='📝 Admin: '+d.resposta_admin;
+        respEl.className='resposta-admin visivel';
+      }
+      
+      document.querySelector('.status-aguardando .texto').innerHTML='✅ <strong style="color:#2e7d32;">AUTORIZADO!</strong> Registrando...';
+      document.querySelector('.autorizacao-icone').style.background='linear-gradient(135deg,#4CAF50,#81c784)';
+      document.querySelector('.autorizacao-icone').textContent='✅';
+      
+      setTimeout(async ()=>{
+        await finalizarRegistroComAutorizacao(idSolicitacaoAtual,d.resposta_admin||'');
+      },1000);
+      
+    }else if(d.status==='rejeitado'){
+      clearInterval(pollingAutorizacao);
+      pollingAutorizacao=null;
+      
+      document.querySelector('.status-aguardando .texto').innerHTML='❌ <strong style="color:#c62828;">NEGADO!</strong>';
+      document.querySelector('.autorizacao-icone').style.background='linear-gradient(135deg,#f44336,#e57373)';
+      document.querySelector('.autorizacao-icone').textContent='❌';
+      
+      if(d.resposta_admin){
+        const respEl=document.getElementById('autResposta');
+        respEl.textContent='📝 Motivo: '+d.resposta_admin;
+        respEl.className='resposta-admin visivel';
+      }
+      
+      setTimeout(()=>{
+        fecharTelaAutorizacao();
+        mostrar('❌ Solicitação negada pelo administrador.'+(d.resposta_admin?'\\nMotivo: '+d.resposta_admin:''),'erro');
+        travarBotoes(false);
+      },2500);
+      
+    }else if(d.status==='expirado'){
+      clearInterval(pollingAutorizacao);
+      pollingAutorizacao=null;
+      fecharTelaAutorizacao();
+      mostrar('⏱️ Solicitação expirada! Tente novamente.','erro');
+      travarBotoes(false);
     }
   }catch(e){}
 }
-
-function mostrarResultadoAprovacao(d){
-  document.getElementById('bloqueioIcone').textContent='✅';
-  document.getElementById('bloqueioIcone').style.background='linear-gradient(135deg,#4CAF50,#66bb6a)';
-  document.getElementById('bloqueioIcone').style.animation='none';
-  document.getElementById('bloqueioTitulo').textContent='SOLICITAÇÃO APROVADA!';
-  document.getElementById('bloqueioTitulo').style.color='#2e7d32';
-  document.getElementById('bloqueioSub').textContent='O administrador aprovou seu registro. Ponto registrado com sucesso.';
-  document.getElementById('bloqueioStatus').outerHTML=
-    '<div class="bloqueio-aprovado"><h3>🎉 Ponto Registrado!</h3><p>Tipo: '+d.tipo_formatado+'<br>Horário: '+d.data_hora.split(' ')[1]+'</p></div>'+
-    '<button class="btn-continuar" onclick="fecharTelaBloqueio()">Continuar</button>';
-  document.removeEventListener('keydown',prevenirFechamento);
+async function cancelarAutorizacao(){
+  if(pollingAutorizacao){clearInterval(pollingAutorizacao);pollingAutorizacao=null;}
+  idSolicitacaoAtual=null;
+  tempoInicioAutorizacao=null;
+  fecharTelaAutorizacao();
+  travarBotoes(false);
+  mostrar('Solicitação cancelada.','erro');
 }
-
-function mostrarResultadoNegacao(d){
-  document.getElementById('bloqueioIcone').textContent='❌';
-  document.getElementById('bloqueioIcone').style.background='linear-gradient(135deg,#f44336,#d32f2f)';
-  document.getElementById('bloqueioIcone').style.animation='none';
-  document.getElementById('bloqueioTitulo').textContent='SOLICITAÇÃO NEGADA';
-  document.getElementById('bloqueioTitulo').style.color='#b71c1c';
-  document.getElementById('bloqueioSub').textContent='O administrador negou sua solicitação de registro.';
-  const motivo=d.motivo_negacao?'<div class="motivo">Motivo: '+d.motivo_negacao+'</div>':'';
-  document.getElementById('bloqueioStatus').outerHTML=
-    '<div class="bloqueio-negado"><h3>⚠️ Registro não efetuado</h3><p>Procure o administrador para mais informações.</p>'+motivo+'</div>'+
-    '<button class="btn-continuar" onclick="fecharTelaBloqueio()">Entendido</button>';
-  document.removeEventListener('keydown',prevenirFechamento);
+function fecharTelaAutorizacao(){
+  document.getElementById('telaAutorizacao').classList.remove('ativa');
+  document.querySelector('.autorizacao-icone').style.background='';
+  document.querySelector('.autorizacao-icone').textContent='⏰';
 }
-
-function fecharTelaBloqueio(){
-  document.getElementById('telaBloqueio').classList.remove('ativa');
-  // Resetar tela para estado original
-  location.reload();
-}
-function fecharModal(){document.getElementById('modalJust').classList.remove('ativo');pendente=null;}
-async function confirmar(){
-  if(!pendente)return;
-  const j=document.getElementById('justificativa').value.trim();
-  if(!j){alert('Informe a justificativa!');document.getElementById('justificativa').focus();return;}
-  fecharModal(); await executar(pendente.cpf,pendente.tipo,j);
-}
-async function executar(cpf,tipo,just){
+async function finalizarRegistro(registroId){
   try{
-    const r=await fetch('/api/bater_ponto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cpf:cpf,tipo:tipo,qr_code:QR,justificativa:just})});
+    const r=await fetch('/api/obter_registro/'+registroId);
     const d=await r.json();
-    if(r.ok){let t='sucesso';if(d.mensagem.includes('Banco'))t='banco-horas';mostrar(d.mensagem,t);}
-    else mostrar(d.detail||'Erro','erro');
-  }catch(e){mostrar('Erro de conexão!','erro');}
+    if(r.ok && d.mensagem){
+      let t='sucesso';
+      if(d.mensagem.includes('Banco'))t='banco-horas';
+      mostrar(d.mensagem,t);
+    }
+  }catch(e){}
+  travarBotoes(false);
 }
-function mostrar(texto,tipo){const m=document.getElementById('mensagem');m.textContent=texto;m.className='mensagem '+tipo;setTimeout(()=>m.className='mensagem',10000);}
-document.getElementById('modalJust').addEventListener('click',function(e){if(e.target===this)fecharModal();});
+async function finalizarRegistroComAutorizacao(solicitacaoId,respostaAdmin){
+  try{
+    const r=await fetch('/api/executar_autorizado',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({solicitacao_id:solicitacaoId,resposta_admin:respostaAdmin})
+    });
+    const d=await r.json();
+    if(r.ok){
+      let t='sucesso';
+      if(d.mensagem.includes('Banco'))t='banco-horas';
+      mostrar(d.mensagem+'\\n\\n✅ COM AUTORIZAÇÃO DO ADMINISTRADOR',t);
+    }else{
+      mostrar(d.detail||'Erro ao registrar','erro');
+    }
+  }catch(e){mostrar('Erro de conexão!','erro');}
+  
+  setTimeout(()=>{fecharTelaAutorizacao();travarBotoes(false);},1500);
+}
+function mostrar(texto,tipo){
+  const m=document.getElementById('mensagem');
+  m.textContent=texto;
+  m.className='mensagem '+tipo;
+  setTimeout(()=>m.className='mensagem',12000);
+}
 </script>
 </body>
 </html>"""
@@ -817,12 +1124,20 @@ body { background:#f0f2f5; min-height:100vh; }
 .header h1 { font-size:22px; text-shadow:0 2px 8px rgba(0,0,0,0.2); }
 .logout { position:absolute; right:20px; top:50%; transform:translateY(-50%); background:rgba(255,255,255,0.2); padding:9px 18px; border-radius:25px; cursor:pointer; font-size:13px; border:1px solid rgba(255,255,255,0.35); backdrop-filter:blur(5px); transition:all 0.3s; font-weight:bold; }
 .logout:hover { background:rgba(255,255,255,0.35); transform:translateY(-50%) scale(1.05); }
+.alerta-autorizacoes { display:none; background:linear-gradient(135deg,#ff5722,#ff9800); color:white; padding:15px 25px; text-align:center; cursor:pointer; position:relative; overflow:hidden; box-shadow:0 4px 20px rgba(255,87,34,0.4); }
+.alerta-autorizacoes.visivel { display:block; animation:entrar-cima 0.4s ease; }
+.alerta-autorizacoes .conteudo { display:flex; align-items:center; justify-content:center; gap:12px; font-weight:bold; font-size:15px; }
+.alerta-autorizacoes .icone { font-size:24px; }
+.alerta-autorizacoes .badge { background:white; color:#ff5722; padding:3px 12px; border-radius:20px; font-weight:bold; font-size:13px; }
+.alerta-autorizacoes:hover { filter:brightness(1.1); }
 .container { max-width:1250px; margin:25px auto; padding:0 20px; }
-.tabs { display:flex; gap:6px; margin-bottom:20px; flex-wrap:wrap; position:relative; z-index:10; }
-.tab { padding:12px 20px; background:#dde2e8; border:none; border-radius:12px 12px 0 0; cursor:pointer; font-weight:bold; font-size:13px; color:#555; transition:all 0.3s; position:relative; z-index:11; }
+.tabs { display:flex; gap:6px; margin-bottom:20px; flex-wrap:wrap; }
+.tab { padding:12px 20px; background:#dde2e8; border:none; border-radius:12px 12px 0 0; cursor:pointer; font-weight:bold; font-size:13px; color:#555; transition:all 0.3s; position:relative; }
 .tab:hover { background:#cfd6de; transform:translateY(-2px); }
 .tab.ativo { background:white; color:#667eea; box-shadow:0 -4px 15px rgba(0,0,0,0.08); }
-.painel { background:white; border-radius:0 18px 18px 18px; padding:28px; box-shadow:0 10px 40px rgba(0,0,0,0.08); display:none; position:relative; z-index:1; }
+.tab .badge-aut { position:absolute; top:-5px; right:-5px; background:#ff5722; color:white; width:20px; height:20px; border-radius:50%; font-size:11px; display:flex; align-items:center; justify-content:center; display:none; }
+.tab .badge-aut.visivel { display:flex; }
+.painel { background:white; border-radius:0 18px 18px 18px; padding:28px; box-shadow:0 10px 40px rgba(0,0,0,0.08); display:none; }
 .painel.ativo { display:block; animation:entrar-cima 0.4s ease; }
 h2 { color:#333; margin-bottom:22px; font-size:21px; background:linear-gradient(135deg,#667eea,#764ba2); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; }
 input, select, textarea { width:100%; padding:12px; margin:8px 0; border:2px solid #e8e8e8; border-radius:10px; font-size:14px; font-family:'Segoe UI',Arial,sans-serif; transition:all 0.3s; background:#fafafa; }
@@ -860,46 +1175,56 @@ th { background:linear-gradient(135deg,#f8f9fa,#eef2f7); font-weight:bold; color
 .filtros { display:flex; gap:10px; margin-bottom:15px; flex-wrap:wrap; align-items:center; }
 .filtros input, .filtros select { margin:0; width:auto; min-width:150px; }
 label { font-size:13px; color:#555; font-weight:bold; display:block; margin-top:8px; }
-.tab-badge { position:relative; }
-.badge-notificacao { position:absolute; top:-5px; right:-8px; background:#f44336; color:white; border-radius:50%; width:20px; height:20px; font-size:11px; display:flex; align-items:center; justify-content:center; font-weight:bold; box-shadow:0 2px 8px rgba(244,67,54,0.5); animation:pulse-badge 2s infinite; }
-@keyframes pulse-badge { 0%,100%{transform:scale(1)} 50%{transform:scale(1.15)} }
-.solic-card { background:linear-gradient(135deg,#fff,#fafafa); border:2px solid #e0e0e0; border-left:5px solid #ff9800; border-radius:14px; padding:18px; margin:12px 0; transition:all 0.3s; box-shadow:0 3px 10px rgba(0,0,0,0.05); }
-.solic-card:hover { transform:translateX(4px); box-shadow:0 6px 20px rgba(0,0,0,0.1); }
-.solic-card.atraso-alto { border-left-color:#f44336; background:linear-gradient(135deg,#fff,#fff5f5); }
-.solic-header { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:10px; }
-.solic-nome { font-size:16px; font-weight:bold; color:#333; }
-.solic-tipo { font-size:12px; padding:4px 10px; border-radius:20px; font-weight:bold; color:white; }
-.tipo-entrada-bg { background:linear-gradient(135deg,#4CAF50,#66bb6a); }
-.tipo-saida-almoco-bg { background:linear-gradient(135deg,#ff9800,#ffb74d); }
-.tipo-retorno-almoco-bg { background:linear-gradient(135deg,#2196F3,#64b5f6); }
-.tipo-saida-bg { background:linear-gradient(135deg,#f44336,#ef5350); }
-.solic-detalhes { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:8px; margin:10px 0; }
-.solic-detalhe-item { background:#f5f5f5; padding:8px 10px; border-radius:8px; font-size:12px; }
-.solic-detalhe-item strong { display:block; color:#888; font-size:10px; text-transform:uppercase; margin-bottom:2px; }
-.solic-justificativa { background:linear-gradient(135deg,#fff8e1,#ffecb3); border-radius:10px; padding:10px 12px; margin:10px 0; font-size:13px; color:#e65100; border-left:3px solid #ff9800; }
-.solic-acoes { display:flex; gap:10px; margin-top:12px; }
-.solic-acoes button { flex:1; padding:10px; font-size:13px; }
-.alerta-solic-vazio { text-align:center; padding:40px; color:#999; font-size:15px; }
-.alerta-solic-vazio .icone-grande { font-size:50px; display:block; margin-bottom:15px; opacity:0.5; }
-.motivo-input { width:100%; padding:10px; margin:8px 0; border:2px solid #e0e0e0; border-radius:8px; font-size:13px; resize:vertical; min-height:60px; }
+.lista-autorizacoes { display:grid; gap:15px; margin-top:15px; }
+.card-autorizacao { background:linear-gradient(135deg,#fff8e1,#ffe0b2); border-left:5px solid #ff9800; border-radius:14px; padding:20px; box-shadow:0 4px 15px rgba(255,152,0,0.15); position:relative; }
+.card-autorizacao.urgente { animation:pulsar-alerta 1.5s infinite; }
+.card-autorizacao .cabecalho { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:12px; }
+.card-autorizacao .nome { font-size:18px; font-weight:bold; color:#bf360c; }
+.card-autorizacao .tipo { display:inline-block; padding:4px 12px; border-radius:20px; font-size:12px; font-weight:bold; color:white; }
+.card-autorizacao .detalhes { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px; font-size:13px; }
+.card-autorizacao .det-item { background:rgba(255,255,255,0.6); padding:8px 12px; border-radius:8px; }
+.card-autorizacao .det-label { font-size:10px; color:#888; text-transform:uppercase; font-weight:bold; }
+.card-autorizacao .det-valor { font-weight:bold; color:#333; margin-top:2px; }
+.card-autorizacao .diferenca { text-align:center; padding:12px; background:linear-gradient(135deg,#ff5722,#f44336); color:white; border-radius:10px; font-weight:bold; margin-bottom:15px; }
+.card-autorizacao .acoes { display:flex; gap:10px; }
+.card-autorizacao .acoes button { flex:1; padding:12px; font-size:13px; }
+.card-autorizacao textarea { width:100%; margin-bottom:10px; min-height:60px; resize:vertical; position:relative; z-index:10; pointer-events:auto; background:white; border:2px solid #e8e8e8; border-radius:10px; padding:12px; font-size:14px; font-family:'Segoe UI',Arial,sans-serif; transition:all 0.3s; }
+.card-autorizacao textarea:focus { border-color:#667eea; background:white; outline:none; box-shadow:0 0 0 4px rgba(102,126,234,0.1); }
+.tempo-urgencia { position:absolute; top:15px; right:15px; font-size:11px; color:#e65100; font-weight:bold; background:rgba(255,255,255,0.7); padding:3px 8px; border-radius:10px; }
+.vazio-aut { text-align:center; padding:40px; color:#999; font-size:14px; }
+.vazio-aut .icone { font-size:48px; margin-bottom:10px; opacity:0.5; }
+.db-status { position:absolute; left:20px; top:50%; transform:translateY(-50%); background:rgba(255,255,255,0.2); padding:6px 12px; border-radius:15px; font-size:11px; border:1px solid rgba(255,255,255,0.3); backdrop-filter:blur(5px); }
+.db-status .ponto { display:inline-block; width:8px; height:8px; background:#4CAF50; border-radius:50%; margin-right:5px; animation:pulsar-alerta 2s infinite; }
 </style>
 </head>
 <body>
 <div class="header">
+<div class="db-status"><span class="ponto"></span>""" + ("POSTGRES" if USAR_POSTGRES else "SQLITE") + """ PERSISTENTE</div>
 <div class="header-content">
 <img src="/static/logo.png?t=""" + ts + """" alt="Logo" class="logo-header" onerror="this.outerHTML='<div class=\\'logo-header-fallback\\'>🏥</div>'">
 <h1>⚙️ Painel Administrativo</h1>
 </div>
 <div class="logout" onclick="sair()">🚪 Sair</div>
 </div>
+<div class="alerta-autorizacoes" id="alertaAut" onclick="abrir('autorizacoes',this)">
+<div class="conteudo">
+<span class="icone">⏰</span>
+<span><span id="qtdAut">0</span> SOLICITAÇÃO(ÕES) DE AUTORIZAÇÃO PENDENTE(S)!</span>
+<span class="badge" id="badgeAut">0</span>
+<span style="margin-left:10px;font-size:12px;opacity:0.9;">→ Clique para ver</span>
+</div>
+</div>
 <div class="container">
 <div class="tabs">
 <button class="tab ativo" onclick="abrir('cadastro',this)">👤 Cadastrar</button>
 <button class="tab" onclick="abrir('funcionarios',this)">📋 Funcionários</button>
 <button class="tab" onclick="abrir('registros',this)">📊 Registros</button>
+<button class="tab" onclick="abrir('autorizacoes',this)">
+⏰ Autorizações
+<span class="badge-aut" id="tabBadgeAut">0</span>
+</button>
 <button class="tab" onclick="abrir('relatorios',this)">📄 Relatórios PDF</button>
 <button class="tab" onclick="abrir('qrcode',this)">📱 QR Code</button>
-<button class="tab tab-badge" onclick="abrir('solicitacoes',this)" id="tabSolicitacoes">📨 Solicitações <span class="badge-notificacao" id="badgeSolic" style="display:none;">0</span></button>
 <button class="tab" onclick="abrir('acessos',this)">📡 Acessos</button>
 <button class="tab" onclick="abrir('config',this)">🔧 Configurações</button>
 </div>
@@ -936,7 +1261,17 @@ label { font-size:13px; color:#555; font-weight:bold; display:block; margin-top:
 </select>
 <button onclick="carregarRegs()">🔄 Atualizar</button>
 </div>
-<table><thead><tr><th>Funcionário</th><th>CPF</th><th>Data</th><th>Hora</th><th>Tipo</th><th>Atrasado</th><th>Min.</th><th>Banco</th><th>Justificativa</th><th>IP</th></tr></thead><tbody id="tbodyReg"></tbody></table>
+<table><thead><tr><th>Funcionário</th><th>CPF</th><th>Data</th><th>Hora</th><th>Tipo</th><th>Atrasado</th><th>Min.</th><th>Banco</th><th>Justificativa</th><th>Aut.</th><th>IP</th></tr></thead><tbody id="tbodyReg"></tbody></table>
+</div>
+<div id="autorizacoes" class="painel">
+<h2>⏰ Solicitações de Autorização Pendentes</h2>
+<div class="info-box">
+<strong>ℹ️ Como funciona:</strong> Quando um funcionário tenta registrar ponto fora do horário padrão, sua tela fica bloqueada até que você aprove ou rejeite.
+</div>
+<button onclick="carregarAutorizacoes()">🔄 Atualizar</button>
+<div class="lista-autorizacoes" id="listaAut">
+<div class="vazio-aut"><div class="icone">✅</div>Nenhuma solicitação pendente no momento.</div>
+</div>
 </div>
 <div id="relatorios" class="painel">
 <h2>Gerar Relatórios em PDF</h2>
@@ -958,15 +1293,9 @@ label { font-size:13px; color:#555; font-weight:bold; display:block; margin-top:
 </div>
 <div id="qrcode" class="painel">
 <h2>📱 QR Code do Sistema</h2>
-<div class="qr-info"><p><strong>URL Local:</strong></p><p id="urlLocal" style="font-weight:bold;color:#1565c0;"></p></div>
+<div class="qr-info"><p><strong>URL:</strong></p><p id="urlLocal" style="font-weight:bold;color:#1565c0;"></p></div>
 <button onclick="gerarQR()">🔄 Gerar/Atualizar QR Code</button>
 <div id="qrImg" style="margin-top:20px;"></div>
-</div>
-<div id="solicitacoes" class="painel">
-<h2>📨 Solicitações Pendentes de Aprovação</h2>
-<div class="info-box">⚠️ Funcionários com atraso superior a 5 minutos precisam de sua aprovação para registrar o ponto. A tela do funcionário fica bloqueada até sua decisão.</div>
-<button onclick="carregarSolicitacoes()">🔄 Atualizar Lista</button>
-<div id="listaSolicitacoes"></div>
 </div>
 <div id="acessos" class="painel">
 <h2>📡 Registros de Acesso de Dispositivos</h2>
@@ -976,12 +1305,29 @@ label { font-size:13px; color:#555; font-weight:bold; display:block; margin-top:
 <div id="config" class="painel">
 <h2>🔧 Configurações</h2>
 <div class="card">
+<h3 style="margin-bottom:10px;">💾 Status do Banco de Dados</h3>
+<p style="font-size:14px;line-height:1.6;">
+<strong>Banco em uso:</strong> """ + ("PostgreSQL (PERSISTENTE)" if USAR_POSTGRES else "SQLite Local") + """<br>
+<strong>Persistência:</strong> """ + ("✅ DADOS PERMANENTES - NÃO se perdem em reinícios" if USAR_POSTGRES else "⚠️ SQLite local - em produção use PostgreSQL") + """<br>
+""" + ("<strong>URL:</strong> " + DATABASE_URL[:60] + "..." if USAR_POSTGRES else "<strong>Arquivo:</strong> ponto.db") + """
+</p>
+</div>
+<div class="card">
 <h3 style="margin-bottom:10px;">🖼️ Logo da Clínica</h3>
-<p style="font-size:14px;line-height:1.6;">Coloque sua logo em <strong>static/logo.png</strong> (formato PNG).<br>Se não aparecer, pressione <strong>Ctrl+F5</strong>.</p>
+<p style="font-size:14px;line-height:1.6;">Coloque sua logo em <strong>static/logo.png</strong> (formato PNG).</p>
 </div>
 <div class="card">
 <h3 style="margin-bottom:10px;">🔐 Credenciais de Acesso</h3>
-<p style="font-size:14px;"><strong>Usuário:</strong> admin<br><strong>Senha:</strong> 3223ronte</p>
+<p style="font-size:14px;"><strong>Usuário:</strong> """ + ADMIN_USUARIO + """<br><strong>Senha:</strong> """ + ("*" * len(ADMIN_SENHA)) + """</p>
+</div>
+<div class="card">
+<h3 style="margin-bottom:10px;">⏰ Sistema de Autorização</h3>
+<p style="font-size:14px;line-height:1.6;">
+• Funcionários que registram <strong>fora do horário</strong> precisam de sua autorização<br>
+• A tela do funcionário fica <strong>bloqueada</strong> até sua resposta<br>
+• Solicitações expiram após <strong>5 minutos</strong><br>
+• Você recebe <strong>alertas em tempo real</strong> nesta página
+</p>
 </div>
 <div class="card">
 <h3 style="margin-bottom:10px;">🛡️ Segurança</h3>
@@ -1002,109 +1348,20 @@ const h=new Date();const ma=h.toISOString().slice(0,7);
 document.getElementById('mesAno').value=ma;document.getElementById('mesAnoFunc').value=ma;
 document.getElementById('urlLocal').textContent=window.location.origin+'/';
 document.getElementById('cpfCad').addEventListener('input',function(){this.value=this.value.replace(/\\D/g,'');});
-let pollingAdmin=null;
+let audioAlerta=null;
+try{audioAlerta=new Audio('data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2teleQkFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYIG2m98OScTgwOUarm7blmFgU7k9n1unEiBC13yO/eizEIHWq+8+OWT');}catch(e){}
 function abrir(n,btn){
   document.querySelectorAll('.painel').forEach(p=>p.classList.remove('ativo'));
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('ativo'));
-  document.getElementById(n).classList.add('ativo');btn.classList.add('ativo');
+  document.getElementById(n).classList.add('ativo');
+  if(btn)btn.classList.add('ativo');
+  else{document.querySelectorAll('.tab').forEach(t=>{if(t.textContent.includes(n.substring(0,4).toUpperCase()))t.classList.add('ativo');});}
   if(n==='funcionarios')carregarFuncs();
   if(n==='registros')carregarRegs();
   if(n==='relatorios')carregarSel();
   if(n==='acessos')carregarAcessos();
-  if(n==='solicitacoes')carregarSolicitacoes();
+  if(n==='autorizacoes')carregarAutorizacoes();
 }
-
-// Iniciar polling para verificar solicitações pendentes e atualizar badge
-function iniciarPollingAdmin(){
-  pararPollingAdmin();
-  pollingAdmin=setInterval(atualizarBadgeSolic,5000);
-  atualizarBadgeSolic();
-}
-function pararPollingAdmin(){if(pollingAdmin){clearInterval(pollingAdmin);pollingAdmin=null;}}
-
-async function atualizarBadgeSolic(){
-  try{
-    const r=await fetch('/api/solicitacoes_pendentes');
-    if(r.status===401){window.location.href='/admin';return;}
-    const d=await r.json();
-    const badge=document.getElementById('badgeSolic');
-    if(d.length>0){
-      badge.style.display='flex';
-      badge.textContent=d.length;
-    }else{
-      badge.style.display='none';
-    }
-  }catch(e){}
-}
-
-async function carregarSolicitacoes(){
-  const r=await fetch('/api/solicitacoes_pendentes');
-  if(r.status===401){window.location.href='/admin';return;}
-  const d=await r.json();
-  const lista=document.getElementById('listaSolicitacoes');
-  
-  if(d.length===0){
-    lista.innerHTML='<div class="alerta-solic-vazio"><span class="icone-grande">✅</span>Nenhuma solicitação pendente no momento.</div>';
-    return;
-  }
-  
-  lista.innerHTML=d.map(function(s){
-    const ct='tipo-'+s.tipo.toLowerCase().replace(/_/g,'-')+'-bg';
-    const atrasoClasse=s.minutos_atraso>=15?'solic-card atraso-alto':'solic-card';
-    const justificativa=s.justificativa?'<div class="solic-justificativa">📝 <strong>Justificativa:</strong> '+s.justificativa+'</div>':'';
-    return '<div class="'+atrasoClasse+'" id="solic-'+s.id+'">'+
-      '<div class="solic-header">'+
-        '<div class="solic-nome">👤 '+s.nome+'</div>'+
-        '<span class="solic-tipo '+ct+'">'+s.tipo_formatado+'</span>'+
-      '</div>'+
-      '<div class="solic-detalhes">'+
-        '<div class="solic-detalhe-item"><strong>Data</strong>'+s.data+'</div>'+
-        '<div class="solic-detalhe-item"><strong>Hora</strong>'+s.hora+'</div>'+
-        '<div class="solic-detalhe-item"><strong>Atraso</strong><span style="color:#f44336;font-weight:bold;">'+s.minutos_atraso+' min</span></div>'+
-        '<div class="solic-detalhe-item"><strong>CPF</strong>'+s.cpf+'</div>'+
-        '<div class="solic-detalhe-item"><strong>Horário Padrão</strong>'+(s.tipo==='SAIDA'?s.horario_saida:s.horario_entrada)+'</div>'+
-        '<div class="solic-detalhe-item"><strong>IP</strong><span style="font-size:10px;">'+(s.ip||'-')+'</span></div>'+
-      '</div>'+
-      justificativa+
-      '<div class="solic-acoes">'+
-        '<button class="btn-success" onclick="aprovarSolic('+s.id+')">✅ ACEITAR ATRASO</button>'+
-        '<button class="btn-danger" onclick="negarSolic('+s.id+')">❌ NEGAR</button>'+
-      '</div>'+
-    '</div>';
-  }).join('');
-}
-
-async function aprovarSolic(id){
-  if(!confirm('✅ Confirmar aprovação?\n\nO ponto será registrado para este funcionário.'))return;
-  try{
-    const r=await fetch('/api/solicitacoes/'+id+'/aprovar',{method:'POST',headers:{'Content-Type':'application/json'}});
-    if(r.status===401){window.location.href='/admin';return;}
-    const d=await r.json();
-    if(r.ok){
-      alert('✅ Solicitação aprovada! Ponto registrado.');
-      carregarSolicitacoes();
-      atualizarBadgeSolic();
-    }else alert('❌ Erro: '+(d.detail||'Erro ao aprovar'));
-  }catch(e){alert('Erro de conexão!');}
-}
-
-async function negarSolic(id){
-  const motivo=prompt('❌ Informe o motivo da negativa (será exibido ao funcionário):');
-  if(motivo===null)return;
-  try{
-    const r=await fetch('/api/solicitacoes/'+id+'/negar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({motivo:motivo||'Não informado'})});
-    if(r.status===401){window.location.href='/admin';return;}
-    const d=await r.json();
-    if(r.ok){
-      alert('❌ Solicitação negada. O funcionário será notificado.');
-      carregarSolicitacoes();
-      atualizarBadgeSolic();
-    }else alert('❌ Erro: '+(d.detail||'Erro ao negar'));
-  }catch(e){alert('Erro de conexão!');}
-}
-
-// Iniciar polling quando a página carregar
-setTimeout(iniciarPollingAdmin,1000);
 function sair(){document.cookie='sessao_admin=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';window.location.href='/admin';}
 function msg(id,texto,tipo){const e=document.getElementById(id);e.textContent=texto;e.className='mensagem '+tipo;setTimeout(()=>e.className='mensagem',4000);}
 async function cadastrar(){
@@ -1112,7 +1369,7 @@ async function cadastrar(){
   if(!d.nome||!d.cpf){msg('msgCad','Preencha nome e CPF!','erro');return;}
   if(d.cpf.length!==11){msg('msgCad','CPF deve ter 11 dígitos!','erro');return;}
   const r=await fetch('/api/funcionarios',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});
-  if(r.ok){msg('msgCad','✅ Funcionário cadastrado!','sucesso');document.getElementById('nome').value='';document.getElementById('cpfCad').value='';}
+  if(r.ok){msg('msgCad','✅ Funcionário cadastrado permanentemente!','sucesso');document.getElementById('nome').value='';document.getElementById('cpfCad').value='';}
   else{const e=await r.json();msg('msgCad','❌ '+(e.detail||'Erro'),'erro');}
 }
 async function carregarFuncs(){
@@ -1121,7 +1378,7 @@ async function carregarFuncs(){
   if(d.length===0){tb.innerHTML='<tr><td colspan="8" style="text-align:center;color:#999;padding:20px;">Nenhum cadastrado.</td></tr>';return;}
   tb.innerHTML=d.map(f=>'<tr><td>'+f.id+'</td><td>'+f.nome+'</td><td>'+f.cpf+'</td><td><strong>'+f.horario_entrada+'</strong></td><td>'+f.horario_saida_almoco+'</td><td>'+f.horario_retorno_almoco+'</td><td><strong>'+f.horario_saida+'</strong></td><td><button class="btn-danger btn-small" onclick="excluir('+f.id+')">Excluir</button></td></tr>').join('');
 }
-async function excluir(id){if(confirm('Tem CERTEZA? Todos os registros serão APAGADOS!')){const r=await fetch('/api/funcionarios/'+id,{method:'DELETE'});if(r.status===401){window.location.href='/admin';return;}carregarFuncs();}}
+async function excluir(id){if(confirm('Tem CERTEZA? Todos os registros serão APAGADOS permanentemente!')){const r=await fetch('/api/funcionarios/'+id,{method:'DELETE'});if(r.status===401){window.location.href='/admin';return;}carregarFuncs();}}
 async function carregarRegs(){
   const r=await fetch('/api/registros');if(r.status===401){window.location.href='/admin';return;}
   let d=await r.json();
@@ -1130,15 +1387,16 @@ async function carregarRegs(){
   if(fn)d=d.filter(x=>x.nome.toLowerCase().includes(fn));
   if(ft)d=d.filter(x=>x.tipo===ft);
   const tb=document.getElementById('tbodyReg');
-  if(d.length===0){tb.innerHTML='<tr><td colspan="10" style="text-align:center;color:#999;padding:20px;">Nenhum registro.</td></tr>';return;}
+  if(d.length===0){tb.innerHTML='<tr><td colspan="11" style="text-align:center;color:#999;padding:20px;">Nenhum registro.</td></tr>';return;}
   tb.innerHTML=d.map(function(r){
     const ct='tipo-'+r.tipo.toLowerCase().replace(/_/g,'-');
     const cf=r.dia_semana>=5?' fim-semana':'';
     const mh=r.minutos_atraso>0?'<span class="minutos-cell">'+r.minutos_atraso+'</span>':'-';
     const bh=r.minutos_banco_horas>0?'<span class="banco-cell">+'+r.minutos_banco_horas+'</span>':'-';
     const jt=r.justificativa?'<span class="justificativa-cell" title="'+r.justificativa.replace(/"/g,'&quot;')+'">'+r.justificativa+'</span>':'<span style="color:#ccc;">-</span>';
+    const aut=r.autorizado_admin?'<span style="color:#4CAF50;font-weight:bold;">✅</span>':'-';
     const ip=r.ip_dispositivo||'<span style="color:#ccc;">-</span>';
-    return '<tr class="'+cf+'"><td>'+r.nome+'</td><td>'+r.cpf+'</td><td>'+r.data+'</td><td>'+r.hora+'</td><td class="'+ct+'">'+r.tipo_formatado+'</td><td class="'+(r.atrasado?'atrasado':'')+'">'+(r.atrasado?'⚠️ SIM':'✅ NÃO')+'</td><td>'+mh+'</td><td>'+bh+'</td><td>'+jt+'</td><td style="font-size:11px;color:#888;">'+ip+'</td></tr>';
+    return '<tr class="'+cf+'"><td>'+r.nome+'</td><td>'+r.cpf+'</td><td>'+r.data+'</td><td>'+r.hora+'</td><td class="'+ct+'">'+r.tipo_formatado+'</td><td class="'+(r.atrasado?'atrasado':'')+'">'+(r.atrasado?'⚠️ SIM':'✅ NÃO')+'</td><td>'+mh+'</td><td>'+bh+'</td><td>'+jt+'</td><td>'+aut+'</td><td style="font-size:11px;color:#888;">'+ip+'</td></tr>';
   }).join('');
 }
 async function carregarSel(){
@@ -1161,9 +1419,199 @@ async function carregarAcessos(){
   if(d.length===0){tb.innerHTML='<tr><td colspan="6" style="text-align:center;color:#999;padding:20px;">Nenhum acesso registrado.</td></tr>';return;}
   tb.innerHTML=d.map(a=>'<tr><td>'+a.data_hora+'</td><td>'+a.cpf+'</td><td>'+(a.nome||'<span style="color:#999;">-</span>')+'</td><td style="font-size:11px;color:#555;">'+a.ip+'</td><td style="font-size:10px;color:#888;max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="'+(a.user_agent||'').replace(/"/g,'&quot;')+'">'+(a.user_agent||'-')+'</td><td>'+a.tipo_acesso+'</td></tr>').join('');
 }
+let qtdAnterior=0;
+async function verificarAutorizacoesPendentes(){
+  try{
+    const r=await fetch('/api/autorizacoes_pendentes');
+    if(r.status===401){window.location.href='/admin';return;}
+    const d=await r.json();
+    const qtd=d.length||0;
+    
+    document.getElementById('qtdAut').textContent=qtd;
+    document.getElementById('badgeAut').textContent=qtd;
+    document.getElementById('tabBadgeAut').textContent=qtd;
+    
+    const alerta=document.getElementById('alertaAut');
+    const tabBadge=document.getElementById('tabBadgeAut');
+    
+    if(qtd>0){
+      alerta.classList.add('visivel');
+      tabBadge.classList.add('visivel');
+      if(qtd>qtdAnterior && audioAlerta){
+        try{audioAlerta.play().catch(()=>{});}catch(e){}
+      }
+    }else{
+      alerta.classList.remove('visivel');
+      tabBadge.classList.remove('visivel');
+    }
+    
+    qtdAnterior=qtd;
+    
+    if(document.getElementById('autorizacoes').classList.contains('ativo')){
+      renderizarAutorizacoes(d);
+    }
+  }catch(e){}
+}
+function carregarAutorizacoes(){
+  verificarAutorizacoesPendentes();
+}
+function renderizarAutorizacoes(lista){
+  const el=document.getElementById('listaAut');
+  if(!lista||lista.length===0){
+    el.innerHTML='<div class="vazio-aut"><div class="icone">✅</div>Nenhuma solicitação pendente no momento.</div>';
+    return;
+  }
+  
+  const coresTipo={
+    'ENTRADA':'linear-gradient(135deg,#4CAF50,#66bb6a)',
+    'SAIDA_ALMOCO':'linear-gradient(135deg,#ff9800,#ffb74d)',
+    'RETORNO_ALMOCO':'linear-gradient(135deg,#2196F3,#64b5f6)',
+    'SAIDA':'linear-gradient(135deg,#f44336,#ef5350)'
+  };
+  
+  el.innerHTML=lista.map(s=>{
+    const urgente=s.segundos_restantes<60;
+    const textoDif=s.tipo_diferenca==='antecipado'
+      ? '⏰ REGISTRANDO '+s.minutos_diferenca+' MIN ANTES DO HORÁRIO'
+      : '⚠️ ATRASO DE '+s.minutos_diferenca+' MIN';
+    return '<div class="card-autorizacao'+(urgente?' urgente':'')+'" id="card-'+s.id+'">'+
+      '<div class="tempo-urgencia">⏱️ '+Math.floor(s.segundos_restantes/60)+':'+String(s.segundos_restantes%60).padStart(2,'0')+'</div>'+
+      '<div class="cabecalho">'+
+        '<div class="nome">👤 '+s.nome+'</div>'+
+        '<span class="tipo" style="background:'+(coresTipo[s.tipo]||'#666')+'">'+s.tipo_formatado+'</span>'+
+      '</div>'+
+      '<div class="detalhes">'+
+        '<div class="det-item"><div class="det-label">CPF</div><div class="det-valor">'+s.cpf+'</div></div>'+
+        '<div class="det-item"><div class="det-label">Solicitado</div><div class="det-valor">'+s.criado_em+'</div></div>'+
+        '<div class="det-item"><div class="det-label">Horário Padrão</div><div class="det-valor">🕐 '+s.horario_padrao+'</div></div>'+
+        '<div class="det-item"><div class="det-label">Horário Atual</div><div class="det-valor">⏰ '+s.hora_registro+'</div></div>'+
+      '</div>'+
+      '<div class="diferenca">'+textoDif+'</div>'+
+      '<div class="acoes">'+
+        '<button class="btn-danger" onclick="responderAutorizacao(\\''+s.id+'\\',false)">❌ NEGAR</button>'+
+        '<button class="btn-success" onclick="responderAutorizacao(\\''+s.id+'\\',true)">✅ APROVAR</button>'+
+      '</div>'+
+    '</div>';
+  }).join('');
+}
+async function responderAutorizacao(sid,aprovar){
+  try{
+    const r=await fetch('/api/responder_autorizacao',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({solicitacao_id:sid,aprovar:aprovar,resposta:''})
+    });
+    if(r.status===401){window.location.href='/admin';return;}
+    const d=await r.json();
+    
+    if(r.ok){
+      const card=document.getElementById('card-'+sid);
+      if(card){
+        card.style.opacity='0.5';
+        card.style.transform='scale(0.98)';
+        setTimeout(()=>{
+          carregarAutorizacoes();
+          verificarAutorizacoesPendentes();
+        },500);
+      }
+    }else{
+      alert('Erro: '+(d.detail||'Não foi possível responder'));
+    }
+  }catch(e){alert('Erro de conexão!');}
+}
+setInterval(verificarAutorizacoesPendentes,3000);
+verificarAutorizacoesPendentes();
 </script>
 </body>
 </html>"""
+
+# ===================== BACKUP E HISTORICO =====================
+os.makedirs(BACKUP_DIR, exist_ok=True)
+
+def salvar_historico_json():
+    try:
+        conn = get_db()
+        funcionarios = db_fetchall(conn, "SELECT * FROM funcionarios ORDER BY id")
+        registros = db_fetchall(conn, "SELECT * FROM registros_ponto ORDER BY data_hora")
+        acessos = db_fetchall(conn, "SELECT * FROM acessos_dispositivos ORDER BY data_hora_acesso")
+        conn.close()
+        
+        dados_historico = {
+            "meta": {
+                "versao_sistema": "4.2-PERSISTENTE",
+                "banco": "POSTGRESQL" if USAR_POSTGRES else "SQLITE",
+                "ultima_atualizacao": agora_brasilia().strftime("%Y-%m-%d %H:%M:%S"),
+                "total_funcionarios": len(funcionarios),
+                "total_registros_ponto": len(registros),
+                "total_acessos": len(acessos)
+            },
+            "funcionarios": [dict(f) for f in funcionarios],
+            "registros_ponto": [dict(r) for r in registros],
+            "acessos_dispositivos": [dict(a) for a in acessos]
+        }
+        
+        caminho_temp = HISTORICO_JSON + ".tmp"
+        with open(caminho_temp, "w", encoding="utf-8") as f:
+            json.dump(dados_historico, f, ensure_ascii=False, indent=2, default=str)
+        
+        os.replace(caminho_temp, HISTORICO_JSON)
+        print(f"[HISTORICO] Arquivo {HISTORICO_JSON} atualizado | {len(registros)} registros")
+        return True
+    except Exception as e:
+        print(f"[ERRO HISTORICO] Falha ao salvar historico JSON: {e}")
+        return False
+
+def fazer_backup_db():
+    try:
+        import shutil
+        timestamp = agora_brasilia().strftime("%Y%m%d_%H%M%S")
+        
+        if not USAR_POSTGRES:
+            caminho_backup = os.path.join(BACKUP_DIR, f"ponto_backup_{timestamp}.db")
+            conn = get_db()
+            db_execute(conn, "VACUUM INTO ?", (caminho_backup,))
+            conn.close()
+            print(f"[BACKUP] Banco SQLite copiado para: {caminho_backup}")
+        else:
+            caminho_backup = os.path.join(BACKUP_DIR, f"ponto_backup_{timestamp}.json")
+            salvar_historico_json()
+            import shutil as _shutil
+            if os.path.exists(HISTORICO_JSON):
+                _shutil.copy2(HISTORICO_JSON, caminho_backup)
+            print(f"[BACKUP] PostgreSQL - backup JSON criado: {caminho_backup}")
+        
+        try:
+            backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith("ponto_backup_")])
+            for backup_antigo in backups[:-10]:
+                os.remove(os.path.join(BACKUP_DIR, backup_antigo))
+        except: pass
+        
+        return caminho_backup
+    except Exception as e:
+        print(f"[ERRO BACKUP] Falha no backup: {e}")
+        return None
+
+def verificar_backup_periodico():
+    try:
+        arquivo_controle = os.path.join(BACKUP_DIR, ".ultimo_backup")
+        agora = agora_brasilia()
+        
+        if os.path.exists(arquivo_controle):
+            with open(arquivo_controle, "r") as f:
+                ultima_str = f.read().strip()
+            ultima_data = datetime.strptime(ultima_str, "%Y-%m-%d %H:%M:%S")
+            if (agora - ultima_data).total_seconds() < BACKUP_INTERVAL_HORAS * 3600:
+                return False
+        
+        caminho = fazer_backup_db()
+        if caminho:
+            with open(arquivo_controle, "w") as f:
+                f.write(agora.strftime("%Y-%m-%d %H:%M:%S"))
+            return True
+        return False
+    except Exception as e:
+        print(f"[ERRO] Verificacao backup periodico: {e}")
+        return False
 
 # ===================== SERVIDOR HTTP =====================
 class ServidorPonto(BaseHTTPRequestHandler):
@@ -1175,19 +1623,6 @@ class ServidorPonto(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         caminho = url.path
         params = parse_qs(url.query)
-        
-        # Rota de health check para monitoramento (UptimeBot / Render)
-        # Nao requer autenticacao, retorna rapido para manter o servidor acordado
-        if caminho == "/health" or caminho == "/healthz":
-            agora_ts = agora_brasilia().strftime("%Y-%m-%d %H:%M:%S")
-            responder_json(self, {
-                "status": "ok",
-                "servico": "sistema_ponto",
-                "versao": "3.0 SECURE",
-                "timestamp": agora_ts,
-                "uptime_config": "Monitorar a cada 5 minutos para evitar sleep no Render"
-            })
-            return
         
         if caminho == "/" or caminho == "/index.html":
             responder_html(self, gerar_html_ponto())
@@ -1215,8 +1650,6 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 self.send_response(200)
                 if nome_arquivo.endswith(".png"):
                     self.send_header("Content-Type", "image/png")
-                elif nome_arquivo.endswith(".jpg") or nome_arquivo.endswith(".jpeg"):
-                    self.send_header("Content-Type", "image/jpeg")
                 else:
                     self.send_header("Content-Type", "application/octet-stream")
                 self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
@@ -1237,7 +1670,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 return
             try:
                 conn = get_db()
-                func = conn.execute("SELECT * FROM funcionarios WHERE cpf = ?", (cpf,)).fetchone()
+                func = db_fetchone(conn, "SELECT * FROM funcionarios WHERE cpf = ?", (cpf,))
                 conn.close()
                 if func:
                     responder_json(self, {
@@ -1254,87 +1687,28 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
             return
         
-        rotas_admin = ["/api/funcionarios", "/api/registros", "/api/gerar_qrcode", "/api/pdf/geral", "/api/logout", "/api/acessos", "/api/solicitacoes_pendentes"]
-        precisa_login = (caminho in rotas_admin or caminho.startswith("/api/funcionarios/") or caminho.startswith("/api/pdf/funcionario/") or caminho.startswith("/api/solicitacoes/"))
-        
-        # Rota para funcionário consultar status da sua solicitação
-        if caminho.startswith("/api/solicitacao_status/"):
-            cpf = formatar_cpf(caminho.replace("/api/solicitacao_status/", ""))
-            if len(cpf) != 11:
-                responder_json(self, {"detail": "CPF inválido"}, status=400)
-                return
-            try:
-                conn = get_db()
-                # Buscar solicitação mais recente deste CPF
-                solic = conn.execute("""
-                    SELECT s.*, f.nome FROM solicitacoes_pendentes s
-                    JOIN funcionarios f ON s.funcionario_id = f.id
-                    WHERE s.cpf = ? ORDER BY s.id DESC LIMIT 1
-                """, (cpf,)).fetchone()
-                conn.close()
-                
-                if solic:
-                    responder_json(self, {
-                        "encontrada": True,
-                        "id": solic["id"],
-                        "status": solic["status"],
-                        "tipo": solic["tipo"],
-                        "tipo_formatado": solic["tipo"].replace("_", " "),
-                        "minutos_atraso": solic["minutos_atraso"] or 0,
-                        "data_hora": solic["data_hora_solicitacao"],
-                        "motivo_negacao": solic["motivo_negacao"] or "",
-                        "data_aprovacao": solic["data_hora_aprovacao"] or ""
-                    })
-                else:
-                    responder_json(self, {"encontrada": False})
-            except Exception as e:
-                responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
+        if caminho.startswith("/api/status_autorizacao/"):
+            sid = caminho.replace("/api/status_autorizacao/", "")
+            status = verificar_status_autorizacao(sid)
+            responder_json(self, status)
             return
+        
+        rotas_admin = ["/api/funcionarios", "/api/registros", "/api/gerar_qrcode", "/api/pdf/geral", "/api/logout", "/api/acessos", "/api/autorizacoes_pendentes"]
+        precisa_login = (caminho in rotas_admin or caminho.startswith("/api/funcionarios/") or caminho.startswith("/api/pdf/funcionario/") or caminho.startswith("/api/obter_registro/"))
         
         if precisa_login and not verificar_login(self):
             responder_json(self, {"detail": "Não autorizado. Faça login."}, status=401)
             return
         
-        if caminho == "/api/solicitacoes_pendentes":
-            try:
-                conn = get_db()
-                solics = conn.execute("""
-                    SELECT s.*, f.nome, f.horario_entrada, f.horario_saida_almoco, 
-                           f.horario_retorno_almoco, f.horario_saida
-                    FROM solicitacoes_pendentes s
-                    JOIN funcionarios f ON s.funcionario_id = f.id
-                    WHERE s.status = 'PENDENTE'
-                    ORDER BY s.data_hora_solicitacao ASC
-                """).fetchall()
-                conn.close()
-                resultado = []
-                for s in solics:
-                    dh = datetime.strptime(s["data_hora_solicitacao"], "%Y-%m-%d %H:%M:%S")
-                    resultado.append({
-                        "id": s["id"],
-                        "funcionario_id": s["funcionario_id"],
-                        "nome": s["nome"],
-                        "cpf": s["cpf"],
-                        "data": dh.strftime("%d/%m/%Y"),
-                        "hora": dh.strftime("%H:%M:%S"),
-                        "tipo": s["tipo"],
-                        "tipo_formatado": s["tipo"].replace("_", " "),
-                        "atrasado": bool(s["atrasado"]),
-                        "minutos_atraso": s["minutos_atraso"] or 0,
-                        "justificativa": s["justificativa"] or "",
-                        "ip": s["ip_dispositivo"] or "",
-                        "horario_entrada": s["horario_entrada"],
-                        "horario_saida": s["horario_saida"]
-                    })
-                responder_json(self, resultado)
-            except Exception as e:
-                responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
+        if caminho == "/api/autorizacoes_pendentes":
+            lista = listar_autorizacoes_pendentes()
+            responder_json(self, lista)
             return
         
         if caminho == "/api/funcionarios":
             try:
                 conn = get_db()
-                funcs = conn.execute("SELECT * FROM funcionarios ORDER BY nome").fetchall()
+                funcs = db_fetchall(conn, "SELECT * FROM funcionarios ORDER BY nome")
                 conn.close()
                 resultado = [{
                     "id": f["id"], "nome": f["nome"], "cpf": f["cpf"],
@@ -1351,11 +1725,11 @@ class ServidorPonto(BaseHTTPRequestHandler):
         if caminho == "/api/registros":
             try:
                 conn = get_db()
-                regs = conn.execute("""
+                regs = db_fetchall(conn, """
                     SELECT r.*, f.nome, f.cpf FROM registros_ponto r 
                     JOIN funcionarios f ON r.funcionario_id = f.id 
                     ORDER BY r.data_hora DESC
-                """).fetchall()
+                """)
                 conn.close()
                 resultado = []
                 dias_semana = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]
@@ -1370,6 +1744,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
                         "minutos_banco_horas": r["minutos_banco_horas"] or 0,
                         "justificativa": r["justificativa"] or "",
                         "ip_dispositivo": r["ip_dispositivo"] or "",
+                        "autorizado_admin": bool(r["autorizado_admin"] or 0),
                         "dia_semana": dh.weekday()
                     })
                 responder_json(self, resultado)
@@ -1377,14 +1752,41 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
             return
         
+        if caminho.startswith("/api/obter_registro/"):
+            try:
+                reg_id = int(caminho.replace("/api/obter_registro/", ""))
+                conn = get_db()
+                r = db_fetchone(conn, """
+                    SELECT r.*, f.nome FROM registros_ponto r 
+                    JOIN funcionarios f ON r.funcionario_id = f.id 
+                    WHERE r.id = ?
+                """, (reg_id,))
+                conn.close()
+                
+                if not r:
+                    responder_json(self, {"detail": "Registro não encontrado"}, status=404)
+                    return
+                
+                tipo_info = TIPOS_REGISTRO[r["tipo"]]
+                agora = datetime.strptime(r["data_hora"], "%Y-%m-%d %H:%M:%S")
+                msg = f"{tipo_info['icone']} {tipo_info['label']} registrada!\n"
+                msg += f"👤 {r['nome']}\n📅 {agora.strftime('%d/%m/%Y')}\n⏰ {agora.strftime('%H:%M:%S')}"
+                if r["atrasado"]: msg += f"\n⚠️ Atraso: {r['minutos_atraso'] or 0} min"
+                if (r["minutos_banco_horas"] or 0) > 0: msg += f"\n⏱️ Banco de horas: +{r['minutos_banco_horas']} min"
+                
+                responder_json(self, {"mensagem": msg})
+            except Exception as e:
+                responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
+            return
+        
         if caminho == "/api/acessos":
             try:
                 conn = get_db()
-                acs = conn.execute("""
+                acs = db_fetchall(conn, """
                     SELECT a.*, f.nome FROM acessos_dispositivos a 
                     LEFT JOIN funcionarios f ON a.funcionario_id = f.id 
                     ORDER BY a.data_hora_acesso DESC LIMIT 200
-                """).fetchall()
+                """)
                 conn.close()
                 resultado = []
                 for a in acs:
@@ -1482,735 +1884,4 @@ class ServidorPonto(BaseHTTPRequestHandler):
             dados = {}
         
         ip_cliente = obter_ip_cliente(self)
-        user_agent = sanitizar_texto(self.headers.get("User-Agent", ""), 500)
-        
-        if caminho == "/api/login":
-            if not verificar_rate_limit(ip_cliente):
-                responder_json(self, {"detail": "Muitas tentativas. Aguarde alguns minutos."}, status=429)
-                return
-            
-            usuario = sanitizar_texto(dados.get("usuario", ""), 50)
-            senha = sanitizar_texto(dados.get("senha", ""), 100)
-            
-            if usuario == ADMIN_USUARIO and senha == ADMIN_SENHA:
-                token = gerar_sessao()
-                sessoes_admin[token] = agora_brasilia() + timedelta(hours=8)
-                cookie = f"sessao_admin={token}; Path=/; Max-Age=28800; HttpOnly; SameSite=Lax"
-                tentativas_login.pop(ip_cliente, None)
-                print(f"[LOGIN OK] Admin de {ip_cliente}")
-                responder_json(self, {"status": "ok", "mensagem": "Login realizado"}, cookies_extra=[cookie])
-            else:
-                print(f"[LOGIN FALHA] {ip_cliente} user={usuario}")
-                responder_json(self, {"detail": "Usuário ou senha incorretos!"}, status=401)
-            return
-        
-        if caminho == "/api/funcionario/acessar":
-            cpf = formatar_cpf(dados.get("cpf", ""))
-            if len(cpf) != 11:
-                responder_json(self, {"detail": "CPF inválido! 11 dígitos."}, status=400)
-                return
-            
-            try:
-                conn = get_db()
-                func = conn.execute("SELECT * FROM funcionarios WHERE cpf = ?", (cpf,)).fetchone()
-                if not func:
-                    conn.close()
-                    responder_json(self, {"detail": "CPF não cadastrado!"}, status=404)
-                    return
-                
-                func_id = func["id"]
-                conn.close()
-                
-                registrar_acesso_dispositivo(cpf, func_id, ip_cliente, user_agent, "login_funcionario")
-                acessos_funcionarios[cpf] = {
-                    "funcionario_id": func_id,
-                    "ip": ip_cliente,
-                    "expira": agora_brasilia() + timedelta(hours=2)
-                }
-                
-                print(f"[ACESSO FUNC] {func['nome']} | IP: {ip_cliente}")
-                responder_json(self, {"status": "ok", "nome": func["nome"]})
-            except Exception as e:
-                responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
-            return
-        
-        if caminho == "/api/verificar_ponto":
-            cpf = formatar_cpf(dados.get("cpf", ""))
-            tipo = dados.get("tipo", "ENTRADA")
-            qr_code = dados.get("qr_code", "")
-            
-            if qr_code != SEGREDO_QR:
-                responder_json(self, {"detail": "QR Code inválido!"}, status=400)
-                return
-            if tipo not in TIPOS_REGISTRO:
-                responder_json(self, {"detail": "Tipo inválido!"}, status=400)
-                return
-            if len(cpf) != 11:
-                responder_json(self, {"detail": "CPF inválido! 11 dígitos."}, status=400)
-                return
-            
-            try:
-                conn = get_db()
-                func = conn.execute("SELECT * FROM funcionarios WHERE cpf = ?", (cpf,)).fetchone()
-                if not func:
-                    conn.close()
-                    responder_json(self, {"detail": "CPF não cadastrado!"}, status=404)
-                    return
-                
-                agora = agora_brasilia()
-                data_str = agora.strftime("%Y-%m-%d")
-                hora_str = agora.strftime("%H:%M:%S")
-                
-                ultimo = obter_ultimo_registro(func["id"], data_str)
-                ultimo_tipo = ultimo["tipo"] if ultimo else None
-                
-                valido, msg_erro = verificar_sequencia_valida(ultimo_tipo, tipo)
-                if not valido:
-                    conn.close()
-                    responder_json(self, {"detail": "⛔ " + msg_erro}, status=400)
-                    return
-                
-                if verificar_registro_duplicado(func["id"], data_str, tipo):
-                    conn.close()
-                    responder_json(self, {"detail": f"⛔ {TIPOS_REGISTRO[tipo]['label']} JÁ registrada hoje! Não é permitido duplicar."}, status=400)
-                    return
-                
-                atrasado = 0
-                minutos = 0
-                msg_just = ""
-                info = ""
-                
-                if tipo == "ENTRADA":
-                    atrasado = 1 if verificar_atraso(hora_str, func["horario_entrada"], tolerancia_minutos=5) else 0
-                    if atrasado:
-                        minutos = calcular_minutos(hora_str, func["horario_entrada"])
-                        msg_just = f"Atraso na ENTRADA. Horário padrão: {func['horario_entrada']} (tolerância: 5 min)."
-                        info = f"Atraso de {minutos} minuto(s)"
-                elif tipo == "SAIDA_ALMOCO":
-                    minutos_antes = calcular_minutos(func["horario_saida_almoco"], hora_str)
-                    if not verificar_atraso(hora_str, func["horario_saida_almoco"]) and minutos_antes >= 30:
-                        minutos = minutos_antes
-                        msg_just = f"Saída para almoço com {minutos_antes} min de antecedência. Padrão: {func['horario_saida_almoco']}."
-                        info = f"Antecedência de {minutos_antes} min"
-                elif tipo == "RETORNO_ALMOCO":
-                    atrasado = 1 if verificar_atraso(hora_str, func["horario_retorno_almoco"], tolerancia_minutos=5) else 0
-                    if atrasado:
-                        minutos = calcular_minutos(hora_str, func["horario_retorno_almoco"])
-                        msg_just = f"Atraso no RETORNO. Padrão: {func['horario_retorno_almoco']} (tolerância: 5 min)."
-                        info = f"Atraso de {minutos} minuto(s)"
-                elif tipo == "SAIDA":
-                    atrasado = 1 if verificar_atraso(func["horario_saida"], hora_str, tolerancia_minutos=5) else 0
-                    if atrasado:
-                        minutos = calcular_minutos(func["horario_saida"], hora_str)
-                        msg_just = f"SAÍDA ANTECIPADA. Padrão: {func['horario_saida']} (tolerância: 5 min)."
-                        info = f"Antecipada em {minutos} minuto(s)"
-                
-                conn.close()
-                # BLOQUEIO: se atrasado (já passou da tolerância de 5min), precisa de aprovação admin
-                bloqueado = (atrasado == 1)
-                responder_json(self, {
-                    "precisa_justificativa": (minutos > 0 and not bloqueado),
-                    "bloqueado": bloqueado,
-                    "mensagem_justificativa": msg_just,
-                    "info_atraso": info,
-                    "minutos_atraso": minutos,
-                    "atrasado": atrasado
-                })
-            except Exception as e:
-                responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
-            return
-        
-        if caminho == "/api/solicitar_ponto":
-            cpf = formatar_cpf(dados.get("cpf", ""))
-            tipo = dados.get("tipo", "ENTRADA")
-            qr_code = dados.get("qr_code", "")
-            justificativa = sanitizar_texto(dados.get("justificativa", ""), 500)
-            
-            if qr_code != SEGREDO_QR:
-                responder_json(self, {"detail": "QR Code inválido!"}, status=400)
-                return
-            if tipo not in TIPOS_REGISTRO:
-                responder_json(self, {"detail": "Tipo inválido!"}, status=400)
-                return
-            if len(cpf) != 11:
-                responder_json(self, {"detail": "CPF inválido!"}, status=400)
-                return
-            
-            try:
-                conn = get_db()
-                func = conn.execute("SELECT * FROM funcionarios WHERE cpf = ?", (cpf,)).fetchone()
-                if not func:
-                    conn.close()
-                    responder_json(self, {"detail": "CPF não cadastrado!"}, status=404)
-                    return
-                
-                agora = agora_brasilia()
-                data_str = agora.strftime("%Y-%m-%d")
-                data_hora_str = agora.strftime("%Y-%m-%d %H:%M:%S")
-                hora_str = agora.strftime("%H:%M:%S")
-                
-                ultimo = obter_ultimo_registro(func["id"], data_str)
-                ultimo_tipo = ultimo["tipo"] if ultimo else None
-                
-                valido, msg_erro = verificar_sequencia_valida(ultimo_tipo, tipo)
-                if not valido:
-                    conn.close()
-                    responder_json(self, {"detail": "⛔ " + msg_erro}, status=400)
-                    return
-                
-                if verificar_registro_duplicado(func["id"], data_str, tipo):
-                    conn.close()
-                    responder_json(self, {"detail": f"⛔ {TIPOS_REGISTRO[tipo]['label']} JÁ registrada hoje!"}, status=400)
-                    return
-                
-                # Verificar se já existe solicitação pendente para este tipo hoje
-                solic_existente = conn.execute("""
-                    SELECT id FROM solicitacoes_pendentes 
-                    WHERE funcionario_id = ? AND strftime('%Y-%m-%d', data_hora_solicitacao) = ? 
-                    AND tipo = ? AND status = 'PENDENTE' LIMIT 1
-                """, (func["id"], data_str, tipo)).fetchone()
-                
-                if solic_existente:
-                    conn.close()
-                    responder_json(self, {
-                        "status": "ja_existe",
-                        "solicitacao_id": solic_existente["id"],
-                        "mensagem": "Já existe uma solicitação pendente de aprovação."
-                    })
-                    return
-                
-                # Calcular atraso para registrar na solicitação
-                atrasado = 0
-                minutos_atraso = 0
-                if tipo == "ENTRADA":
-                    atrasado = 1 if verificar_atraso(hora_str, func["horario_entrada"], tolerancia_minutos=5) else 0
-                    if atrasado: minutos_atraso = calcular_minutos(hora_str, func["horario_entrada"])
-                elif tipo == "RETORNO_ALMOCO":
-                    atrasado = 1 if verificar_atraso(hora_str, func["horario_retorno_almoco"], tolerancia_minutos=5) else 0
-                    if atrasado: minutos_atraso = calcular_minutos(hora_str, func["horario_retorno_almoco"])
-                elif tipo == "SAIDA":
-                    atrasado = 1 if verificar_atraso(func["horario_saida"], hora_str, tolerancia_minutos=5) else 0
-                    if atrasado: minutos_atraso = calcular_minutos(func["horario_saida"], hora_str)
-                
-                conn.execute("""
-                    INSERT INTO solicitacoes_pendentes 
-                    (funcionario_id, cpf, data_hora_solicitacao, tipo, atrasado, minutos_atraso, 
-                     justificativa, status, ip_dispositivo, user_agent)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDENTE', ?, ?)
-                """, (func["id"], cpf, data_hora_str, tipo, atrasado, minutos_atraso, 
-                      justificativa, ip_cliente, user_agent))
-                conn.commit()
-                
-                solic_id = conn.execute("SELECT last_insert_rowid() as id").fetchone()["id"]
-                conn.close()
-                
-                tipo_info = TIPOS_REGISTRO[tipo]
-                print(f"[SOLICITAÇÃO #{solic_id}] {func['nome']} | {tipo} | Atraso: {minutos_atraso}min | IP:{ip_cliente}")
-                
-                responder_json(self, {
-                    "status": "solicitado",
-                    "solicitacao_id": solic_id,
-                    "mensagem": f"Solicitação enviada para aprovação do administrador.\n\n{tipo_info['icone']} {tipo_info['label']}\n👤 {func['nome']}\n⏰ {hora_str}\n⚠️ Atraso: {minutos_atraso} min\n\nAguarde a aprovação..."
-                })
-            except Exception as e:
-                responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
-            return
-        
-        if caminho == "/api/bater_ponto":
-            cpf = formatar_cpf(dados.get("cpf", ""))
-            tipo = dados.get("tipo", "ENTRADA")
-            qr_code = dados.get("qr_code", "")
-            justificativa = sanitizar_texto(dados.get("justificativa", ""), 500)
-            
-            if qr_code != SEGREDO_QR:
-                responder_json(self, {"detail": "QR Code inválido!"}, status=400)
-                return
-            if tipo not in TIPOS_REGISTRO:
-                responder_json(self, {"detail": "Tipo inválido!"}, status=400)
-                return
-            if len(cpf) != 11:
-                responder_json(self, {"detail": "CPF inválido!"}, status=400)
-                return
-            
-            try:
-                conn = get_db()
-                func = conn.execute("SELECT * FROM funcionarios WHERE cpf = ?", (cpf,)).fetchone()
-                if not func:
-                    conn.close()
-                    responder_json(self, {"detail": "CPF não cadastrado!"}, status=404)
-                    return
-                
-                agora = agora_brasilia()
-                data_str = agora.strftime("%Y-%m-%d")
-                data_hora_str = agora.strftime("%Y-%m-%d %H:%M:%S")
-                hora_str = agora.strftime("%H:%M:%S")
-                horario_acesso = agora.strftime("%Y-%m-%d %H:%M:%S")
-                
-                ultimo = obter_ultimo_registro(func["id"], data_str)
-                ultimo_tipo = ultimo["tipo"] if ultimo else None
-                
-                valido, msg_erro = verificar_sequencia_valida(ultimo_tipo, tipo)
-                if not valido:
-                    conn.close()
-                    responder_json(self, {"detail": "⛔ " + msg_erro}, status=400)
-                    return
-                
-                if verificar_registro_duplicado(func["id"], data_str, tipo):
-                    conn.close()
-                    responder_json(self, {"detail": f"⛔ {TIPOS_REGISTRO[tipo]['label']} JÁ registrada hoje!"}, status=400)
-                    return
-                
-                atrasado = 0
-                minutos_atraso = 0
-                
-                if tipo == "ENTRADA":
-                    atrasado = 1 if verificar_atraso(hora_str, func["horario_entrada"], tolerancia_minutos=5) else 0
-                    if atrasado: minutos_atraso = calcular_minutos(hora_str, func["horario_entrada"])
-                elif tipo == "RETORNO_ALMOCO":
-                    atrasado = 1 if verificar_atraso(hora_str, func["horario_retorno_almoco"], tolerancia_minutos=5) else 0
-                    if atrasado: minutos_atraso = calcular_minutos(hora_str, func["horario_retorno_almoco"])
-                elif tipo == "SAIDA":
-                    atrasado = 1 if verificar_atraso(func["horario_saida"], hora_str, tolerancia_minutos=5) else 0
-                    if atrasado: minutos_atraso = calcular_minutos(func["horario_saida"], hora_str)
-                
-                minutos_banco = calcular_banco_horas(tipo, hora_str, func)
-                
-                conn.execute("""
-                    INSERT INTO registros_ponto 
-                    (funcionario_id, data_hora, tipo, atrasado, minutos_atraso, minutos_banco_horas, justificativa, ip_dispositivo, user_agent, horario_acesso)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (func["id"], data_hora_str, tipo, atrasado, minutos_atraso, minutos_banco, justificativa, ip_cliente, user_agent, horario_acesso))
-                conn.commit()
-                conn.close()
-                
-                tipo_info = TIPOS_REGISTRO[tipo]
-                msg = f"{tipo_info['icone']} {tipo_info['label']} registrada!\n"
-                msg += f"👤 {func['nome']}\n📅 {agora.strftime('%d/%m/%Y')}\n⏰ {hora_str}"
-                if atrasado: msg += f"\n⚠️ Atraso: {minutos_atraso} min"
-                if minutos_banco > 0: msg += f"\n⏱️ Banco de horas: +{minutos_banco} min"
-                if justificativa: msg += f"\n📝 Justificativa registrada"
-                
-                print(f"[PONTO] {func['nome']} | {tipo} | {hora_str} | IP:{ip_cliente}")
-                responder_json(self, {"mensagem": msg})
-            except Exception as e:
-                responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
-            return
-        
-        if not verificar_login(self):
-            responder_json(self, {"detail": "Não autorizado"}, status=401)
-            return
-        
-        if caminho.startswith("/api/solicitacoes/") and caminho.endswith("/aprovar"):
-            try:
-                solic_id = int(caminho.replace("/api/solicitacoes/", "").replace("/aprovar", ""))
-                conn = get_db()
-                solic = conn.execute("SELECT * FROM solicitacoes_pendentes WHERE id = ?", (solic_id,)).fetchone()
-                
-                if not solic:
-                    conn.close()
-                    responder_json(self, {"detail": "Solicitação não encontrada"}, status=404)
-                    return
-                
-                if solic["status"] != "PENDENTE":
-                    conn.close()
-                    responder_json(self, {"detail": f"Solicitação já foi {solic['status']}"}, status=400)
-                    return
-                
-                func = conn.execute("SELECT * FROM funcionarios WHERE id = ?", (solic["funcionario_id"],)).fetchone()
-                
-                agora = agora_brasilia()
-                data_hora_aprovacao = agora.strftime("%Y-%m-%d %H:%M:%S")
-                
-                # Usar a data/hora original da solicitação para o registro
-                data_hora_registro = solic["data_hora_solicitacao"]
-                hora_str = data_hora_registro.split(" ")[1] if " " in data_hora_registro else data_hora_registro
-                
-                # Calcular banco de horas
-                minutos_banco = calcular_banco_horas(solic["tipo"], hora_str, func)
-                
-                # Registrar o ponto efetivamente
-                conn.execute("""
-                    INSERT INTO registros_ponto 
-                    (funcionario_id, data_hora, tipo, atrasado, minutos_atraso, minutos_banco_horas, 
-                     justificativa, ip_dispositivo, user_agent, horario_acesso)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (solic["funcionario_id"], data_hora_registro, solic["tipo"], 
-                      solic["atrasado"], solic["minutos_atraso"], minutos_banco,
-                      solic["justificativa"], solic["ip_dispositivo"], 
-                      solic["user_agent"], data_hora_aprovacao))
-                
-                # Atualizar status da solicitação
-                conn.execute("""
-                    UPDATE solicitacoes_pendentes 
-                    SET status = 'APROVADA', data_hora_aprovacao = ?, admin_aprovador = ?
-                    WHERE id = ?
-                """, (data_hora_aprovacao, ADMIN_USUARIO, solic_id))
-                
-                conn.commit()
-                conn.close()
-                
-                tipo_info = TIPOS_REGISTRO[solic["tipo"]]
-                print(f"[APROVADA #{solic_id}] {func['nome']} | {solic['tipo']} | Atraso: {solic['minutos_atraso']}min")
-                responder_json(self, {"status": "ok", "mensagem": f"Solicitação aprovada! Ponto registrado para {func['nome']}."})
-            except ValueError:
-                responder_json(self, {"detail": "ID inválido"}, status=400)
-            except Exception as e:
-                responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
-            return
-        
-        if caminho.startswith("/api/solicitacoes/") and caminho.endswith("/negar"):
-            try:
-                solic_id = int(caminho.replace("/api/solicitacoes/", "").replace("/negar", ""))
-                motivo = sanitizar_texto(dados.get("motivo", ""), 500)
-                
-                conn = get_db()
-                solic = conn.execute("SELECT * FROM solicitacoes_pendentes WHERE id = ?", (solic_id,)).fetchone()
-                
-                if not solic:
-                    conn.close()
-                    responder_json(self, {"detail": "Solicitação não encontrada"}, status=404)
-                    return
-                
-                if solic["status"] != "PENDENTE":
-                    conn.close()
-                    responder_json(self, {"detail": f"Solicitação já foi {solic['status']}"}, status=400)
-                    return
-                
-                func = conn.execute("SELECT nome FROM funcionarios WHERE id = ?", (solic["funcionario_id"],)).fetchone()
-                agora = agora_brasilia()
-                data_hora_aprovacao = agora.strftime("%Y-%m-%d %H:%M:%S")
-                
-                conn.execute("""
-                    UPDATE solicitacoes_pendentes 
-                    SET status = 'NEGADA', data_hora_aprovacao = ?, admin_aprovador = ?, motivo_negacao = ?
-                    WHERE id = ?
-                """, (data_hora_aprovacao, ADMIN_USUARIO, motivo, solic_id))
-                
-                conn.commit()
-                conn.close()
-                
-                print(f"[NEGADA #{solic_id}] {func['nome']} | Motivo: {motivo[:50]}")
-                responder_json(self, {"status": "ok", "mensagem": "Solicitação negada."})
-            except ValueError:
-                responder_json(self, {"detail": "ID inválido"}, status=400)
-            except Exception as e:
-                responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
-            return
-        
-        if caminho == "/api/funcionarios":
-            nome = sanitizar_texto(dados.get("nome", ""), 150)
-            cpf = formatar_cpf(dados.get("cpf", ""))
-            
-            if not nome or not cpf:
-                responder_json(self, {"detail": "Preencha nome e CPF!"}, status=400)
-                return
-            if len(cpf) != 11:
-                responder_json(self, {"detail": "CPF deve ter 11 dígitos!"}, status=400)
-                return
-            
-            h_entrada = sanitizar_texto(dados.get("horario_entrada", "08:00:00"), 20) or "08:00:00"
-            h_saida_almoco = sanitizar_texto(dados.get("horario_saida_almoco", "12:00:00"), 20) or "12:00:00"
-            h_retorno_almoco = sanitizar_texto(dados.get("horario_retorno_almoco", "13:00:00"), 20) or "13:00:00"
-            h_saida = sanitizar_texto(dados.get("horario_saida", "18:00:00"), 20) or "18:00:00"
-            
-            try:
-                conn = get_db()
-                existe = conn.execute("SELECT id FROM funcionarios WHERE cpf = ?", (cpf,)).fetchone()
-                if existe:
-                    conn.close()
-                    responder_json(self, {"detail": "CPF já cadastrado!"}, status=400)
-                    return
-                
-                conn.execute("""
-                    INSERT INTO funcionarios (nome, cpf, horario_entrada, horario_saida_almoco, horario_retorno_almoco, horario_saida)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (nome, cpf, h_entrada, h_saida_almoco, h_retorno_almoco, h_saida))
-                conn.commit()
-                
-                novo_id = conn.execute("SELECT last_insert_rowid() as id").fetchone()["id"]
-                conn.close()
-                
-                print(f"[CADASTRO] {nome} | CPF: {cpf}")
-                responder_json(self, {"status": "ok", "id": novo_id})
-            except Exception as e:
-                responder_json(self, {"detail": f"Erro BD: {str(e)}"}, status=500)
-            return
-        
-        responder_json(self, {"detail": "Rota não encontrada"}, status=404)
-    
-    def do_DELETE(self):
-# ===================== GERAÇÃO DE PDF =====================
-        if not verificar_login(self):
-            responder_json(self, {"detail": "Não autorizado"}, status=401)
-            return
-        
-        url = urlparse(self.path)
-        caminho = url.path
-        
-        if caminho.startswith("/api/funcionarios/"):
-            try:
-                func_id = int(caminho.replace("/api/funcionarios/", ""))
-                conn = get_db()
-                conn.execute("DELETE FROM registros_ponto WHERE funcionario_id = ?", (func_id,))
-                conn.execute("DELETE FROM funcionarios WHERE id = ?", (func_id,))
-                conn.commit()
-                conn.close()
-                print(f"[EXCLUSAO] Funcionário ID: {func_id}")
-                responder_json(self, {"status": "ok"})
-            except Exception as e:
-                responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
-            return
-        
-        responder_json(self, {"detail": "Rota não encontrada"}, status=404)
-
-# ===================== FUNÇÕES DE PDF =====================
-def desenhar_pagina_funcionario(c, func, registros, mes, dias_semana, altura, largura, colors):
-    c.setFillColor(colors.HexColor("#667eea"))
-    c.rect(0, altura - 80, largura, 80, fill=True, stroke=False)
-    c.setFillColor(colors.white)
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(40, altura - 50, "RELATORIO DE FOLHA PONTO")
-    c.setFont("Helvetica", 10)
-    c.drawString(40, altura - 68, "Mes/Ano: " + mes)
-    
-    y = altura - 110
-    c.setFillColor(colors.black)
-    c.setFont("Helvetica-Bold", 13)
-    c.drawString(40, y, "Funcionario: " + func["nome"])
-    y -= 18
-    c.setFont("Helvetica", 9)
-    c.drawString(40, y, "CPF: " + func["cpf"])
-    c.drawString(200, y, "Entrada: " + func["horario_entrada"])
-    c.drawString(340, y, "Saida Almoco: " + func["horario_saida_almoco"])
-    y -= 14
-    c.drawString(200, y, "Retorno: " + func["horario_retorno_almoco"])
-    c.drawString(340, y, "Saida: " + func["horario_saida"])
-    y -= 25
-    
-    c.setFont("Helvetica-Bold", 7)
-    c.setFillColor(colors.HexColor("#f0f0f0"))
-    c.rect(40, y - 14, largura - 80, 18, fill=True, stroke=False)
-    c.setFillColor(colors.black)
-    c.drawString(45, y - 9, "DATA")
-    c.drawString(100, y - 9, "HORA")
-    c.drawString(155, y - 9, "TIPO")
-    c.drawString(240, y - 9, "ATRASO")
-    c.drawString(290, y - 9, "MIN.")
-    c.drawString(340, y - 9, "BANCO")
-    c.drawString(400, y - 9, "DIA")
-    c.drawString(440, y - 9, "JUSTIFICATIVA")
-    y -= 32
-    
-    c.setFont("Helvetica", 7)
-    contagem = {"ENTRADA": 0, "SAIDA_ALMOCO": 0, "RETORNO_ALMOCO": 0, "SAIDA": 0}
-    total_atrasos = 0
-    total_min_atraso = 0
-    total_banco_horas = 0
-    
-    for reg in registros:
-        if y < 100:
-            c.showPage()
-            y = altura - 50
-            c.setFont("Helvetica", 7)
-        
-        dh = datetime.strptime(reg["data_hora"], "%Y-%m-%d %H:%M:%S")
-        data = dh.strftime("%d/%m/%Y")
-        hora = dh.strftime("%H:%M:%S")
-        dia_semana = dias_semana[dh.weekday()]
-        tipo_fmt = reg["tipo"].replace("_", " ")
-        
-        if dh.weekday() >= 5:
-            c.setFillColor(colors.HexColor("#fff3cd"))
-            c.rect(40, y - 2, largura - 80, 12, fill=True, stroke=False)
-            c.setFillColor(colors.black)
-        
-        c.drawString(45, y, data)
-        c.drawString(100, y, hora)
-        
-        if reg["tipo"] == "ENTRADA": c.setFillColor(colors.HexColor("#4CAF50"))
-        elif reg["tipo"] == "SAIDA_ALMOCO": c.setFillColor(colors.HexColor("#ff9800"))
-        elif reg["tipo"] == "RETORNO_ALMOCO": c.setFillColor(colors.HexColor("#2196F3"))
-        else: c.setFillColor(colors.HexColor("#f44336"))
-        
-        contagem[reg["tipo"]] += 1
-        c.drawString(155, y, tipo_fmt)
-        c.setFillColor(colors.black)
-        
-        if reg["atrasado"]:
-            c.setFillColor(colors.HexColor("#f44336"))
-            c.drawString(240, y, "SIM")
-            c.setFillColor(colors.black)
-            total_atrasos += 1
-        else:
-            c.drawString(240, y, "Nao")
-        
-        min_atraso = reg["minutos_atraso"] or 0
-        if min_atraso > 0:
-            c.setFillColor(colors.HexColor("#f44336"))
-            c.drawString(290, y, str(min_atraso) + "m")
-            c.setFillColor(colors.black)
-            total_min_atraso += min_atraso
-        else:
-            c.drawString(290, y, "-")
-        
-        min_banco = reg["minutos_banco_horas"] or 0
-        if min_banco > 0:
-            c.setFillColor(colors.HexColor("#0c5460"))
-            c.drawString(340, y, "+" + str(min_banco) + "m")
-            c.setFillColor(colors.black)
-            total_banco_horas += min_banco
-        else:
-            c.drawString(340, y, "-")
-        
-        c.drawString(400, y, dia_semana[:3])
-        
-        justificativa = reg["justificativa"] or ""
-        if justificativa:
-            c.setFillColor(colors.HexColor("#666666"))
-            if len(justificativa) > 45: justificativa = justificativa[:42] + "..."
-            c.drawString(440, y, justificativa)
-            c.setFillColor(colors.black)
-        
-        y -= 13
-    
-    if y < 200:
-        c.showPage()
-        y = altura - 50
-    
-    y -= 10
-    c.setFillColor(colors.HexColor("#f5f5f5"))
-    c.rect(40, y - 100, largura - 80, 110, fill=True, stroke=False)
-    c.setFillColor(colors.black)
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(50, y - 15, "RESUMO DO MES:")
-    c.setFont("Helvetica", 9)
-    c.drawString(50, y - 35, "Total: " + str(len(registros)) + " registros")
-    c.drawString(180, y - 35, "Entradas: " + str(contagem["ENTRADA"]))
-    c.drawString(310, y - 35, "Saida Almoco: " + str(contagem["SAIDA_ALMOCO"]))
-    c.drawString(50, y - 50, "Retornos: " + str(contagem["RETORNO_ALMOCO"]))
-    c.drawString(180, y - 50, "Saidas: " + str(contagem["SAIDA"]))
-    c.drawString(310, y - 50, "Atrasos: " + str(total_atrasos))
-    c.drawString(50, y - 65, "Min. atrasados: " + str(total_min_atraso) + " min")
-    
-    c.setFillColor(colors.HexColor("#0c5460"))
-    c.setFont("Helvetica-Bold", 9)
-    c.drawString(180, y - 65, "Banco: +" + str(total_banco_horas) + " min")
-    c.setFillColor(colors.black)
-    
-    y -= 115
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(40, y, "_______________________________________________________")
-    y -= 15
-    c.setFont("Helvetica", 9)
-    c.drawString(40, y, "Assinatura do Funcionario: ___________________________")
-    y -= 15
-    c.drawString(40, y, "Data: ____/____/__________")
-    
-    y -= 40
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(300, y, "_______________________________________________________")
-    y -= 15
-    c.setFont("Helvetica", 9)
-    c.drawString(300, y, "Assinatura do Responsavel: ___________________________")
-    y -= 15
-    c.drawString(300, y, "Data: ____/____/__________")
-    
-    c.showPage()
-
-def gerar_pdf_geral(mes):
-    from reportlab.lib.pagesizes import A4
-    from reportlab.pdfgen import canvas
-    from reportlab.lib import colors
-    
-    conn = get_db()
-    funcionarios = conn.execute("SELECT * FROM funcionarios ORDER BY nome").fetchall()
-    
-    buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    largura, altura = A4
-    dias_semana = ["Segunda", "Terca", "Quarta", "Quinta", "Sexta", "Sabado", "Domingo"]
-    
-    for func in funcionarios:
-        registros = conn.execute("""
-            SELECT * FROM registros_ponto 
-            WHERE funcionario_id = ? AND strftime('%Y-%m', data_hora) = ?
-            ORDER BY data_hora
-        """, (func["id"], mes)).fetchall()
-        desenhar_pagina_funcionario(c, func, registros, mes, dias_semana, altura, largura, colors)
-    
-    conn.close()
-    c.save()
-    buffer.seek(0)
-    return buffer
-
-def gerar_pdf_individual(func_id, mes):
-    from reportlab.lib.pagesizes import A4
-    from reportlab.pdfgen import canvas
-    from reportlab.lib import colors
-    
-    conn = get_db()
-    func = conn.execute("SELECT * FROM funcionarios WHERE id = ?", (func_id,)).fetchone()
-    
-    if not func:
-        conn.close()
-        buffer = io.BytesIO()
-        c = canvas.Canvas(buffer, pagesize=A4)
-        c.drawString(100, 400, "Funcionario nao encontrado")
-        c.save()
-        buffer.seek(0)
-        return buffer
-    
-    registros = conn.execute("""
-        SELECT * FROM registros_ponto 
-        WHERE funcionario_id = ? AND strftime('%Y-%m', data_hora) = ?
-        ORDER BY data_hora
-    """, (func_id, mes)).fetchall()
-    
-    buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    largura, altura = A4
-    dias_semana = ["Segunda", "Terca", "Quarta", "Quinta", "Sexta", "Sabado", "Domingo"]
-    
-    desenhar_pagina_funcionario(c, func, registros, mes, dias_semana, altura, largura, colors)
-    
-    conn.close()
-    c.save()
-    buffer.seek(0)
-    return buffer
-
-# ===================== INICIAR SERVIDOR =====================
-if __name__ == "__main__":
-    print("=" * 65)
-    print("   SISTEMA DE PONTO v3.0 SECURE - FUNCIONANDO!")
-    print("=" * 65)
-    print(f"Pagina inicial (CPF):   http://localhost:{PORTA}")
-    print(f"Painel Funcionario:     http://localhost:{PORTA}/funcionario")
-    print(f"Login Admin:            http://localhost:{PORTA}/admin")
-    print(f"Health Check:           http://localhost:{PORTA}/health")
-    print(f"Usuario: {ADMIN_USUARIO} | Senha: {ADMIN_SENHA}")
-    print("=" * 65)
-    print("📡 MONITORAMENTO UPTIMEBOT (para Render 24h):")
-    print("   URL: https://SEU_DOMINIO.onrender.com/health")
-    print("   Intervalo: 5 minutos (evita sleep do plano gratuito)")
-    print("   O Render dorme apos 15 min sem atividade; ping de 5")
-    print("   minutos mantem o sistema ONLINE 24 horas gratuitamente.")
-    print("=" * 65)
-    print("NOVAS FUNCIONALIDADES v3.0:")
-    print("  - Tela de login separada para funcionario")
-    print("  - Registro de IP e dispositivo em cada acesso")
-    print("  - Rate limiting contra brute force")
-    print("  - Anti-duplicata (mesmo tipo nao pode 2x no dia)")
-    print("  - Justificativa flexivel para qualquer horario")
-    print("  - Design moderno com efeitos 5D e animacoes")
-    print("  - Desenvolvido por WELL")
-    print("=" * 65)
-    print(f"Acesso WI-FI: http://SEU_IP:{PORTA}")
-    print("=" * 65)
-    print("\nServidor rodando... Ctrl+C para parar.\n")
-    
-    try:
-        servidor = HTTPServer(("0.0.0.0", PORTA), ServidorPonto)
-        servidor.serve_forever()
-    except KeyboardInterrupt:
-        print("\nServidor parado.")
-        servidor.server_close()
+        user_agent = sanitizar_texto(self.headers.get("User-Agent", ""), 500
