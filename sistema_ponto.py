@@ -1,3 +1,19 @@
+# -*- coding: utf-8 -*-
+"""
+=================================================================
+   SISTEMA DE PONTO v3.1 - CLÍNICA
+=================================================================
+   Desenvolvido por WELL
+   Última atualização: 2026-09-07
+   
+   NOVAS FUNCIONALIDADES v3.1:
+   ✅ Sistema de múltiplos administradores
+   ✅ Painel de resumo visual dos funcionários
+   ✅ Correção total das abas do painel admin
+   ✅ Gerenciamento completo de admins (CRUD)
+   ✅ Cards coloridos e divertidos com horários
+=================================================================
+"""
 import sqlite3
 import json
 import os
@@ -36,6 +52,7 @@ ADMIN_SENHA = "3223ronte"
 sessoes_admin = {}
 tentativas_login = {}
 acessos_funcionarios = {}
+
 os.makedirs("static", exist_ok=True)
 
 CABECALHOS_SEGURANCA = {
@@ -111,6 +128,8 @@ def get_db():
 
 def init_db():
     conn = get_db()
+    
+    # Tabela de funcionários
     conn.execute("""CREATE TABLE IF NOT EXISTS funcionarios (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         nome TEXT NOT NULL,
@@ -120,6 +139,8 @@ def init_db():
         horario_retorno_almoco TEXT DEFAULT '13:00:00',
         horario_saida TEXT DEFAULT '18:00:00'
     )""")
+    
+    # Tabela de registros de ponto
     conn.execute("""CREATE TABLE IF NOT EXISTS registros_ponto (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         funcionario_id INTEGER NOT NULL,
@@ -134,6 +155,8 @@ def init_db():
         horario_acesso TEXT DEFAULT '',
         FOREIGN KEY (funcionario_id) REFERENCES funcionarios(id) ON DELETE CASCADE
     )""")
+    
+    # Tabela de acessos de dispositivos
     conn.execute("""CREATE TABLE IF NOT EXISTS acessos_dispositivos (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         funcionario_id INTEGER,
@@ -144,6 +167,8 @@ def init_db():
         tipo_acesso TEXT DEFAULT 'pagina_inicial',
         FOREIGN KEY (funcionario_id) REFERENCES funcionarios(id) ON DELETE SET NULL
     )""")
+    
+    # Tabela de solicitações pendentes
     conn.execute("""CREATE TABLE IF NOT EXISTS solicitacoes_pendentes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         funcionario_id INTEGER NOT NULL,
@@ -161,17 +186,38 @@ def init_db():
         motivo_negacao TEXT DEFAULT '',
         FOREIGN KEY (funcionario_id) REFERENCES funcionarios(id) ON DELETE CASCADE
     )""")
-    for coluna, tipo in [("minutos_atraso","INTEGER DEFAULT 0"),("minutos_banco_horas","INTEGER DEFAULT 0"),("justificativa","TEXT DEFAULT ''"),("ip_dispositivo","TEXT DEFAULT ''"),("user_agent","TEXT DEFAULT ''"),("horario_acesso","TEXT DEFAULT ''")]:
+    
+    # Tabela de ADMINS (NOVO - múltiplos administradores)
+    conn.execute("""CREATE TABLE IF NOT EXISTS admins (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        usuario TEXT UNIQUE NOT NULL,
+        senha TEXT NOT NULL,
+        nome_completo TEXT DEFAULT '',
+        criado_em TEXT DEFAULT '',
+        ultimo_login TEXT DEFAULT ''
+    )""")
+    
+    # Migrações de colunas se necessário
+    for coluna, tipo in [
+        ("minutos_atraso","INTEGER DEFAULT 0"),
+        ("minutos_banco_horas","INTEGER DEFAULT 0"),
+        ("justificativa","TEXT DEFAULT ''"),
+        ("ip_dispositivo","TEXT DEFAULT ''"),
+        ("user_agent","TEXT DEFAULT ''"),
+        ("horario_acesso","TEXT DEFAULT ''")
+    ]:
         try:
             conn.execute(f"ALTER TABLE registros_ponto ADD COLUMN {coluna} {tipo}")
             print(f"[MIGRACAO] Coluna {coluna} adicionada")
         except: pass
+    
     conn.commit()
     conn.close()
 
 init_db()
 criar_logo_padrao()
 
+# ===================== FUNÇÕES AUXILIARES =====================
 def formatar_cpf(cpf):
     return ''.join(filter(str.isdigit, str(cpf)))
 
@@ -233,6 +279,31 @@ def verificar_sequencia_valida(ultimo_tipo, novo_tipo):
 
 def gerar_sessao():
     return hashlib.sha256(os.urandom(64)).hexdigest()
+
+def hash_senha(senha):
+    """Hash simples para senhas de admins adicionais"""
+    return hashlib.sha256(senha.encode('utf-8')).hexdigest()
+
+def verificar_credenciais_admin(usuario, senha):
+    """
+    Verifica credenciais: primeiro o admin padrão, depois os admins do banco.
+    Retorna (True, nome_usuario) ou (False, None)
+    """
+    # Admin padrão (master)
+    if usuario == ADMIN_USUARIO and senha == ADMIN_SENHA:
+        return True, ADMIN_USUARIO
+    
+    # Admins do banco de dados
+    try:
+        conn = get_db()
+        admin = conn.execute("SELECT * FROM admins WHERE usuario = ?", (usuario,)).fetchone()
+        conn.close()
+        if admin and admin["senha"] == hash_senha(senha):
+            return True, admin["nome_completo"] or admin["usuario"]
+    except:
+        pass
+    
+    return False, None
 
 def limpar_sessoes_expiradas():
     agora = agora_brasilia()
@@ -302,7 +373,7 @@ RODAPE_WELL = """
   <div class="rodape-content">
     <span class="rodape-icone">⚡</span>
     <span class="rodape-texto">Desenvolvido por <strong>WELL</strong></span>
-    <span class="rodape-versao">v3.0 SECURE</span>
+    <span class="rodape-versao">v3.1</span>
   </div>
 </div>
 """
@@ -474,10 +545,10 @@ function atualizarDH(){
 }
 setInterval(atualizarDH,1000); atualizarDH();
 const cpfInp=document.getElementById('cpf');
-cpfInp.addEventListener('input',function(){this.value=this.value.replace(/\\D/g,'');});
+cpfInp.addEventListener('input',function(){this.value=this.value.replace(/\\\\D/g,'');});
 cpfInp.addEventListener('keypress',function(e){if(e.key==='Enter')acessar();});
 cpfInp.addEventListener('blur',async function(){
-  const c=this.value.replace(/\\D/g,''); const inf=document.getElementById('infoFunc');
+  const c=this.value.replace(/\\\\D/g,''); const inf=document.getElementById('infoFunc');
   if(c.length===11){
     try{const r=await fetch('/api/buscar/'+c);const d=await r.json();
       if(d.encontrado){inf.textContent='👤 '+d.nome;inf.className='info-func info-ok';}
@@ -486,7 +557,7 @@ cpfInp.addEventListener('blur',async function(){
   }else inf.style.display='none';
 });
 async function acessar(){
-  const c=cpfInp.value.replace(/\\D/g,''); const m=document.getElementById('mensagem');
+  const c=cpfInp.value.replace(/\\\\D/g,''); const m=document.getElementById('mensagem');
   if(!c||c.length!==11){m.textContent='Digite um CPF válido com 11 números!';m.className='mensagem erro';return;}
   try{
     const r=await fetch('/api/funcionario/acessar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cpf:c})});
@@ -604,7 +675,6 @@ body { min-height:100vh; padding:15px; position:relative; overflow-x:hidden; }
 </div>
 """ + RODAPE_WELL + """
 </div>
-
 <!-- TELA DE BLOQUEIO - AGUARDANDO APROVAÇÃO ADMIN -->
 <div class="tela-bloqueio" id="telaBloqueio">
   <div class="bloqueio-box" id="bloqueioConteudo">
@@ -623,7 +693,6 @@ body { min-height:100vh; padding:15px; position:relative; overflow-x:hidden; }
     <div class="bloqueio-aviso">⚠️ Esta tela não pode ser fechada. O sistema verificará automaticamente a aprovação.</div>
   </div>
 </div>
-
 <div class="modal-overlay" id="modalJust">
 <div class="modal-box">
 <h2>⚠️ Atenção!</h2>
@@ -654,7 +723,7 @@ async function carregar(){
     const r=await fetch('/api/buscar/'+CPF);const d=await r.json();
     if(!d.encontrado){window.location.href='/';return;}
     document.getElementById('nomeFunc').textContent=d.nome;
-    document.getElementById('cpfFunc').textContent='CPF: '+CPF.replace(/(\\d{3})(\\d{3})(\\d{3})(\\d{2})/,'$1.$2.$3-$4');
+    document.getElementById('cpfFunc').textContent='CPF: '+CPF.replace(/(\\\\d{3})(\\\\d{3})(\\\\d{3})(\\\\d{2})/,'$1.$2.$3-$4');
     document.getElementById('fotoFunc').textContent=d.nome.charAt(0).toUpperCase();
     document.getElementById('horariosInfo').innerHTML=
       '<div class="horario-item"><div class="horario-label">Entrada</div><div class="horario-valor">🕐 '+d.horario_entrada+'</div></div>'+
@@ -672,10 +741,8 @@ async function registrar(tipo){
     const d=await r.json();
     if(!r.ok){mostrar(d.detail||'Erro','erro');return;}
     if(d.bloqueado){
-      // ATRASO ACIMA DE 5 MINUTOS: Bloquear e solicitar aprovação admin
       await solicitarAprovacao(tipo,d);
     }else if(d.precisa_justificativa){
-      // Atraso pequeno ou situação que pede justificativa mas não bloqueia
       pendente={cpf:CPF,tipo:tipo};
       document.getElementById('modalTexto').textContent=d.mensagem_justificativa;
       document.getElementById('modalInfo').textContent='⏱️ '+d.info_atraso;
@@ -685,55 +752,42 @@ async function registrar(tipo){
     }else await executar(CPF,tipo,'');
   }catch(e){mostrar('Erro de conexão!','erro');}
 }
-
 async function solicitarAprovacao(tipo,dados){
-  // Pede justificativa primeiro, depois envia solicitação
-  const just=prompt('📝 Descreva o motivo do atraso:\n(esta informação será enviada ao administrador)');
-  if(just===null)return; // Usuário não quer informar motivo, mas ainda assim envia
-  
+  const just=prompt('📝 Descreva o motivo do atraso:\\n(esta informação será enviada ao administrador)');
+  if(just===null)return;
   try{
     const r=await fetch('/api/solicitar_ponto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cpf:CPF,tipo:tipo,qr_code:QR,justificativa:just||'Não informado'})});
     const d=await r.json();
     if(!r.ok){mostrar(d.detail||'Erro','erro');return;}
-    
-    // Mostrar tela de bloqueio - SEM OPÇÃO DE CANCELAR
     mostrarTelaBloqueio(tipo,dados.minutos_atraso||0);
-    // Iniciar polling para verificar status
     iniciarPolling();
   }catch(e){mostrar('Erro ao enviar solicitação!','erro');}
 }
-
 function mostrarTelaBloqueio(tipo,minutos){
-  const tiposLabel={'ENTRADA':'✅ ENTRADA','SAIDA_ALMOCO':'🍽️ SAÍDA ALMOÇO','RETORNO_ALMOCO':'↩️ RETORNO ALMOÇO','SAIDA':'🚪 SAÍDA'};
+  const tiposLabel={'ENTRADA':'✅ ENTRADA','SAIDA_ALMOCO':'🍽️ SAÍDA ALMOCO','RETORNO_ALMOCO':'↩️ RETORNO ALMOCO','SAIDA':'🚪 SAÍDA'};
   document.getElementById('bloqTipo').textContent=tiposLabel[tipo]||tipo;
   document.getElementById('bloqAtraso').textContent=minutos;
   document.getElementById('bloqHora').textContent=new Date().toLocaleTimeString('pt-BR');
   document.getElementById('telaBloqueio').classList.add('ativa');
-  // Prevenir ESC e outros métodos de fechamento
   document.addEventListener('keydown',prevenirFechamento);
 }
-
 function prevenirFechamento(e){
   if(e.key==='Escape'){e.preventDefault();e.stopPropagation();}
 }
-
 function iniciarPolling(){
   pararPolling();
   pollingId=setInterval(verificarStatusSolicitacao,3000);
   verificarStatusSolicitacao();
 }
-
 function pararPolling(){
   if(pollingId){clearInterval(pollingId);pollingId=null;}
 }
-
 async function verificarStatusSolicitacao(){
   if(!CPF)return;
   try{
     const r=await fetch('/api/solicitacao_status/'+CPF);
     const d=await r.json();
     if(!d.encontrada)return;
-    
     if(d.status==='APROVADA'){
       pararPolling();
       mostrarResultadoAprovacao(d);
@@ -743,7 +797,6 @@ async function verificarStatusSolicitacao(){
     }
   }catch(e){}
 }
-
 function mostrarResultadoAprovacao(d){
   document.getElementById('bloqueioIcone').textContent='✅';
   document.getElementById('bloqueioIcone').style.background='linear-gradient(135deg,#4CAF50,#66bb6a)';
@@ -756,7 +809,6 @@ function mostrarResultadoAprovacao(d){
     '<button class="btn-continuar" onclick="fecharTelaBloqueio()">Continuar</button>';
   document.removeEventListener('keydown',prevenirFechamento);
 }
-
 function mostrarResultadoNegacao(d){
   document.getElementById('bloqueioIcone').textContent='❌';
   document.getElementById('bloqueioIcone').style.background='linear-gradient(135deg,#f44336,#d32f2f)';
@@ -770,10 +822,8 @@ function mostrarResultadoNegacao(d){
     '<button class="btn-continuar" onclick="fecharTelaBloqueio()">Entendido</button>';
   document.removeEventListener('keydown',prevenirFechamento);
 }
-
 function fecharTelaBloqueio(){
   document.getElementById('telaBloqueio').classList.remove('ativa');
-  // Resetar tela para estado original
   location.reload();
 }
 function fecharModal(){document.getElementById('modalJust').classList.remove('ativo');pendente=null;}
@@ -797,7 +847,7 @@ document.getElementById('modalJust').addEventListener('click',function(e){if(e.t
 </body>
 </html>"""
 
-# ===================== HTML - PAINEL ADMIN =====================
+# ===================== HTML - PAINEL ADMIN (CORRIGIDO E MELHORADO) =====================
 def gerar_html_admin():
     ts = str(int(agora_brasilia().timestamp()))
     return """<!DOCTYPE html>
@@ -805,7 +855,7 @@ def gerar_html_admin():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>⚙️ Painel Administrativo</title>
+<title>⚙️ Painel Administrativo v3.1</title>
 <style>
 * { margin:0; padding:0; box-sizing:border-box; font-family:'Segoe UI',Arial,sans-serif; }
 body { background:#f0f2f5; min-height:100vh; }
@@ -819,13 +869,13 @@ body { background:#f0f2f5; min-height:100vh; }
 .logout:hover { background:rgba(255,255,255,0.35); transform:translateY(-50%) scale(1.05); }
 .container { max-width:1250px; margin:25px auto; padding:0 20px; }
 .tabs { display:flex; gap:6px; margin-bottom:20px; flex-wrap:wrap; }
-.tab { padding:12px 20px; background:#dde2e8; border:none; border-radius:12px 12px 0 0; cursor:pointer; font-weight:bold; font-size:13px; color:#555; transition:all 0.3s; }
+.tab { padding:12px 18px; background:#dde2e8; border:none; border-radius:12px 12px 0 0; cursor:pointer; font-weight:bold; font-size:12px; color:#555; transition:all 0.3s; }
 .tab:hover { background:#cfd6de; transform:translateY(-2px); }
 .tab.ativo { background:white; color:#667eea; box-shadow:0 -4px 15px rgba(0,0,0,0.08); }
 .painel { background:white; border-radius:0 18px 18px 18px; padding:28px; box-shadow:0 10px 40px rgba(0,0,0,0.08); display:none; }
 .painel.ativo { display:block; animation:entrar-cima 0.4s ease; }
 h2 { color:#333; margin-bottom:22px; font-size:21px; background:linear-gradient(135deg,#667eea,#764ba2); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; }
-input, select, textarea { width:100%; padding:12px; margin:8px 0; border:2px solid #e8e8e8; border-radius:10px; font-size:14px; font-family:'Segoe UI',Arial,sans-serif; transition:all 0.3s; background:#fafafa; }
+input, select, textarea { width:100%; padding:12px; margin:8px 0; border:2px solid #e0e0e0; border-radius:10px; font-size:14px; font-family:'Segoe UI',Arial,sans-serif; transition:all 0.3s; background:#fafafa; }
 input:focus, select:focus, textarea:focus { border-color:#667eea; background:white; outline:none; box-shadow:0 0 0 4px rgba(102,126,234,0.1); }
 button { padding:12px 22px; background:linear-gradient(135deg,#667eea,#764ba2); color:white; border:none; border-radius:10px; cursor:pointer; font-weight:bold; font-size:14px; margin:5px 5px 5px 0; transition:all 0.3s; box-shadow:0 4px 12px rgba(102,126,234,0.25); }
 button:hover { transform:translateY(-2px); box-shadow:0 7px 18px rgba(102,126,234,0.35); }
@@ -882,28 +932,87 @@ label { font-size:13px; color:#555; font-weight:bold; display:block; margin-top:
 .alerta-solic-vazio { text-align:center; padding:40px; color:#999; font-size:15px; }
 .alerta-solic-vazio .icone-grande { font-size:50px; display:block; margin-bottom:15px; opacity:0.5; }
 .motivo-input { width:100%; padding:10px; margin:8px 0; border:2px solid #e0e0e0; border-radius:8px; font-size:13px; resize:vertical; min-height:60px; }
+
+/* ========== NOVOS ESTILOS: RESUMO FUNCIONÁRIOS ========== */
+.resumo-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:20px; margin-top:20px; }
+.func-card-resumo { background:white; border-radius:18px; padding:20px; position:relative; overflow:hidden; transition:all 0.4s cubic-bezier(0.175,0.885,0.32,1.275); box-shadow:0 8px 25px rgba(0,0,0,0.08); border:2px solid transparent; }
+.func-card-resumo:hover { transform:translateY(-8px) scale(1.02); box-shadow:0 20px 50px rgba(102,126,234,0.2); border-color:#667eea; }
+.func-card-resumo::before { content:''; position:absolute; top:0; left:0; right:0; height:6px; background:linear-gradient(90deg,#667eea,#f093fb,#4facfe,#43e97b); }
+.func-avatar { width:60px; height:60px; border-radius:50%; background:linear-gradient(135deg,#667eea,#f093fb); display:flex; align-items:center; justify-content:center; color:white; font-size:26px; font-weight:bold; margin-bottom:12px; box-shadow:0 5px 15px rgba(102,126,234,0.3); }
+.func-nome-resumo { font-size:16px; font-weight:bold; color:#333; margin-bottom:4px; }
+.func-cpf-resumo { font-size:11px; color:#999; margin-bottom:15px; }
+.func-horarios-resumo { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+.func-horario-item { background:#f8f9fa; padding:8px; border-radius:8px; text-align:center; transition:all 0.3s; }
+.func-card-resumo:hover .func-horario-item { background:linear-gradient(135deg,#f0f4ff,#f8f0ff); }
+.func-horario-icone { font-size:16px; display:block; margin-bottom:2px; }
+.func-horario-label { font-size:9px; color:#888; text-transform:uppercase; font-weight:bold; }
+.func-horario-valor { font-size:12px; color:#333; font-weight:bold; margin-top:2px; }
+.func-status-hoje { margin-top:12px; padding:8px 12px; border-radius:10px; text-align:center; font-size:12px; font-weight:bold; }
+.status-ok { background:linear-gradient(135deg,#e8f5e9,#c8e6c9); color:#2e7d32; }
+.status-pendente { background:linear-gradient(135deg,#fff3e0,#ffe0b2); color:#e65100; }
+.resumo-estatisticas { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:15px; margin-bottom:25px; }
+.stat-card { padding:18px; border-radius:14px; text-align:center; color:white; transition:all 0.3s; }
+.stat-card:hover { transform:translateY(-4px); box-shadow:0 10px 25px rgba(0,0,0,0.2); }
+.stat-card.roxo { background:linear-gradient(135deg,#667eea,#764ba2); }
+.stat-card.verde { background:linear-gradient(135deg,#43e97b,#38f9d7); }
+.stat-card.laranja { background:linear-gradient(135deg,#fa709a,#fee140); }
+.stat-card.azul { background:linear-gradient(135deg,#4facfe,#00f2fe); }
+.stat-numero { font-size:32px; font-weight:bold; display:block; }
+.stat-label { font-size:12px; opacity:0.9; margin-top:4px; display:block; }
+
+/* ========== NOVOS ESTILOS: GERENCIAR ADMINS ========== */
+.admin-item { display:flex; justify-content:space-between; align-items:center; padding:15px; background:#fafafa; border-radius:12px; margin:10px 0; border-left:4px solid #667eea; transition:all 0.3s; }
+.admin-item:hover { background:#f0f4ff; transform:translateX(4px); }
+.admin-info { display:flex; align-items:center; gap:15px; }
+.admin-avatar { width:45px; height:45px; border-radius:50%; background:linear-gradient(135deg,#667eea,#764ba2); display:flex; align-items:center; justify-content:center; color:white; font-weight:bold; font-size:18px; }
+.admin-dados strong { display:block; color:#333; font-size:14px; }
+.admin-dados span { color:#888; font-size:12px; }
+.admin-master { background:linear-gradient(135deg,#fff3e0,#ffe0b2); border-left-color:#ff9800; }
+.admin-master .admin-avatar { background:linear-gradient(135deg,#ff9800,#f57c00); }
 </style>
 </head>
 <body>
 <div class="header">
 <div class="header-content">
 <img src="/static/logo.png?t=""" + ts + """" alt="Logo" class="logo-header" onerror="this.outerHTML='<div class=\\'logo-header-fallback\\'>🏥</div>'">
-<h1>⚙️ Painel Administrativo</h1>
+<h1>⚙️ Painel Administrativo v3.1</h1>
 </div>
 <div class="logout" onclick="sair()">🚪 Sair</div>
 </div>
 <div class="container">
 <div class="tabs">
-<button class="tab ativo" onclick="abrir('cadastro',this)">👤 Cadastrar</button>
-<button class="tab" onclick="abrir('funcionarios',this)">📋 Funcionários</button>
-<button class="tab" onclick="abrir('registros',this)">📊 Registros</button>
-<button class="tab" onclick="abrir('relatorios',this)">📄 Relatórios PDF</button>
-<button class="tab" onclick="abrir('qrcode',this)">📱 QR Code</button>
-<button class="tab tab-badge" onclick="abrir('solicitacoes',this)" id="tabSolicitacoes">📨 Solicitações <span class="badge-notificacao" id="badgeSolic" style="display:none;">0</span></button>
-<button class="tab" onclick="abrir('acessos',this)">📡 Acessos</button>
-<button class="tab" onclick="abrir('config',this)">🔧 Configurações</button>
+<button class="tab ativo" onclick="abrirAba('resumo',this)">📊 Resumo</button>
+<button class="tab" onclick="abrirAba('cadastro',this)">👤 Cadastrar</button>
+<button class="tab" onclick="abrirAba('funcionarios',this)">📋 Funcionários</button>
+<button class="tab" onclick="abrirAba('registros',this)">📊 Registros</button>
+<button class="tab" onclick="abrirAba('relatorios',this)">📄 Relatórios PDF</button>
+<button class="tab" onclick="abrirAba('qrcode',this)">📱 QR Code</button>
+<button class="tab tab-badge" onclick="abrirAba('solicitacoes',this)" id="tabSolicitacoes">📨 Solicitações <span class="badge-notificacao" id="badgeSolic" style="display:none;">0</span></button>
+<button class="tab" onclick="abrirAba('acessos',this)">📡 Acessos</button>
+<button class="tab" onclick="abrirAba('admins',this)">👥 Admins</button>
+<button class="tab" onclick="abrirAba('config',this)">🔧 Configurações</button>
 </div>
-<div id="cadastro" class="painel ativo">
+
+<!-- ========== ABA: RESUMO (NOVA!) ========== -->
+<div id="resumo" class="painel ativo">
+<h2>📊 Resumo da Equipe</h2>
+<div class="resumo-estatisticas" id="estatisticasResumo">
+<div class="stat-card roxo"><span class="stat-numero" id="totalFuncs">0</span><span class="stat-label">Funcionários</span></div>
+<div class="stat-card verde"><span class="stat-numero" id="totalRegistrosHoje">0</span><span class="stat-label">Registros Hoje</span></div>
+<div class="stat-card laranja"><span class="stat-numero" id="totalAtrasos">0</span><span class="stat-label">Atrasos Hoje</span></div>
+<div class="stat-card azul"><span class="stat-numero" id="totalSolicPend">0</span><span class="stat-label">Solicitações Pendentes</span></div>
+</div>
+<h3 style="color:#555;margin-bottom:10px;">👥 Horários da Equipe</h3>
+<div class="resumo-grid" id="gridResumo">
+<div style="grid-column:1/-1;text-align:center;padding:40px;color:#999;">
+<div style="font-size:40px;margin-bottom:10px;opacity:0.5;">⏳</div>
+Carregando dados dos funcionários...
+</div>
+</div>
+</div>
+
+<!-- ========== ABA: CADASTRO ========== -->
+<div id="cadastro" class="painel">
 <h2>Cadastrar Novo Funcionário</h2>
 <div class="mensagem" id="msgCad"></div>
 <label>Nome Completo:</label>
@@ -918,11 +1027,15 @@ label { font-size:13px; color:#555; font-weight:bold; display:block; margin-top:
 </div>
 <button class="btn-success" onclick="cadastrar()">💾 Salvar Cadastro</button>
 </div>
+
+<!-- ========== ABA: FUNCIONÁRIOS ========== -->
 <div id="funcionarios" class="painel">
 <h2>Funcionários Cadastrados</h2>
 <button onclick="carregarFuncs()">🔄 Atualizar Lista</button>
 <table><thead><tr><th>ID</th><th>Nome</th><th>CPF</th><th>Entrada</th><th>Saída Almoço</th><th>Retorno</th><th>Saída</th><th>Ação</th></tr></thead><tbody id="tbodyFunc"></tbody></table>
 </div>
+
+<!-- ========== ABA: REGISTROS ========== -->
 <div id="registros" class="painel">
 <h2>Todos os Registros de Ponto</h2>
 <div class="filtros">
@@ -938,6 +1051,8 @@ label { font-size:13px; color:#555; font-weight:bold; display:block; margin-top:
 </div>
 <table><thead><tr><th>Funcionário</th><th>CPF</th><th>Data</th><th>Hora</th><th>Tipo</th><th>Atrasado</th><th>Min.</th><th>Banco</th><th>Justificativa</th><th>IP</th></tr></thead><tbody id="tbodyReg"></tbody></table>
 </div>
+
+<!-- ========== ABA: RELATÓRIOS ========== -->
 <div id="relatorios" class="painel">
 <h2>Gerar Relatórios em PDF</h2>
 <div class="grid-2">
@@ -956,23 +1071,50 @@ label { font-size:13px; color:#555; font-weight:bold; display:block; margin-top:
 </div>
 </div>
 </div>
+
+<!-- ========== ABA: QR CODE ========== -->
 <div id="qrcode" class="painel">
 <h2>📱 QR Code do Sistema</h2>
 <div class="qr-info"><p><strong>URL Local:</strong></p><p id="urlLocal" style="font-weight:bold;color:#1565c0;"></p></div>
 <button onclick="gerarQR()">🔄 Gerar/Atualizar QR Code</button>
 <div id="qrImg" style="margin-top:20px;"></div>
 </div>
+
+<!-- ========== ABA: SOLICITAÇÕES ========== -->
 <div id="solicitacoes" class="painel">
 <h2>📨 Solicitações Pendentes de Aprovação</h2>
 <div class="info-box">⚠️ Funcionários com atraso superior a 5 minutos precisam de sua aprovação para registrar o ponto. A tela do funcionário fica bloqueada até sua decisão.</div>
 <button onclick="carregarSolicitacoes()">🔄 Atualizar Lista</button>
 <div id="listaSolicitacoes"></div>
 </div>
+
+<!-- ========== ABA: ACESSOS ========== -->
 <div id="acessos" class="painel">
 <h2>📡 Registros de Acesso de Dispositivos</h2>
 <button onclick="carregarAcessos()">🔄 Atualizar</button>
 <table><thead><tr><th>Data/Hora</th><th>CPF</th><th>Funcionário</th><th>IP</th><th>Dispositivo</th><th>Tipo</th></tr></thead><tbody id="tbodyAcessos"></tbody></table>
 </div>
+
+<!-- ========== ABA: ADMINS (NOVA!) ========== -->
+<div id="admins" class="painel">
+<h2>👥 Gerenciar Administradores</h2>
+<div class="info-box">💡 O usuário <strong>admin</strong> é o administrador MASTER e não pode ser excluído. Você pode criar admins adicionais abaixo.</div>
+<div class="card" style="max-width:500px;">
+<h3 style="margin-bottom:15px;color:#555;">➕ Adicionar Novo Admin</h3>
+<div class="mensagem" id="msgAdmin"></div>
+<label>Usuário (login):</label>
+<input type="text" id="novoAdminUser" placeholder="Ex: rh.clinica">
+<label>Nome Completo:</label>
+<input type="text" id="novoAdminNome" placeholder="Ex: Recursos Humanos">
+<label>Senha:</label>
+<input type="password" id="novoAdminSenha" placeholder="Digite uma senha forte">
+<button class="btn-success" onclick="cadastrarAdmin()">💾 Criar Admin</button>
+</div>
+<h3 style="margin-top:30px;color:#555;">📋 Administradores Cadastrados</h3>
+<div id="listaAdmins"></div>
+</div>
+
+<!-- ========== ABA: CONFIGURAÇÕES ========== -->
 <div id="config" class="painel">
 <h2>🔧 Configurações</h2>
 <div class="card">
@@ -980,8 +1122,12 @@ label { font-size:13px; color:#555; font-weight:bold; display:block; margin-top:
 <p style="font-size:14px;line-height:1.6;">Coloque sua logo em <strong>static/logo.png</strong> (formato PNG).<br>Se não aparecer, pressione <strong>Ctrl+F5</strong>.</p>
 </div>
 <div class="card">
-<h3 style="margin-bottom:10px;">🔐 Credenciais de Acesso</h3>
+<h3 style="margin-bottom:10px;">🔐 Credenciais de Acesso Master</h3>
 <p style="font-size:14px;"><strong>Usuário:</strong> admin<br><strong>Senha:</strong> 3223ronte</p>
+</div>
+<div class="card">
+<h3 style="margin-bottom:10px;">👥 Múltiplos Admins</h3>
+<p style="font-size:14px;line-height:1.6;">Agora você pode criar administradores adicionais na aba <strong>👥 Admins</strong>. Cada admin tem seu próprio usuário e senha para acessar o painel.</p>
 </div>
 <div class="card">
 <h3 style="margin-bottom:10px;">🛡️ Segurança</h3>
@@ -998,30 +1144,45 @@ label { font-size:13px; color:#555; font-weight:bold; display:block; margin-top:
 </div>
 </div>
 <script>
+// ========== CONFIGURAÇÕES INICIAIS ==========
 const h=new Date();const ma=h.toISOString().slice(0,7);
-document.getElementById('mesAno').value=ma;document.getElementById('mesAnoFunc').value=ma;
+document.getElementById('mesAno').value=ma;
+document.getElementById('mesAnoFunc').value=ma;
 document.getElementById('urlLocal').textContent=window.location.origin+'/';
-document.getElementById('cpfCad').addEventListener('input',function(){this.value=this.value.replace(/\\D/g,'');});
-let pollingAdmin=null;
-function abrir(n,btn){
-  document.querySelectorAll('.painel').forEach(p=>p.classList.remove('ativo'));
-  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('ativo'));
-  document.getElementById(n).classList.add('ativo');btn.classList.add('ativo');
-  if(n==='funcionarios')carregarFuncs();
-  if(n==='registros')carregarRegs();
-  if(n==='relatorios')carregarSel();
-  if(n==='acessos')carregarAcessos();
-  if(n==='solicitacoes')carregarSolicitacoes();
+document.getElementById('cpfCad').addEventListener('input',function(){this.value=this.value.replace(/\\\\D/g,'');});
+
+// ========== SISTEMA DE ABAS (CORRIGIDO!) ==========
+function abrirAba(nomeId, botao){
+  // Remove classe ativo de TODOS os painéis
+  document.querySelectorAll('.painel').forEach(function(p){
+    p.classList.remove('ativo');
+  });
+  // Remove classe ativo de TODAS as abas
+  document.querySelectorAll('.tab').forEach(function(t){
+    t.classList.remove('ativo');
+  });
+  // Ativa o painel selecionado
+  document.getElementById(nomeId).classList.add('ativo');
+  // Ativa o botão da aba
+  botao.classList.add('ativo');
+  // Carrega dados específicos conforme a aba
+  if(nomeId==='resumo')carregarResumo();
+  if(nomeId==='funcionarios')carregarFuncs();
+  if(nomeId==='registros')carregarRegs();
+  if(nomeId==='relatorios')carregarSel();
+  if(nomeId==='acessos')carregarAcessos();
+  if(nomeId==='solicitacoes')carregarSolicitacoes();
+  if(nomeId==='admins')carregarAdmins();
 }
 
-// Iniciar polling para verificar solicitações pendentes e atualizar badge
+// ========== POLLING PARA SOLICITAÇÕES ==========
+let pollingAdmin=null;
 function iniciarPollingAdmin(){
   pararPollingAdmin();
   pollingAdmin=setInterval(atualizarBadgeSolic,5000);
   atualizarBadgeSolic();
 }
 function pararPollingAdmin(){if(pollingAdmin){clearInterval(pollingAdmin);pollingAdmin=null;}}
-
 async function atualizarBadgeSolic(){
   try{
     const r=await fetch('/api/solicitacoes_pendentes');
@@ -1036,18 +1197,75 @@ async function atualizarBadgeSolic(){
     }
   }catch(e){}
 }
+setTimeout(iniciarPollingAdmin,1000);
 
+// ========== NOVA FUNÇÃO: CARREGAR RESUMO ==========
+async function carregarResumo(){
+  try{
+    const r=await fetch('/api/funcionarios');
+    if(r.status===401){window.location.href='/admin';return;}
+    const funcs=await r.json();
+    
+    const r2=await fetch('/api/registros');
+    let registros=[];
+    if(r2.ok)registros=await r2.json();
+    
+    const r3=await fetch('/api/solicitacoes_pendentes');
+    let solics=[];
+    if(r3.ok)solics=await r3.json();
+    
+    // Estatísticas
+    document.getElementById('totalFuncs').textContent=funcs.length;
+    
+    const hoje=new Date().toISOString().slice(0,10);
+    const regsHoje=registros.filter(function(x){
+      const partes=x.data.split('/');
+      const dataReg=partes[2]+'-'+partes[1]+'-'+partes[0];
+      return dataReg===hoje;
+    });
+    document.getElementById('totalRegistrosHoje').textContent=regsHoje.length;
+    
+    const atrasosHoje=regsHoje.filter(function(x){return x.atrasado;}).length;
+    document.getElementById('totalAtrasos').textContent=atrasosHoje;
+    document.getElementById('totalSolicPend').textContent=solics.length;
+    
+    // Grid de funcionários
+    const grid=document.getElementById('gridResumo');
+    if(funcs.length===0){
+      grid.innerHTML='<div style="grid-column:1/-1;text-align:center;padding:40px;color:#999;"><div style="font-size:40px;margin-bottom:10px;opacity:0.5;">👥</div>Nenhum funcionário cadastrado ainda.</div>';
+      return;
+    }
+    
+    grid.innerHTML=funcs.map(function(f){
+      const inicial=f.nome.charAt(0).toUpperCase();
+      return '<div class="func-card-resumo">'+
+        '<div class="func-avatar">'+inicial+'</div>'+
+        '<div class="func-nome-resumo">'+f.nome+'</div>'+
+        '<div class="func-cpf-resumo">CPF: '+f.cpf.replace(/(\\\\d{3})(\\\\d{3})(\\\\d{3})(\\\\d{2})/,'$1.$2.$3-$4')+'</div>'+
+        '<div class="func-horarios-resumo">'+
+          '<div class="func-horario-item"><span class="func-horario-icone">🌅</span><span class="func-horario-label">Entrada</span><span class="func-horario-valor">'+f.horario_entrada+'</span></div>'+
+          '<div class="func-horario-item"><span class="func-horario-icone">🍽️</span><span class="func-horario-label">Almoço</span><span class="func-horario-valor">'+f.horario_saida_almoco+'</span></div>'+
+          '<div class="func-horario-item"><span class="func-horario-icone">↩️</span><span class="func-horario-label">Retorno</span><span class="func-horario-valor">'+f.horario_retorno_almoco+'</span></div>'+
+          '<div class="func-horario-item"><span class="func-horario-icone">🌙</span><span class="func-horario-label">Saída</span><span class="func-horario-valor">'+f.horario_saida+'</span></div>'+
+        '</div>'+
+        '<div class="func-status-hoje status-pendente">⏰ Horários definidos</div>'+
+      '</div>';
+    }).join('');
+  }catch(e){
+    document.getElementById('gridResumo').innerHTML='<div style="grid-column:1/-1;text-align:center;padding:40px;color:#f44336;">Erro ao carregar dados.</div>';
+  }
+}
+
+// ========== SOLICITAÇÕES ==========
 async function carregarSolicitacoes(){
   const r=await fetch('/api/solicitacoes_pendentes');
   if(r.status===401){window.location.href='/admin';return;}
   const d=await r.json();
   const lista=document.getElementById('listaSolicitacoes');
-  
   if(d.length===0){
     lista.innerHTML='<div class="alerta-solic-vazio"><span class="icone-grande">✅</span>Nenhuma solicitação pendente no momento.</div>';
     return;
   }
-  
   lista.innerHTML=d.map(function(s){
     const ct='tipo-'+s.tipo.toLowerCase().replace(/_/g,'-')+'-bg';
     const atrasoClasse=s.minutos_atraso>=15?'solic-card atraso-alto':'solic-card';
@@ -1062,8 +1280,6 @@ async function carregarSolicitacoes(){
         '<div class="solic-detalhe-item"><strong>Hora</strong>'+s.hora+'</div>'+
         '<div class="solic-detalhe-item"><strong>Atraso</strong><span style="color:#f44336;font-weight:bold;">'+s.minutos_atraso+' min</span></div>'+
         '<div class="solic-detalhe-item"><strong>CPF</strong>'+s.cpf+'</div>'+
-        '<div class="solic-detalhe-item"><strong>Horário Padrão</strong>'+(s.tipo==='SAIDA'?s.horario_saida:s.horario_entrada)+'</div>'+
-        '<div class="solic-detalhe-item"><strong>IP</strong><span style="font-size:10px;">'+(s.ip||'-')+'</span></div>'+
       '</div>'+
       justificativa+
       '<div class="solic-acoes">'+
@@ -1073,9 +1289,8 @@ async function carregarSolicitacoes(){
     '</div>';
   }).join('');
 }
-
 async function aprovarSolic(id){
-  if(!confirm('✅ Confirmar aprovação?\n\nO ponto será registrado para este funcionário.'))return;
+  if(!confirm('✅ Confirmar aprovação?\\n\\nO ponto será registrado para este funcionário.'))return;
   try{
     const r=await fetch('/api/solicitacoes/'+id+'/aprovar',{method:'POST',headers:{'Content-Type':'application/json'}});
     if(r.status===401){window.location.href='/admin';return;}
@@ -1084,10 +1299,10 @@ async function aprovarSolic(id){
       alert('✅ Solicitação aprovada! Ponto registrado.');
       carregarSolicitacoes();
       atualizarBadgeSolic();
+      carregarResumo();
     }else alert('❌ Erro: '+(d.detail||'Erro ao aprovar'));
   }catch(e){alert('Erro de conexão!');}
 }
-
 async function negarSolic(id){
   const motivo=prompt('❌ Informe o motivo da negativa (será exibido ao funcionário):');
   if(motivo===null)return;
@@ -1099,29 +1314,37 @@ async function negarSolic(id){
       alert('❌ Solicitação negada. O funcionário será notificado.');
       carregarSolicitacoes();
       atualizarBadgeSolic();
+      carregarResumo();
     }else alert('❌ Erro: '+(d.detail||'Erro ao negar'));
   }catch(e){alert('Erro de conexão!');}
 }
 
-// Iniciar polling quando a página carregar
-setTimeout(iniciarPollingAdmin,1000);
+// ========== FUNÇÕES GERAIS ==========
 function sair(){document.cookie='sessao_admin=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';window.location.href='/admin';}
 function msg(id,texto,tipo){const e=document.getElementById(id);e.textContent=texto;e.className='mensagem '+tipo;setTimeout(()=>e.className='mensagem',4000);}
+
 async function cadastrar(){
-  const d={nome:document.getElementById('nome').value.trim(),cpf:document.getElementById('cpfCad').value.replace(/\\D/g,''),horario_entrada:document.getElementById('hEntrada').value.trim()||'08:00:00',horario_saida_almoco:document.getElementById('hSaidaAlmoco').value.trim()||'12:00:00',horario_retorno_almoco:document.getElementById('hRetornoAlmoco').value.trim()||'13:00:00',horario_saida:document.getElementById('hSaida').value.trim()||'18:00:00'};
+  const d={nome:document.getElementById('nome').value.trim(),cpf:document.getElementById('cpfCad').value.replace(/\\\\D/g,''),horario_entrada:document.getElementById('hEntrada').value.trim()||'08:00:00',horario_saida_almoco:document.getElementById('hSaidaAlmoco').value.trim()||'12:00:00',horario_retorno_almoco:document.getElementById('hRetornoAlmoco').value.trim()||'13:00:00',horario_saida:document.getElementById('hSaida').value.trim()||'18:00:00'};
   if(!d.nome||!d.cpf){msg('msgCad','Preencha nome e CPF!','erro');return;}
   if(d.cpf.length!==11){msg('msgCad','CPF deve ter 11 dígitos!','erro');return;}
   const r=await fetch('/api/funcionarios',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});
-  if(r.ok){msg('msgCad','✅ Funcionário cadastrado!','sucesso');document.getElementById('nome').value='';document.getElementById('cpfCad').value='';}
-  else{const e=await r.json();msg('msgCad','❌ '+(e.detail||'Erro'),'erro');}
+  if(r.ok){
+    msg('msgCad','✅ Funcionário cadastrado!','sucesso');
+    document.getElementById('nome').value='';
+    document.getElementById('cpfCad').value='';
+    carregarResumo();
+  }else{const e=await r.json();msg('msgCad','❌ '+(e.detail||'Erro'),'erro');}
 }
+
 async function carregarFuncs(){
   const r=await fetch('/api/funcionarios');if(r.status===401){window.location.href='/admin';return;}
   const d=await r.json();const tb=document.getElementById('tbodyFunc');
   if(d.length===0){tb.innerHTML='<tr><td colspan="8" style="text-align:center;color:#999;padding:20px;">Nenhum cadastrado.</td></tr>';return;}
   tb.innerHTML=d.map(f=>'<tr><td>'+f.id+'</td><td>'+f.nome+'</td><td>'+f.cpf+'</td><td><strong>'+f.horario_entrada+'</strong></td><td>'+f.horario_saida_almoco+'</td><td>'+f.horario_retorno_almoco+'</td><td><strong>'+f.horario_saida+'</strong></td><td><button class="btn-danger btn-small" onclick="excluir('+f.id+')">Excluir</button></td></tr>').join('');
 }
-async function excluir(id){if(confirm('Tem CERTEZA? Todos os registros serão APAGADOS!')){const r=await fetch('/api/funcionarios/'+id,{method:'DELETE'});if(r.status===401){window.location.href='/admin';return;}carregarFuncs();}}
+
+async function excluir(id){if(confirm('Tem CERTEZA? Todos os registros serão APAGADOS!')){const r=await fetch('/api/funcionarios/'+id,{method:'DELETE'});if(r.status===401){window.location.href='/admin';return;}carregarFuncs();carregarResumo();}}
+
 async function carregarRegs(){
   const r=await fetch('/api/registros');if(r.status===401){window.location.href='/admin';return;}
   let d=await r.json();
@@ -1141,26 +1364,112 @@ async function carregarRegs(){
     return '<tr class="'+cf+'"><td>'+r.nome+'</td><td>'+r.cpf+'</td><td>'+r.data+'</td><td>'+r.hora+'</td><td class="'+ct+'">'+r.tipo_formatado+'</td><td class="'+(r.atrasado?'atrasado':'')+'">'+(r.atrasado?'⚠️ SIM':'✅ NÃO')+'</td><td>'+mh+'</td><td>'+bh+'</td><td>'+jt+'</td><td style="font-size:11px;color:#888;">'+ip+'</td></tr>';
   }).join('');
 }
+
 async function carregarSel(){
   const r=await fetch('/api/funcionarios');if(r.status===401){window.location.href='/admin';return;}
   const d=await r.json();const s=document.getElementById('selFunc');
   if(d.length===0){s.innerHTML='<option value="">Cadastre funcionários primeiro</option>';return;}
   s.innerHTML=d.map(f=>'<option value="'+f.id+'">'+f.nome+' ('+f.cpf+')</option>').join('');
 }
+
 function gerarGeral(){const m=document.getElementById('mesAno').value;if(!m){alert('Selecione o mês!');return;}window.open('/api/pdf/geral?mes='+m,'_blank');}
 function gerarInd(){const i=document.getElementById('selFunc').value;const m=document.getElementById('mesAnoFunc').value;if(!i||!m){alert('Preencha todos os campos!');return;}window.open('/api/pdf/funcionario/'+i+'?mes='+m,'_blank');}
+
 async function gerarQR(){
   const r=await fetch('/api/gerar_qrcode');if(r.status===401){window.location.href='/admin';return;}
   const d=await r.json();
   if(d.detail)document.getElementById('qrImg').innerHTML='<p style="color:#f44336;">❌ '+d.detail+'</p>';
   else document.getElementById('qrImg').innerHTML='<img src="'+d.caminho+'?t='+Date.now()+'" style="max-width:250px;border:3px solid #ddd;border-radius:14px;box-shadow:0 8px 25px rgba(0,0,0,0.15);">';
 }
+
 async function carregarAcessos(){
   const r=await fetch('/api/acessos');if(r.status===401){window.location.href='/admin';return;}
   const d=await r.json();const tb=document.getElementById('tbodyAcessos');
   if(d.length===0){tb.innerHTML='<tr><td colspan="6" style="text-align:center;color:#999;padding:20px;">Nenhum acesso registrado.</td></tr>';return;}
   tb.innerHTML=d.map(a=>'<tr><td>'+a.data_hora+'</td><td>'+a.cpf+'</td><td>'+(a.nome||'<span style="color:#999;">-</span>')+'</td><td style="font-size:11px;color:#555;">'+a.ip+'</td><td style="font-size:10px;color:#888;max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="'+(a.user_agent||'').replace(/"/g,'&quot;')+'">'+(a.user_agent||'-')+'</td><td>'+a.tipo_acesso+'</td></tr>').join('');
 }
+
+// ========== NOVAS FUNÇÕES: GERENCIAR ADMINS ==========
+async function cadastrarAdmin(){
+  const usuario=document.getElementById('novoAdminUser').value.trim();
+  const nome=document.getElementById('novoAdminNome').value.trim();
+  const senha=document.getElementById('novoAdminSenha').value;
+  if(!usuario||!senha){msg('msgAdmin','Preencha usuário e senha!','erro');return;}
+  try{
+    const r=await fetch('/api/admins',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({usuario:usuario,nome_completo:nome,senha:senha})});
+    if(r.status===401){window.location.href='/admin';return;}
+    const d=await r.json();
+    if(r.ok){
+      msg('msgAdmin','✅ Admin criado com sucesso!','sucesso');
+      document.getElementById('novoAdminUser').value='';
+      document.getElementById('novoAdminNome').value='';
+      document.getElementById('novoAdminSenha').value='';
+      carregarAdmins();
+    }else{msg('msgAdmin','❌ '+(d.detail||'Erro'),'erro');}
+  }catch(e){msg('msgAdmin','Erro de conexão!','erro');}
+}
+
+async function carregarAdmins(){
+  try{
+    const r=await fetch('/api/admins');
+    if(r.status===401){window.location.href='/admin';return;}
+    const admins=await r.json();
+    const lista=document.getElementById('listaAdmins');
+    
+    // Admin Master sempre primeiro
+    let html='<div class="admin-item admin-master">'+
+      '<div class="admin-info">'+
+        '<div class="admin-avatar">👑</div>'+
+        '<div class="admin-dados">'+
+          '<strong>admin</strong>'+
+          '<span>Administrador Master (padrão do sistema)</span>'+
+        '</div>'+
+      '</div>'+
+      '<span style="background:#ff9800;color:white;padding:4px 12px;border-radius:20px;font-size:11px;font-weight:bold;">MASTER</span>'+
+    '</div>';
+    
+    // Admins adicionais
+    admins.forEach(function(a){
+      const inicial=(a.nome_completo||a.usuario).charAt(0).toUpperCase();
+      html+='<div class="admin-item" id="admin-'+a.id+'">'+
+        '<div class="admin-info">'+
+          '<div class="admin-avatar">'+inicial+'</div>'+
+          '<div class="admin-dados">'+
+            '<strong>'+a.usuario+'</strong>'+
+            '<span>'+(a.nome_completo||'Sem nome')+'</span>'+
+          '</div>'+
+        '</div>'+
+        '<button class="btn-danger btn-small" onclick="excluirAdmin('+a.id+',\\''+a.usuario+'\\')">🗑️ Excluir</button>'+
+      '</div>';
+    });
+    
+    if(admins.length===0){
+      html+='<div style="text-align:center;padding:30px;color:#999;font-size:14px;">Nenhum admin adicional cadastrado.</div>';
+    }
+    
+    lista.innerHTML=html;
+  }catch(e){
+    document.getElementById('listaAdmins').innerHTML='<p style="color:#f44336;">Erro ao carregar admins.</p>';
+  }
+}
+
+async function excluirAdmin(id,usuario){
+  if(!confirm('Tem CERTEZA que deseja excluir o admin "'+usuario+'"?\\n\\nEsta ação não pode ser desfeita.'))return;
+  try{
+    const r=await fetch('/api/admins/'+id,{method:'DELETE'});
+    if(r.status===401){window.location.href='/admin';return;}
+    if(r.ok){
+      alert('✅ Admin excluído com sucesso!');
+      carregarAdmins();
+    }else{
+      const d=await r.json();
+      alert('❌ Erro: '+(d.detail||'Erro ao excluir'));
+    }
+  }catch(e){alert('Erro de conexão!');}
+}
+
+// Carregar resumo ao iniciar
+setTimeout(carregarResumo,500);
 </script>
 </body>
 </html>"""
@@ -1241,10 +1550,22 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
             return
         
-        rotas_admin = ["/api/funcionarios", "/api/registros", "/api/gerar_qrcode", "/api/pdf/geral", "/api/logout", "/api/acessos", "/api/solicitacoes_pendentes"]
-        precisa_login = (caminho in rotas_admin or caminho.startswith("/api/funcionarios/") or caminho.startswith("/api/pdf/funcionario/") or caminho.startswith("/api/solicitacoes/"))
+        # Rotas que precisam de login admin
+        rotas_admin = [
+            "/api/funcionarios", "/api/registros", "/api/gerar_qrcode", 
+            "/api/pdf/geral", "/api/logout", "/api/acessos", 
+            "/api/solicitacoes_pendentes", "/api/admins"
+        ]
         
-        # Rota para funcionário consultar status da sua solicitação
+        precisa_login = (
+            caminho in rotas_admin or 
+            caminho.startswith("/api/funcionarios/") or 
+            caminho.startswith("/api/pdf/funcionario/") or 
+            caminho.startswith("/api/solicitacoes/") or
+            caminho.startswith("/api/admins/")
+        )
+        
+        # Rota para funcionário consultar status da sua solicitação (NÃO precisa de login admin)
         if caminho.startswith("/api/solicitacao_status/"):
             cpf = formatar_cpf(caminho.replace("/api/solicitacao_status/", ""))
             if len(cpf) != 11:
@@ -1252,7 +1573,6 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 return
             try:
                 conn = get_db()
-                # Buscar solicitação mais recente deste CPF
                 solic = conn.execute("""
                     SELECT s.*, f.nome FROM solicitacoes_pendentes s
                     JOIN funcionarios f ON s.funcionario_id = f.id
@@ -1280,6 +1600,23 @@ class ServidorPonto(BaseHTTPRequestHandler):
         
         if precisa_login and not verificar_login(self):
             responder_json(self, {"detail": "Não autorizado. Faça login."}, status=401)
+            return
+        
+        # ===== NOVA ROTA: Listar admins adicionais =====
+        if caminho == "/api/admins":
+            try:
+                conn = get_db()
+                admins = conn.execute("SELECT id, usuario, nome_completo, criado_em FROM admins ORDER BY id").fetchall()
+                conn.close()
+                resultado = [{
+                    "id": a["id"],
+                    "usuario": a["usuario"],
+                    "nome_completo": a["nome_completo"],
+                    "criado_em": a["criado_em"]
+                } for a in admins]
+                responder_json(self, resultado)
+            except Exception as e:
+                responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
             return
         
         if caminho == "/api/solicitacoes_pendentes":
@@ -1378,7 +1715,8 @@ class ServidorPonto(BaseHTTPRequestHandler):
                     dh = datetime.strptime(a["data_hora_acesso"], "%Y-%m-%d %H:%M:%S")
                     resultado.append({
                         "data_hora": dh.strftime("%d/%m/%Y %H:%M:%S"),
-                        "cpf": a["cpf"], "nome": a["nome"],
+                        "cpf": a["cpf"],
+                        "nome": a["nome"],
                         "ip": a["ip_dispositivo"] or "",
                         "user_agent": a["user_agent"] or "",
                         "tipo_acesso": a["tipo_acesso"] or ""
@@ -1479,12 +1817,14 @@ class ServidorPonto(BaseHTTPRequestHandler):
             usuario = sanitizar_texto(dados.get("usuario", ""), 50)
             senha = sanitizar_texto(dados.get("senha", ""), 100)
             
-            if usuario == ADMIN_USUARIO and senha == ADMIN_SENHA:
+            login_ok, nome_admin = verificar_credenciais_admin(usuario, senha)
+            
+            if login_ok:
                 token = gerar_sessao()
                 sessoes_admin[token] = agora_brasilia() + timedelta(hours=8)
                 cookie = f"sessao_admin={token}; Path=/; Max-Age=28800; HttpOnly; SameSite=Lax"
                 tentativas_login.pop(ip_cliente, None)
-                print(f"[LOGIN OK] Admin de {ip_cliente}")
+                print(f"[LOGIN OK] Admin '{nome_admin}' de {ip_cliente}")
                 responder_json(self, {"status": "ok", "mensagem": "Login realizado"}, cookies_extra=[cookie])
             else:
                 print(f"[LOGIN FALHA] {ip_cliente} user={usuario}")
@@ -1593,7 +1933,6 @@ class ServidorPonto(BaseHTTPRequestHandler):
                         info = f"Antecipada em {minutos} minuto(s)"
                 
                 conn.close()
-                # BLOQUEIO: se atrasado (já passou da tolerância de 5min), precisa de aprovação admin
                 bloqueado = (atrasado == 1)
                 responder_json(self, {
                     "precisa_justificativa": (minutos > 0 and not bloqueado),
@@ -1650,7 +1989,6 @@ class ServidorPonto(BaseHTTPRequestHandler):
                     responder_json(self, {"detail": f"⛔ {TIPOS_REGISTRO[tipo]['label']} JÁ registrada hoje!"}, status=400)
                     return
                 
-                # Verificar se já existe solicitação pendente para este tipo hoje
                 solic_existente = conn.execute("""
                     SELECT id FROM solicitacoes_pendentes 
                     WHERE funcionario_id = ? AND strftime('%Y-%m-%d', data_hora_solicitacao) = ? 
@@ -1666,7 +2004,6 @@ class ServidorPonto(BaseHTTPRequestHandler):
                     })
                     return
                 
-                # Calcular atraso para registrar na solicitação
                 atrasado = 0
                 minutos_atraso = 0
                 if tipo == "ENTRADA":
@@ -1697,7 +2034,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 responder_json(self, {
                     "status": "solicitado",
                     "solicitacao_id": solic_id,
-                    "mensagem": f"Solicitação enviada para aprovação do administrador.\n\n{tipo_info['icone']} {tipo_info['label']}\n👤 {func['nome']}\n⏰ {hora_str}\n⚠️ Atraso: {minutos_atraso} min\n\nAguarde a aprovação..."
+                    "mensagem": f"Solicitação enviada para aprovação do administrador."
                 })
             except Exception as e:
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
@@ -1771,11 +2108,11 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 conn.close()
                 
                 tipo_info = TIPOS_REGISTRO[tipo]
-                msg = f"{tipo_info['icone']} {tipo_info['label']} registrada!\n"
-                msg += f"👤 {func['nome']}\n📅 {agora.strftime('%d/%m/%Y')}\n⏰ {hora_str}"
-                if atrasado: msg += f"\n⚠️ Atraso: {minutos_atraso} min"
-                if minutos_banco > 0: msg += f"\n⏱️ Banco de horas: +{minutos_banco} min"
-                if justificativa: msg += f"\n📝 Justificativa registrada"
+                msg = f"{tipo_info['icone']} {tipo_info['label']} registrada!\\n"
+                msg += f"👤 {func['nome']}\\n📅 {agora.strftime('%d/%m/%Y')}\\n⏰ {hora_str}"
+                if atrasado: msg += f"\\n⚠️ Atraso: {minutos_atraso} min"
+                if minutos_banco > 0: msg += f"\\n⏱️ Banco de horas: +{minutos_banco} min"
+                if justificativa: msg += f"\\n📝 Justificativa registrada"
                 
                 print(f"[PONTO] {func['nome']} | {tipo} | {hora_str} | IP:{ip_cliente}")
                 responder_json(self, {"mensagem": msg})
@@ -1783,8 +2120,47 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
             return
         
+        # ===== ROTAS QUE PRECISAM DE LOGIN ADMIN =====
         if not verificar_login(self):
             responder_json(self, {"detail": "Não autorizado"}, status=401)
+            return
+        
+        # ===== NOVA ROTA: Criar admin =====
+        if caminho == "/api/admins":
+            usuario = sanitizar_texto(dados.get("usuario", ""), 50)
+            nome_completo = sanitizar_texto(dados.get("nome_completo", ""), 100)
+            senha = dados.get("senha", "")
+            
+            if not usuario or not senha:
+                responder_json(self, {"detail": "Preencha usuário e senha!"}, status=400)
+                return
+            
+            if usuario.lower() == ADMIN_USUARIO.lower():
+                responder_json(self, {"detail": "Este usuário é o admin master e já existe!"}, status=400)
+                return
+            
+            try:
+                conn = get_db()
+                existe = conn.execute("SELECT id FROM admins WHERE usuario = ?", (usuario,)).fetchone()
+                if existe:
+                    conn.close()
+                    responder_json(self, {"detail": "Usuário já existe!"}, status=400)
+                    return
+                
+                criado_em = agora_brasilia().strftime("%Y-%m-%d %H:%M:%S")
+                conn.execute("""
+                    INSERT INTO admins (usuario, senha, nome_completo, criado_em)
+                    VALUES (?, ?, ?, ?)
+                """, (usuario, hash_senha(senha), nome_completo, criado_em))
+                conn.commit()
+                
+                novo_id = conn.execute("SELECT last_insert_rowid() as id").fetchone()["id"]
+                conn.close()
+                
+                print(f"[ADMIN CRIADO] Usuário: {usuario} | Nome: {nome_completo}")
+                responder_json(self, {"status": "ok", "id": novo_id, "usuario": usuario})
+            except Exception as e:
+                responder_json(self, {"detail": f"Erro BD: {str(e)}"}, status=500)
             return
         
         if caminho.startswith("/api/solicitacoes/") and caminho.endswith("/aprovar"):
@@ -1808,14 +2184,11 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 agora = agora_brasilia()
                 data_hora_aprovacao = agora.strftime("%Y-%m-%d %H:%M:%S")
                 
-                # Usar a data/hora original da solicitação para o registro
                 data_hora_registro = solic["data_hora_solicitacao"]
                 hora_str = data_hora_registro.split(" ")[1] if " " in data_hora_registro else data_hora_registro
                 
-                # Calcular banco de horas
                 minutos_banco = calcular_banco_horas(solic["tipo"], hora_str, func)
                 
-                # Registrar o ponto efetivamente
                 conn.execute("""
                     INSERT INTO registros_ponto 
                     (funcionario_id, data_hora, tipo, atrasado, minutos_atraso, minutos_banco_horas, 
@@ -1826,7 +2199,6 @@ class ServidorPonto(BaseHTTPRequestHandler):
                       solic["justificativa"], solic["ip_dispositivo"], 
                       solic["user_agent"], data_hora_aprovacao))
                 
-                # Atualizar status da solicitação
                 conn.execute("""
                     UPDATE solicitacoes_pendentes 
                     SET status = 'APROVADA', data_hora_aprovacao = ?, admin_aprovador = ?
@@ -1836,7 +2208,6 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 conn.commit()
                 conn.close()
                 
-                tipo_info = TIPOS_REGISTRO[solic["tipo"]]
                 print(f"[APROVADA #{solic_id}] {func['nome']} | {solic['tipo']} | Atraso: {solic['minutos_atraso']}min")
                 responder_json(self, {"status": "ok", "mensagem": f"Solicitação aprovada! Ponto registrado para {func['nome']}."})
             except ValueError:
@@ -1926,13 +2297,36 @@ class ServidorPonto(BaseHTTPRequestHandler):
         responder_json(self, {"detail": "Rota não encontrada"}, status=404)
     
     def do_DELETE(self):
-# ===================== GERAÇÃO DE PDF =====================
         if not verificar_login(self):
             responder_json(self, {"detail": "Não autorizado"}, status=401)
             return
         
         url = urlparse(self.path)
         caminho = url.path
+        
+        # ===== NOVA ROTA: Excluir admin =====
+        if caminho.startswith("/api/admins/"):
+            try:
+                admin_id = int(caminho.replace("/api/admins/", ""))
+                conn = get_db()
+                admin = conn.execute("SELECT * FROM admins WHERE id = ?", (admin_id,)).fetchone()
+                
+                if not admin:
+                    conn.close()
+                    responder_json(self, {"detail": "Admin não encontrado"}, status=404)
+                    return
+                
+                conn.execute("DELETE FROM admins WHERE id = ?", (admin_id,))
+                conn.commit()
+                conn.close()
+                
+                print(f"[ADMIN EXCLUÍDO] ID: {admin_id} | Usuário: {admin['usuario']}")
+                responder_json(self, {"status": "ok"})
+            except ValueError:
+                responder_json(self, {"detail": "ID inválido"}, status=400)
+            except Exception as e:
+                responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
+            return
         
         if caminho.startswith("/api/funcionarios/"):
             try:
@@ -2026,7 +2420,6 @@ def desenhar_pagina_funcionario(c, func, registros, mes, dias_semana, altura, la
         if reg["atrasado"]:
             c.setFillColor(colors.HexColor("#f44336"))
             c.drawString(240, y, "SIM")
-            c.setFillColor(colors.black)
             total_atrasos += 1
         else:
             c.drawString(240, y, "Nao")
@@ -2168,29 +2561,30 @@ def gerar_pdf_individual(func_id, mes):
 # ===================== INICIAR SERVIDOR =====================
 if __name__ == "__main__":
     print("=" * 65)
-    print("   SISTEMA DE PONTO v3.0 SECURE - FUNCIONANDO!")
+    print("   🚀 SISTEMA DE PONTO v3.1 - FUNCIONANDO!")
     print("=" * 65)
-    print(f"Pagina inicial (CPF):   http://localhost:{PORTA}")
-    print(f"Painel Funcionario:     http://localhost:{PORTA}/funcionario")
-    print(f"Login Admin:            http://localhost:{PORTA}/admin")
-    print(f"Usuario: {ADMIN_USUARIO} | Senha: {ADMIN_SENHA}")
+    print(f"📱 Página do funcionário:  http://localhost:{PORTA}")
+    print(f"👤 Painel Funcionário:     http://localhost:{PORTA}/funcionario")
+    print(f"🔐 Login Admin:            http://localhost:{PORTA}/admin")
+    print(f"👤 Usuário: {ADMIN_USUARIO}   |   Senha: {ADMIN_SENHA}")
     print("=" * 65)
-    print("NOVAS FUNCIONALIDADES v3.0:")
-    print("  - Tela de login separada para funcionario")
-    print("  - Registro de IP e dispositivo em cada acesso")
-    print("  - Rate limiting contra brute force")
-    print("  - Anti-duplicata (mesmo tipo nao pode 2x no dia)")
-    print("  - Justificativa flexivel para qualquer horario")
-    print("  - Design moderno com efeitos 5D e animacoes")
-    print("  - Desenvolvido por WELL")
+    print("✨ NOVAS FUNCIONALIDADES v3.1:")
+    print("   👥 Sistema de múltiplos administradores")
+    print("   📊 Painel de resumo visual da equipe")
+    print("   🎨 Cards coloridos com horários dos funcionários")
+    print("   🔧 Gerenciamento completo de admins (CRUD)")
+    print("   ✅ Correção total das abas do painel admin")
     print("=" * 65)
-    print(f"Acesso WI-FI: http://SEU_IP:{PORTA}")
+    print("📝 4 opções de registro:")
+    print("   ✅ ENTRADA  |  🍽️ SAÍDA ALMOÇO  |  ↩️ RETORNO ALMOÇO  |  🚪 SAÍDA")
     print("=" * 65)
-    print("\nServidor rodando... Ctrl+C para parar.\n")
+    print(f"🌐 Acesso na rede WI-FI: http://SEU_IP:{PORTA}")
+    print("   (descubra seu IP com o comando: ipconfig / ifconfig)")
+    print("=" * 65)
+    print("\nServidor rodando... Aperte Ctrl+C para parar.\n")
     
     try:
         servidor = HTTPServer(("0.0.0.0", PORTA), ServidorPonto)
         servidor.serve_forever()
     except KeyboardInterrupt:
         print("\nServidor parado.")
-        servidor.server_close()
