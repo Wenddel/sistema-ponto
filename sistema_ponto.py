@@ -1,4 +1,3 @@
-import sqlite3
 import json
 import os
 import io
@@ -101,75 +100,192 @@ def criar_logo_padrao():
         print(f"[LOGO] Erro: {e}")
         return False
 
+# ===================== DETECCAO AUTOMATICA DO BANCO =====================
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+USAR_POSTGRES = bool(DATABASE_URL)
+
+if USAR_POSTGRES:
+    try:
+        import psycopg2
+        import psycopg2.extras
+        print("[BD] PostgreSQL detectado via DATABASE_URL")
+    except ImportError:
+        print("[ERRO] psycopg2-binary nao instalado! Instale: pip install psycopg2-binary")
+        raise
+    PH = "%s"
+    def sql_data(coluna):
+        return f"DATE({coluna})"
+    def sql_mes(coluna):
+        return f"TO_CHAR({coluna}, 'YYYY-MM')"
+else:
+    import sqlite3
+    print("[BD] SQLite local (ponto.db)")
+    PH = "?"
+    def sql_data(coluna):
+        return f"strftime('%Y-%m-%d', {coluna})"
+    def sql_mes(coluna):
+        return f"strftime('%Y-%m', {coluna})"
+
 DB_NOME = "ponto.db"
 
 def get_db():
-    conn = sqlite3.connect(DB_NOME)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+    if USAR_POSTGRES:
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.cursor_factory = psycopg2.extras.RealDictCursor
+        with conn.cursor() as cur:
+            cur.execute("SET TIME ZONE 'America/Sao_Paulo'")
+        return conn
+    else:
+        conn = sqlite3.connect(DB_NOME)
+        conn.row_factory = sqlite3.Row
+        db_exec(conn, f"""PRAGMA foreign_keys = ON""")
+        return conn
+
+def db_exec(conn, query, params=()):
+    """Executa query e retorna cursor."""
+    if USAR_POSTGRES:
+        cur = conn.cursor()
+        cur.execute(query, params)
+        return cur
+    else:
+        return conn.execute(query, params)
+
+def db_one(cur):
+    row = cur.fetchone()
+    if row is None: return None
+    return dict(row) if USAR_POSTGRES else row
+
+def db_all(cur):
+    rows = cur.fetchall()
+    return [dict(r) for r in rows] if USAR_POSTGRES else rows
+
+def db_last_id(conn, cur=None):
+    """Retorna o último ID inserido, compatível SQLite/PostgreSQL."""
+    if USAR_POSTGRES:
+        c = conn.cursor() if cur is None else cur
+        c.execute("SELECT LASTVAL() as id")
+        return dict(c.fetchone())["id"]
+    else:
+        c = conn.execute("SELECT last_insert_rowid() as id") if cur is None else cur
+        return c.fetchone()["id"]
+
 
 def init_db():
     conn = get_db()
-    conn.execute("""CREATE TABLE IF NOT EXISTS funcionarios (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        nome TEXT NOT NULL,
-        cpf TEXT UNIQUE NOT NULL,
-        horario_entrada TEXT DEFAULT '08:00:00',
-        horario_saida_almoco TEXT DEFAULT '12:00:00',
-        horario_retorno_almoco TEXT DEFAULT '13:00:00',
-        horario_saida TEXT DEFAULT '18:00:00'
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS registros_ponto (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        funcionario_id INTEGER NOT NULL,
-        data_hora TEXT NOT NULL,
-        tipo TEXT NOT NULL,
-        atrasado INTEGER DEFAULT 0,
-        minutos_atraso INTEGER DEFAULT 0,
-        minutos_banco_horas INTEGER DEFAULT 0,
-        justificativa TEXT DEFAULT '',
-        ip_dispositivo TEXT DEFAULT '',
-        user_agent TEXT DEFAULT '',
-        horario_acesso TEXT DEFAULT '',
-        FOREIGN KEY (funcionario_id) REFERENCES funcionarios(id) ON DELETE CASCADE
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS acessos_dispositivos (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        funcionario_id INTEGER,
-        cpf TEXT NOT NULL,
-        data_hora_acesso TEXT NOT NULL,
-        ip_dispositivo TEXT DEFAULT '',
-        user_agent TEXT DEFAULT '',
-        tipo_acesso TEXT DEFAULT 'pagina_inicial',
-        FOREIGN KEY (funcionario_id) REFERENCES funcionarios(id) ON DELETE SET NULL
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS solicitacoes_pendentes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        funcionario_id INTEGER NOT NULL,
-        cpf TEXT NOT NULL,
-        data_hora_solicitacao TEXT NOT NULL,
-        tipo TEXT NOT NULL,
-        atrasado INTEGER DEFAULT 0,
-        minutos_atraso INTEGER DEFAULT 0,
-        justificativa TEXT DEFAULT '',
-        status TEXT DEFAULT 'PENDENTE',
-        ip_dispositivo TEXT DEFAULT '',
-        user_agent TEXT DEFAULT '',
-        data_hora_aprovacao TEXT DEFAULT '',
-        admin_aprovador TEXT DEFAULT '',
-        motivo_negacao TEXT DEFAULT '',
-        FOREIGN KEY (funcionario_id) REFERENCES funcionarios(id) ON DELETE CASCADE
-    )""")
-    for coluna, tipo in [("minutos_atraso","INTEGER DEFAULT 0"),("minutos_banco_horas","INTEGER DEFAULT 0"),("justificativa","TEXT DEFAULT ''"),("ip_dispositivo","TEXT DEFAULT ''"),("user_agent","TEXT DEFAULT ''"),("horario_acesso","TEXT DEFAULT ''")]:
-        try:
-            conn.execute(f"ALTER TABLE registros_ponto ADD COLUMN {coluna} {tipo}")
-            print(f"[MIGRACAO] Coluna {coluna} adicionada")
-        except: pass
-    conn.commit()
+    if USAR_POSTGRES:
+        cur = conn.cursor()
+        cur.execute("""CREATE TABLE IF NOT EXISTS funcionarios (
+            id SERIAL PRIMARY KEY,
+            nome TEXT NOT NULL,
+            cpf TEXT UNIQUE NOT NULL,
+            horario_entrada TEXT DEFAULT '08:00:00',
+            horario_saida_almoco TEXT DEFAULT '12:00:00',
+            horario_retorno_almoco TEXT DEFAULT '13:00:00',
+            horario_saida TEXT DEFAULT '18:00:00'
+        )""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS registros_ponto (
+            id SERIAL PRIMARY KEY,
+            funcionario_id INTEGER NOT NULL REFERENCES funcionarios(id) ON DELETE CASCADE,
+            data_hora TEXT NOT NULL,
+            tipo TEXT NOT NULL,
+            atrasado INTEGER DEFAULT 0,
+            minutos_atraso INTEGER DEFAULT 0,
+            minutos_banco_horas INTEGER DEFAULT 0,
+            justificativa TEXT DEFAULT '',
+            ip_dispositivo TEXT DEFAULT '',
+            user_agent TEXT DEFAULT '',
+            horario_acesso TEXT DEFAULT ''
+        )""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS acessos_dispositivos (
+            id SERIAL PRIMARY KEY,
+            funcionario_id INTEGER REFERENCES funcionarios(id) ON DELETE SET NULL,
+            cpf TEXT NOT NULL,
+            data_hora_acesso TEXT NOT NULL,
+            ip_dispositivo TEXT DEFAULT '',
+            user_agent TEXT DEFAULT '',
+            tipo_acesso TEXT DEFAULT 'pagina_inicial'
+        )""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS solicitacoes_pendentes (
+            id SERIAL PRIMARY KEY,
+            funcionario_id INTEGER NOT NULL REFERENCES funcionarios(id) ON DELETE CASCADE,
+            cpf TEXT NOT NULL,
+            data_hora_solicitacao TEXT NOT NULL,
+            tipo TEXT NOT NULL,
+            atrasado INTEGER DEFAULT 0,
+            minutos_atraso INTEGER DEFAULT 0,
+            justificativa TEXT DEFAULT '',
+            status TEXT DEFAULT 'PENDENTE',
+            ip_dispositivo TEXT DEFAULT '',
+            user_agent TEXT DEFAULT '',
+            data_hora_aprovacao TEXT DEFAULT '',
+            admin_aprovador TEXT DEFAULT '',
+            motivo_negacao TEXT DEFAULT ''
+        )""")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_reg_func_data ON registros_ponto(funcionario_id, data_hora)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sol_func_data ON solicitacoes_pendentes(funcionario_id, data_hora_solicitacao)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_acessos_cpf ON acessos_dispositivos(cpf)")
+        conn.commit()
+        cur.close()
+    else:
+        db_exec(conn, f"""CREATE TABLE IF NOT EXISTS funcionarios (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome TEXT NOT NULL,
+            cpf TEXT UNIQUE NOT NULL,
+            horario_entrada TEXT DEFAULT '08:00:00',
+            horario_saida_almoco TEXT DEFAULT '12:00:00',
+            horario_retorno_almoco TEXT DEFAULT '13:00:00',
+            horario_saida TEXT DEFAULT '18:00:00'
+        )""")
+        db_exec(conn, f"""CREATE TABLE IF NOT EXISTS registros_ponto (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            funcionario_id INTEGER NOT NULL,
+            data_hora TEXT NOT NULL,
+            tipo TEXT NOT NULL,
+            atrasado INTEGER DEFAULT 0,
+            minutos_atraso INTEGER DEFAULT 0,
+            minutos_banco_horas INTEGER DEFAULT 0,
+            justificativa TEXT DEFAULT '',
+            ip_dispositivo TEXT DEFAULT '',
+            user_agent TEXT DEFAULT '',
+            horario_acesso TEXT DEFAULT '',
+            FOREIGN KEY (funcionario_id) REFERENCES funcionarios(id) ON DELETE CASCADE
+        )""")
+        db_exec(conn, f"""CREATE TABLE IF NOT EXISTS acessos_dispositivos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            funcionario_id INTEGER,
+            cpf TEXT NOT NULL,
+            data_hora_acesso TEXT NOT NULL,
+            ip_dispositivo TEXT DEFAULT '',
+            user_agent TEXT DEFAULT '',
+            tipo_acesso TEXT DEFAULT 'pagina_inicial',
+            FOREIGN KEY (funcionario_id) REFERENCES funcionarios(id) ON DELETE SET NULL
+        )""")
+        db_exec(conn, f"""CREATE TABLE IF NOT EXISTS solicitacoes_pendentes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            funcionario_id INTEGER NOT NULL,
+            cpf TEXT NOT NULL,
+            data_hora_solicitacao TEXT NOT NULL,
+            tipo TEXT NOT NULL,
+            atrasado INTEGER DEFAULT 0,
+            minutos_atraso INTEGER DEFAULT 0,
+            justificativa TEXT DEFAULT '',
+            status TEXT DEFAULT 'PENDENTE',
+            ip_dispositivo TEXT DEFAULT '',
+            user_agent TEXT DEFAULT '',
+            data_hora_aprovacao TEXT DEFAULT '',
+            admin_aprovador TEXT DEFAULT '',
+            motivo_negacao TEXT DEFAULT '',
+            FOREIGN KEY (funcionario_id) REFERENCES funcionarios(id) ON DELETE CASCADE
+        )""")
+        for coluna, tipo in [("minutos_atraso","INTEGER DEFAULT 0"),("minutos_banco_horas","INTEGER DEFAULT 0"),("justificativa","TEXT DEFAULT ''"),("ip_dispositivo","TEXT DEFAULT ''"),("user_agent","TEXT DEFAULT ''"),("horario_acesso","TEXT DEFAULT ''")]:
+            try:
+                conn.execute(f"ALTER TABLE registros_ponto ADD COLUMN {coluna} {tipo}")
+                print(f"[MIGRACAO] Coluna {coluna} adicionada")
+            except: pass
+        conn.commit()
     conn.close()
+    print("[BD] Banco inicializado com sucesso!")
 
-init_db()
 criar_logo_padrao()
 
 def formatar_cpf(cpf):
@@ -214,13 +330,13 @@ def calcular_banco_horas(tipo, hora_registro, func):
 
 def obter_ultimo_registro(funcionario_id, data_str):
     conn = get_db()
-    ultimo = conn.execute("SELECT * FROM registros_ponto WHERE funcionario_id = ? AND strftime('%Y-%m-%d', data_hora) = ? ORDER BY data_hora DESC LIMIT 1", (funcionario_id, data_str)).fetchone()
+    ultimo = db_one(db_exec(conn, f"""SELECT * FROM registros_ponto WHERE funcionario_id = {PH} AND {sql_data('data_hora')} = {PH} ORDER BY data_hora DESC LIMIT 1""", (funcionario_id, data_str)))
     conn.close()
     return ultimo
 
 def verificar_registro_duplicado(funcionario_id, data_str, tipo):
     conn = get_db()
-    existe = conn.execute("SELECT id FROM registros_ponto WHERE funcionario_id = ? AND strftime('%Y-%m-%d', data_hora) = ? AND tipo = ? LIMIT 1", (funcionario_id, data_str, tipo)).fetchone()
+    existe = db_one(db_exec(conn, f"""SELECT id FROM registros_ponto WHERE funcionario_id = {PH} AND {sql_data('data_hora')} = {PH} AND tipo = {PH} LIMIT 1""", (funcionario_id, data_str, tipo)))
     conn.close()
     return existe is not None
 
@@ -255,7 +371,7 @@ def registrar_acesso_dispositivo(cpf, funcionario_id, ip, user_agent, tipo_acess
     try:
         conn = get_db()
         agora = agora_brasilia().strftime("%Y-%m-%d %H:%M:%S")
-        conn.execute("INSERT INTO acessos_dispositivos (funcionario_id, cpf, data_hora_acesso, ip_dispositivo, user_agent, tipo_acesso) VALUES (?, ?, ?, ?, ?, ?)", (funcionario_id, cpf, agora, ip, user_agent[:500], tipo_acesso))
+        db_exec(conn, f"""INSERT INTO acessos_dispositivos (funcionario_id, cpf, data_hora_acesso, ip_dispositivo, user_agent, tipo_acesso) VALUES ({PH}, {PH}, {PH}, {PH}, {PH}, {PH})""", (funcionario_id, cpf, agora, ip, user_agent[:500], tipo_acesso))
         conn.commit(); conn.close()
         return True
     except Exception as e:
@@ -818,11 +934,11 @@ body { background:#f0f2f5; min-height:100vh; }
 .logout { position:absolute; right:20px; top:50%; transform:translateY(-50%); background:rgba(255,255,255,0.2); padding:9px 18px; border-radius:25px; cursor:pointer; font-size:13px; border:1px solid rgba(255,255,255,0.35); backdrop-filter:blur(5px); transition:all 0.3s; font-weight:bold; }
 .logout:hover { background:rgba(255,255,255,0.35); transform:translateY(-50%) scale(1.05); }
 .container { max-width:1250px; margin:25px auto; padding:0 20px; }
-.tabs { display:flex; gap:6px; margin-bottom:20px; flex-wrap:wrap; position:relative; z-index:10; }
-.tab { padding:12px 20px; background:#dde2e8; border:none; border-radius:12px 12px 0 0; cursor:pointer; font-weight:bold; font-size:13px; color:#555; transition:all 0.3s; position:relative; z-index:11; }
+.tabs { display:flex; gap:6px; margin-bottom:20px; flex-wrap:wrap; }
+.tab { padding:12px 20px; background:#dde2e8; border:none; border-radius:12px 12px 0 0; cursor:pointer; font-weight:bold; font-size:13px; color:#555; transition:all 0.3s; }
 .tab:hover { background:#cfd6de; transform:translateY(-2px); }
 .tab.ativo { background:white; color:#667eea; box-shadow:0 -4px 15px rgba(0,0,0,0.08); }
-.painel { background:white; border-radius:0 18px 18px 18px; padding:28px; box-shadow:0 10px 40px rgba(0,0,0,0.08); display:none; position:relative; z-index:1; }
+.painel { background:white; border-radius:0 18px 18px 18px; padding:28px; box-shadow:0 10px 40px rgba(0,0,0,0.08); display:none; }
 .painel.ativo { display:block; animation:entrar-cima 0.4s ease; }
 h2 { color:#333; margin-bottom:22px; font-size:21px; background:linear-gradient(135deg,#667eea,#764ba2); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; }
 input, select, textarea { width:100%; padding:12px; margin:8px 0; border:2px solid #e8e8e8; border-radius:10px; font-size:14px; font-family:'Segoe UI',Arial,sans-serif; transition:all 0.3s; background:#fafafa; }
@@ -994,6 +1110,7 @@ label { font-size:13px; color:#555; font-weight:bold; display:block; margin-top:
 </p>
 </div>
 """ + RODAPE_WELL + """
+</div>
 </div>
 </div>
 <script>
@@ -1175,19 +1292,6 @@ class ServidorPonto(BaseHTTPRequestHandler):
         caminho = url.path
         params = parse_qs(url.query)
         
-        # Rota de health check para monitoramento (UptimeBot / Render)
-        # Nao requer autenticacao, retorna rapido para manter o servidor acordado
-        if caminho == "/health" or caminho == "/healthz":
-            agora_ts = agora_brasilia().strftime("%Y-%m-%d %H:%M:%S")
-            responder_json(self, {
-                "status": "ok",
-                "servico": "sistema_ponto",
-                "versao": "3.0 SECURE",
-                "timestamp": agora_ts,
-                "uptime_config": "Monitorar a cada 5 minutos para evitar sleep no Render"
-            })
-            return
-        
         if caminho == "/" or caminho == "/index.html":
             responder_html(self, gerar_html_ponto())
             return
@@ -1236,7 +1340,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 return
             try:
                 conn = get_db()
-                func = conn.execute("SELECT * FROM funcionarios WHERE cpf = ?", (cpf,)).fetchone()
+                func = db_one(db_exec(conn, f"""SELECT * FROM funcionarios WHERE cpf = {PH}""", (cpf,)))
                 conn.close()
                 if func:
                     responder_json(self, {
@@ -1265,11 +1369,11 @@ class ServidorPonto(BaseHTTPRequestHandler):
             try:
                 conn = get_db()
                 # Buscar solicitação mais recente deste CPF
-                solic = conn.execute("""
+                solic = db_one(db_exec(conn, f"""
                     SELECT s.*, f.nome FROM solicitacoes_pendentes s
                     JOIN funcionarios f ON s.funcionario_id = f.id
-                    WHERE s.cpf = ? ORDER BY s.id DESC LIMIT 1
-                """, (cpf,)).fetchone()
+                    WHERE s.cpf = {PH} ORDER BY s.id DESC LIMIT 1
+                """, (cpf,)))
                 conn.close()
                 
                 if solic:
@@ -1297,14 +1401,14 @@ class ServidorPonto(BaseHTTPRequestHandler):
         if caminho == "/api/solicitacoes_pendentes":
             try:
                 conn = get_db()
-                solics = conn.execute("""
+                solics = db_all(db_exec(conn, f"""
                     SELECT s.*, f.nome, f.horario_entrada, f.horario_saida_almoco, 
                            f.horario_retorno_almoco, f.horario_saida
                     FROM solicitacoes_pendentes s
                     JOIN funcionarios f ON s.funcionario_id = f.id
                     WHERE s.status = 'PENDENTE'
                     ORDER BY s.data_hora_solicitacao ASC
-                """).fetchall()
+                """))
                 conn.close()
                 resultado = []
                 for s in solics:
@@ -1333,7 +1437,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
         if caminho == "/api/funcionarios":
             try:
                 conn = get_db()
-                funcs = conn.execute("SELECT * FROM funcionarios ORDER BY nome").fetchall()
+                funcs = db_all(db_exec(conn, f"""SELECT * FROM funcionarios ORDER BY nome"""))
                 conn.close()
                 resultado = [{
                     "id": f["id"], "nome": f["nome"], "cpf": f["cpf"],
@@ -1350,11 +1454,11 @@ class ServidorPonto(BaseHTTPRequestHandler):
         if caminho == "/api/registros":
             try:
                 conn = get_db()
-                regs = conn.execute("""
+                regs = db_all(db_exec(conn, f"""
                     SELECT r.*, f.nome, f.cpf FROM registros_ponto r 
                     JOIN funcionarios f ON r.funcionario_id = f.id 
                     ORDER BY r.data_hora DESC
-                """).fetchall()
+                """))
                 conn.close()
                 resultado = []
                 dias_semana = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]
@@ -1379,11 +1483,11 @@ class ServidorPonto(BaseHTTPRequestHandler):
         if caminho == "/api/acessos":
             try:
                 conn = get_db()
-                acs = conn.execute("""
+                acs = db_all(db_exec(conn, f"""
                     SELECT a.*, f.nome FROM acessos_dispositivos a 
                     LEFT JOIN funcionarios f ON a.funcionario_id = f.id 
                     ORDER BY a.data_hora_acesso DESC LIMIT 200
-                """).fetchall()
+                """))
                 conn.close()
                 resultado = []
                 for a in acs:
@@ -1511,7 +1615,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
             
             try:
                 conn = get_db()
-                func = conn.execute("SELECT * FROM funcionarios WHERE cpf = ?", (cpf,)).fetchone()
+                func = db_one(db_exec(conn, f"""SELECT * FROM funcionarios WHERE cpf = {PH}""", (cpf,)))
                 if not func:
                     conn.close()
                     responder_json(self, {"detail": "CPF não cadastrado!"}, status=404)
@@ -1550,7 +1654,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
             
             try:
                 conn = get_db()
-                func = conn.execute("SELECT * FROM funcionarios WHERE cpf = ?", (cpf,)).fetchone()
+                func = db_one(db_exec(conn, f"""SELECT * FROM funcionarios WHERE cpf = {PH}""", (cpf,)))
                 if not func:
                     conn.close()
                     responder_json(self, {"detail": "CPF não cadastrado!"}, status=404)
@@ -1637,7 +1741,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
             
             try:
                 conn = get_db()
-                func = conn.execute("SELECT * FROM funcionarios WHERE cpf = ?", (cpf,)).fetchone()
+                func = db_one(db_exec(conn, f"""SELECT * FROM funcionarios WHERE cpf = {PH}""", (cpf,)))
                 if not func:
                     conn.close()
                     responder_json(self, {"detail": "CPF não cadastrado!"}, status=404)
@@ -1663,11 +1767,11 @@ class ServidorPonto(BaseHTTPRequestHandler):
                     return
                 
                 # Verificar se já existe solicitação pendente para este tipo hoje
-                solic_existente = conn.execute("""
+                solic_existente = db_one(db_exec(conn, f"""
                     SELECT id FROM solicitacoes_pendentes 
-                    WHERE funcionario_id = ? AND strftime('%Y-%m-%d', data_hora_solicitacao) = ? 
-                    AND tipo = ? AND status = 'PENDENTE' LIMIT 1
-                """, (func["id"], data_str, tipo)).fetchone()
+                    WHERE funcionario_id = {PH} AND {sql_data('data_hora_solicitacao')} = {PH} 
+                    AND tipo = {PH} AND status = 'PENDENTE' LIMIT 1
+                """, (func["id"], data_str, tipo)))
                 
                 if solic_existente:
                     conn.close()
@@ -1691,16 +1795,16 @@ class ServidorPonto(BaseHTTPRequestHandler):
                     atrasado = 1 if verificar_atraso(func["horario_saida"], hora_str, tolerancia_minutos=5) else 0
                     if atrasado: minutos_atraso = calcular_minutos(func["horario_saida"], hora_str)
                 
-                conn.execute("""
+                db_exec(conn, f"""
                     INSERT INTO solicitacoes_pendentes 
                     (funcionario_id, cpf, data_hora_solicitacao, tipo, atrasado, minutos_atraso, 
                      justificativa, status, ip_dispositivo, user_agent)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDENTE', ?, ?)
+                    VALUES ({PH}, {PH}, {PH}, {PH}, {PH}, {PH}, {PH}, 'PENDENTE', {PH}, {PH})
                 """, (func["id"], cpf, data_hora_str, tipo, atrasado, minutos_atraso, 
                       justificativa, ip_cliente, user_agent))
                 conn.commit()
                 
-                solic_id = conn.execute("SELECT last_insert_rowid() as id").fetchone()["id"]
+                solic_id = db_last_id(conn)
                 conn.close()
                 
                 tipo_info = TIPOS_REGISTRO[tipo]
@@ -1733,7 +1837,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
             
             try:
                 conn = get_db()
-                func = conn.execute("SELECT * FROM funcionarios WHERE cpf = ?", (cpf,)).fetchone()
+                func = db_one(db_exec(conn, f"""SELECT * FROM funcionarios WHERE cpf = {PH}""", (cpf,)))
                 if not func:
                     conn.close()
                     responder_json(self, {"detail": "CPF não cadastrado!"}, status=404)
@@ -1774,10 +1878,10 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 
                 minutos_banco = calcular_banco_horas(tipo, hora_str, func)
                 
-                conn.execute("""
+                db_exec(conn, f"""
                     INSERT INTO registros_ponto 
                     (funcionario_id, data_hora, tipo, atrasado, minutos_atraso, minutos_banco_horas, justificativa, ip_dispositivo, user_agent, horario_acesso)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES ({PH}, {PH}, {PH}, {PH}, {PH}, {PH}, {PH}, {PH}, {PH}, {PH})
                 """, (func["id"], data_hora_str, tipo, atrasado, minutos_atraso, minutos_banco, justificativa, ip_cliente, user_agent, horario_acesso))
                 conn.commit()
                 conn.close()
@@ -1803,7 +1907,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
             try:
                 solic_id = int(caminho.replace("/api/solicitacoes/", "").replace("/aprovar", ""))
                 conn = get_db()
-                solic = conn.execute("SELECT * FROM solicitacoes_pendentes WHERE id = ?", (solic_id,)).fetchone()
+                solic = db_one(db_exec(conn, f"""SELECT * FROM solicitacoes_pendentes WHERE id = {PH}""", (solic_id,)))
                 
                 if not solic:
                     conn.close()
@@ -1815,7 +1919,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
                     responder_json(self, {"detail": f"Solicitação já foi {solic['status']}"}, status=400)
                     return
                 
-                func = conn.execute("SELECT * FROM funcionarios WHERE id = ?", (solic["funcionario_id"],)).fetchone()
+                func = db_one(db_exec(conn, f"""SELECT * FROM funcionarios WHERE id = {PH}""", (solic["funcionario_id"],)))
                 
                 agora = agora_brasilia()
                 data_hora_aprovacao = agora.strftime("%Y-%m-%d %H:%M:%S")
@@ -1828,21 +1932,21 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 minutos_banco = calcular_banco_horas(solic["tipo"], hora_str, func)
                 
                 # Registrar o ponto efetivamente
-                conn.execute("""
+                db_exec(conn, f"""
                     INSERT INTO registros_ponto 
                     (funcionario_id, data_hora, tipo, atrasado, minutos_atraso, minutos_banco_horas, 
                      justificativa, ip_dispositivo, user_agent, horario_acesso)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES ({PH}, {PH}, {PH}, {PH}, {PH}, {PH}, {PH}, {PH}, {PH}, {PH})
                 """, (solic["funcionario_id"], data_hora_registro, solic["tipo"], 
                       solic["atrasado"], solic["minutos_atraso"], minutos_banco,
                       solic["justificativa"], solic["ip_dispositivo"], 
                       solic["user_agent"], data_hora_aprovacao))
                 
                 # Atualizar status da solicitação
-                conn.execute("""
+                db_exec(conn, f"""
                     UPDATE solicitacoes_pendentes 
-                    SET status = 'APROVADA', data_hora_aprovacao = ?, admin_aprovador = ?
-                    WHERE id = ?
+                    SET status = 'APROVADA', data_hora_aprovacao = {PH}, admin_aprovador = {PH}
+                    WHERE id = {PH}
                 """, (data_hora_aprovacao, ADMIN_USUARIO, solic_id))
                 
                 conn.commit()
@@ -1863,7 +1967,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 motivo = sanitizar_texto(dados.get("motivo", ""), 500)
                 
                 conn = get_db()
-                solic = conn.execute("SELECT * FROM solicitacoes_pendentes WHERE id = ?", (solic_id,)).fetchone()
+                solic = db_one(db_exec(conn, f"""SELECT * FROM solicitacoes_pendentes WHERE id = {PH}""", (solic_id,)))
                 
                 if not solic:
                     conn.close()
@@ -1875,14 +1979,14 @@ class ServidorPonto(BaseHTTPRequestHandler):
                     responder_json(self, {"detail": f"Solicitação já foi {solic['status']}"}, status=400)
                     return
                 
-                func = conn.execute("SELECT nome FROM funcionarios WHERE id = ?", (solic["funcionario_id"],)).fetchone()
+                func = db_one(db_exec(conn, f"""SELECT nome FROM funcionarios WHERE id = {PH}""", (solic["funcionario_id"],)))
                 agora = agora_brasilia()
                 data_hora_aprovacao = agora.strftime("%Y-%m-%d %H:%M:%S")
                 
-                conn.execute("""
+                db_exec(conn, f"""
                     UPDATE solicitacoes_pendentes 
-                    SET status = 'NEGADA', data_hora_aprovacao = ?, admin_aprovador = ?, motivo_negacao = ?
-                    WHERE id = ?
+                    SET status = 'NEGADA', data_hora_aprovacao = {PH}, admin_aprovador = {PH}, motivo_negacao = {PH}
+                    WHERE id = {PH}
                 """, (data_hora_aprovacao, ADMIN_USUARIO, motivo, solic_id))
                 
                 conn.commit()
@@ -1914,19 +2018,19 @@ class ServidorPonto(BaseHTTPRequestHandler):
             
             try:
                 conn = get_db()
-                existe = conn.execute("SELECT id FROM funcionarios WHERE cpf = ?", (cpf,)).fetchone()
+                existe = db_one(db_exec(conn, f"""SELECT id FROM funcionarios WHERE cpf = {PH}""", (cpf,)))
                 if existe:
                     conn.close()
                     responder_json(self, {"detail": "CPF já cadastrado!"}, status=400)
                     return
                 
-                conn.execute("""
+                db_exec(conn, f"""
                     INSERT INTO funcionarios (nome, cpf, horario_entrada, horario_saida_almoco, horario_retorno_almoco, horario_saida)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    VALUES ({PH}, {PH}, {PH}, {PH}, {PH}, {PH})
                 """, (nome, cpf, h_entrada, h_saida_almoco, h_retorno_almoco, h_saida))
                 conn.commit()
                 
-                novo_id = conn.execute("SELECT last_insert_rowid() as id").fetchone()["id"]
+                novo_id = db_last_id(conn)
                 conn.close()
                 
                 print(f"[CADASTRO] {nome} | CPF: {cpf}")
@@ -1950,8 +2054,8 @@ class ServidorPonto(BaseHTTPRequestHandler):
             try:
                 func_id = int(caminho.replace("/api/funcionarios/", ""))
                 conn = get_db()
-                conn.execute("DELETE FROM registros_ponto WHERE funcionario_id = ?", (func_id,))
-                conn.execute("DELETE FROM funcionarios WHERE id = ?", (func_id,))
+                db_exec(conn, f"""DELETE FROM registros_ponto WHERE funcionario_id = {PH}""", (func_id,))
+                db_exec(conn, f"""DELETE FROM funcionarios WHERE id = {PH}""", (func_id,))
                 conn.commit()
                 conn.close()
                 print(f"[EXCLUSAO] Funcionário ID: {func_id}")
@@ -2122,7 +2226,7 @@ def gerar_pdf_geral(mes):
     from reportlab.lib import colors
     
     conn = get_db()
-    funcionarios = conn.execute("SELECT * FROM funcionarios ORDER BY nome").fetchall()
+    funcionarios = db_all(db_exec(conn, f"""SELECT * FROM funcionarios ORDER BY nome"""))
     
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
@@ -2130,11 +2234,11 @@ def gerar_pdf_geral(mes):
     dias_semana = ["Segunda", "Terca", "Quarta", "Quinta", "Sexta", "Sabado", "Domingo"]
     
     for func in funcionarios:
-        registros = conn.execute("""
+        registros = db_all(db_exec(conn, f"""
             SELECT * FROM registros_ponto 
-            WHERE funcionario_id = ? AND strftime('%Y-%m', data_hora) = ?
+            WHERE funcionario_id = {PH} AND {sql_mes('data_hora')} = {PH}
             ORDER BY data_hora
-        """, (func["id"], mes)).fetchall()
+        """, (func["id"], mes)))
         desenhar_pagina_funcionario(c, func, registros, mes, dias_semana, altura, largura, colors)
     
     conn.close()
@@ -2148,7 +2252,7 @@ def gerar_pdf_individual(func_id, mes):
     from reportlab.lib import colors
     
     conn = get_db()
-    func = conn.execute("SELECT * FROM funcionarios WHERE id = ?", (func_id,)).fetchone()
+    func = db_one(db_exec(conn, f"""SELECT * FROM funcionarios WHERE id = {PH}""", (func_id,)))
     
     if not func:
         conn.close()
@@ -2159,11 +2263,11 @@ def gerar_pdf_individual(func_id, mes):
         buffer.seek(0)
         return buffer
     
-    registros = conn.execute("""
+    registros = db_all(db_exec(conn, f"""
         SELECT * FROM registros_ponto 
-        WHERE funcionario_id = ? AND strftime('%Y-%m', data_hora) = ?
+        WHERE funcionario_id = {PH} AND {sql_mes('data_hora')} = {PH}
         ORDER BY data_hora
-    """, (func_id, mes)).fetchall()
+    """, (func_id, mes)))
     
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
@@ -2185,14 +2289,7 @@ if __name__ == "__main__":
     print(f"Pagina inicial (CPF):   http://localhost:{PORTA}")
     print(f"Painel Funcionario:     http://localhost:{PORTA}/funcionario")
     print(f"Login Admin:            http://localhost:{PORTA}/admin")
-    print(f"Health Check:           http://localhost:{PORTA}/health")
     print(f"Usuario: {ADMIN_USUARIO} | Senha: {ADMIN_SENHA}")
-    print("=" * 65)
-    print("📡 MONITORAMENTO UPTIMEBOT (para Render 24h):")
-    print("   URL: https://SEU_DOMINIO.onrender.com/health")
-    print("   Intervalo: 5 minutos (evita sleep do plano gratuito)")
-    print("   O Render dorme apos 15 min sem atividade; ping de 5")
-    print("   minutos mantem o sistema ONLINE 24 horas gratuitamente.")
     print("=" * 65)
     print("NOVAS FUNCIONALIDADES v3.0:")
     print("  - Tela de login separada para funcionario")
