@@ -44,6 +44,13 @@ def agora_brasilia():
         return datetime.now(FUSO_BRASILIA).replace(tzinfo=None)
     return datetime.now()
 
+# Verificar fuso horário na inicialização
+_dt_teste = agora_brasilia()
+print(f"[FUSO] Horário do servidor: {_dt_teste.strftime('%d/%m/%Y %H:%M:%S')} (Brasília)")
+print(f"[FUSO] ZoneInfo disponível: {FUSO_BRASILIA is not None}")
+import time as _time
+print(f"[FUSO] TZ enviro: {os.environ.get('TZ', 'não definido')}")
+
 # ===================== CONFIGURACOES =====================
 SEGREDO_QR = "CLINICA_PONTO_2024"
 PORTA = int(os.environ.get("PORT", 8000))
@@ -223,6 +230,10 @@ def formatar_cpf(cpf):
 
 def verificar_atraso(hora_registro, horario_padrao, tolerancia_minutos=0):
     try:
+        hora_registro = str(hora_registro).strip()
+        horario_padrao = str(horario_padrao).strip()
+        if not hora_registro or not horario_padrao:
+            return False
         h_r = hora_registro.split(":")
         h_p = horario_padrao.split(":")
         t_r = int(h_r[0])*3600 + int(h_r[1])*60 + (int(h_r[2]) if len(h_r)>2 else 0)
@@ -233,6 +244,9 @@ def verificar_atraso(hora_registro, horario_padrao, tolerancia_minutos=0):
 
 def calcular_minutos(hora1, hora2):
     try:
+        hora1 = str(hora1).strip(); hora2 = str(hora2).strip()
+        if not hora1 or not hora2:
+            return 0
         h1 = hora1.split(":"); h2 = hora2.split(":")
         t1 = int(h1[0])*3600 + int(h1[1])*60 + (int(h1[2]) if len(h1)>2 else 0)
         t2 = int(h2[0])*3600 + int(h2[1])*60 + (int(h2[2]) if len(h2)>2 else 0)
@@ -2046,6 +2060,19 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 msg_just = ""
                 info = ""
                 
+                # Validar se o horário correspondente está cadastrado
+                horario_necessario = {
+                    "ENTRADA": func["horario_entrada"],
+                    "SAIDA_ALMOCO": func["horario_saida_almoco"],
+                    "RETORNO_ALMOCO": func["horario_retorno_almoco"],
+                    "SAIDA": func["horario_saida"]
+                }.get(tipo, "")
+                
+                if not horario_necessario or not horario_necessario.strip():
+                    conn.close()
+                    responder_json(self, {"detail": f"⚠️ Horário de {TIPOS_REGISTRO[tipo]['label']} não cadastrado para este funcionário. Contate o RH."}, status=400)
+                    return
+                
                 if tipo == "ENTRADA":
                     atrasado = 1 if verificar_atraso(hora_str, func["horario_entrada"], tolerancia_minutos=5) else 0
                     if atrasado:
@@ -2053,11 +2080,13 @@ class ServidorPonto(BaseHTTPRequestHandler):
                         msg_just = f"Atraso na ENTRADA. Horário padrão: {func['horario_entrada']} (tolerância: 5 min)."
                         info = f"Atraso de {minutos} minuto(s)"
                 elif tipo == "SAIDA_ALMOCO":
-                    minutos_antes = calcular_minutos(func["horario_saida_almoco"], hora_str)
-                    if not verificar_atraso(hora_str, func["horario_saida_almoco"]) and minutos_antes >= 30:
-                        minutos = minutos_antes
-                        msg_just = f"Saída para almoço com {minutos_antes} min de antecedência. Padrão: {func['horario_saida_almoco']}."
-                        info = f"Antecedência de {minutos_antes} min"
+                    # Verifica se está saindo ANTES do horário (mais de 5 min de antecedência)
+                    # Invertemos os parâmetros: se horario_padrao > hora_atual + tolerancia = saindo muito cedo
+                    atrasado = 1 if verificar_atraso(func["horario_saida_almoco"], hora_str, tolerancia_minutos=5) else 0
+                    if atrasado:
+                        minutos = calcular_minutos(func["horario_saida_almoco"], hora_str)
+                        msg_just = f"Saída para almoço ANTECIPADA. Padrão: {func['horario_saida_almoco']} (tolerância: 5 min)."
+                        info = f"Antecedência de {minutos} minuto(s)"
                 elif tipo == "RETORNO_ALMOCO":
                     atrasado = 1 if verificar_atraso(hora_str, func["horario_retorno_almoco"], tolerancia_minutos=5) else 0
                     if atrasado:
@@ -2073,13 +2102,23 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 
                 conn.close()
                 bloqueado = (atrasado == 1)
+                # Log de debug para verificar o que está acontecendo
+                print(f"[VERIFICAR] {func['nome']} | Tipo:{tipo} | Hora:{hora_str} | Padrão:{horario_padrao_debug} | Atrasado:{atrasado} | Bloqueado:{bloqueado} | Minutos:{minutos}")
+                horario_padrao_debug = {
+                    "ENTRADA": func["horario_entrada"],
+                    "SAIDA_ALMOCO": func["horario_saida_almoco"],
+                    "RETORNO_ALMOCO": func["horario_retorno_almoco"],
+                    "SAIDA": func["horario_saida"]
+                }.get(tipo, "")
                 responder_json(self, {
                     "precisa_justificativa": (minutos > 0 and not bloqueado),
                     "bloqueado": bloqueado,
                     "mensagem_justificativa": msg_just,
                     "info_atraso": info,
                     "minutos_atraso": minutos,
-                    "atrasado": atrasado
+                    "atrasado": atrasado,
+                    "hora_atual": hora_str,
+                    "horario_padrao": horario_padrao_debug
                 })
             except Exception as e:
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
