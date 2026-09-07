@@ -30,26 +30,40 @@ os.environ["TZ"] = "America/Sao_Paulo"
 try:
     import time
     time.tzset()
-except:
-    pass
+    print("[FUSO] time.tzset() aplicado com sucesso")
+except Exception as e_tz:
+    print(f"[FUSO] time.tzset() não disponível: {e_tz}")
 try:
     from zoneinfo import ZoneInfo
     FUSO_BRASILIA = ZoneInfo("America/Sao_Paulo")
-except:
+    print("[FUSO] ZoneInfo carregado: America/Sao_Paulo")
+except Exception as e_zi:
     FUSO_BRASILIA = None
+    print(f"[FUSO] ZoneInfo não disponível, usando fallback UTC-3: {e_zi}")
 
 def agora_brasilia():
     """Retorna datetime atual no fuso horário de Brasília (UTC-3)"""
-    if FUSO_BRASILIA:
-        return datetime.now(FUSO_BRASILIA).replace(tzinfo=None)
-    return datetime.now()
+    try:
+        if FUSO_BRASILIA:
+            return datetime.now(FUSO_BRASILIA).replace(tzinfo=None)
+    except:
+        pass
+    # Fallback garantido: calcular UTC-3 manualmente
+    from datetime import timezone, timedelta
+    utc_agora = datetime.now(timezone.utc)
+    brasilia = utc_agora - timedelta(hours=3)
+    return brasilia.replace(tzinfo=None)
 
 # Verificar fuso horário na inicialização
 _dt_teste = agora_brasilia()
-print(f"[FUSO] Horário do servidor: {_dt_teste.strftime('%d/%m/%Y %H:%M:%S')} (Brasília)")
-print(f"[FUSO] ZoneInfo disponível: {FUSO_BRASILIA is not None}")
-import time as _time
-print(f"[FUSO] TZ enviro: {os.environ.get('TZ', 'não definido')}")
+from datetime import datetime as _dt_utc, timezone as _tz_utc
+_dt_utc_now = _dt_utc.now(_tz_utc)
+print(f"[FUSO] ========================================")
+print(f"[FUSO] Horário UTC:      {_dt_utc_now.strftime('%d/%m/%Y %H:%M:%S')}")
+print(f"[FUSO] Horário Brasília: {_dt_teste.strftime('%d/%m/%Y %H:%M:%S')}")
+print(f"[FUSO] ZoneInfo:         {'OK' if FUSO_BRASILIA else 'Fallback UTC-3'}")
+print(f"[FUSO] TZ Environment:   {os.environ.get('TZ', 'não definido')}")
+print(f"[FUSO] ========================================")
 
 # ===================== CONFIGURACOES =====================
 SEGREDO_QR = "CLINICA_PONTO_2024"
@@ -2136,14 +2150,14 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 
                 conn.close()
                 bloqueado = (atrasado == 1)
-                # Log de debug para verificar o que está acontecendo
-                print(f"[VERIFICAR] {func['nome']} | Tipo:{tipo} | Hora:{hora_str} | Padrão:{horario_padrao_debug} | Atrasado:{atrasado} | Bloqueado:{bloqueado} | Minutos:{minutos}")
                 horario_padrao_debug = {
                     "ENTRADA": func["horario_entrada"],
                     "SAIDA_ALMOCO": func["horario_saida_almoco"],
                     "RETORNO_ALMOCO": func["horario_retorno_almoco"],
                     "SAIDA": func["horario_saida"]
                 }.get(tipo, "")
+                # Log de debug para verificar o que está acontecendo
+                print(f"[VERIFICAR] {func['nome']} | Tipo:{tipo} | Hora:{hora_str} | Padrão:{horario_padrao_debug} | Atrasado:{atrasado} | Bloqueado:{bloqueado} | Minutos:{minutos}")
                 responder_json(self, {
                     "precisa_justificativa": (minutos > 0 and not bloqueado),
                     "bloqueado": bloqueado,
