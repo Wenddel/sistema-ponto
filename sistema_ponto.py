@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 =================================================================
-   SISTEMA DE PONTO v3.1 - CLÍNICA
+   SISTEMA DE PONTO v3.2 - CLÍNICA
 =================================================================
    Desenvolvido por WELL
    Última atualização: 2026-09-07
    
-   NOVAS FUNCIONALIDADES v3.1:
+   NOVAS FUNCIONALIDADES v3.2:
    ✅ Sistema de múltiplos administradores
    ✅ Painel de resumo visual dos funcionários
    ✅ Correção total das abas do painel admin
@@ -239,22 +239,56 @@ def calcular_minutos(hora1, hora2):
         return abs(t1-t2)//60
     except: return 0
 
+
+def verificar_na_tolerancia_antes(hora_registro, horario_padrao, tolerancia_minutos=5):
+    """Verifica se o registro está dentro da tolerância ANTES do horário padrão.
+    Retorna True se estiver entre (horario_padrao - tolerancia) e horario_padrao (exclusive).
+    Ex: horario_padrao=08:00, tolerancia=5 → 07:55:00 até 07:59:59 retorna True"""
+    try:
+        h_r = hora_registro.split(":")
+        h_p = horario_padrao.split(":")
+        t_r = int(h_r[0])*3600 + int(h_r[1])*60 + (int(h_r[2]) if len(h_r)>2 else 0)
+        t_p = int(h_p[0])*3600 + int(h_p[1])*60 + (int(h_p[2]) if len(h_p)>2 else 0)
+        tolerancia_segundos = tolerancia_minutos * 60
+        return (t_p - tolerancia_segundos) <= t_r < t_p
+    except: return False
+
+def verificar_na_tolerancia_depois(hora_registro, horario_padrao, tolerancia_minutos=5):
+    """Verifica se o registro está dentro da tolerância DEPOIS do horário padrão.
+    Retorna True se estiver entre horario_padrao (exclusive) e (horario_padrao + tolerancia)."""
+    try:
+        h_r = hora_registro.split(":")
+        h_p = horario_padrao.split(":")
+        t_r = int(h_r[0])*3600 + int(h_r[1])*60 + (int(h_r[2]) if len(h_r)>2 else 0)
+        t_p = int(h_p[0])*3600 + int(h_p[1])*60 + (int(h_p[2]) if len(h_p)>2 else 0)
+        tolerancia_segundos = tolerancia_minutos * 60
+        return t_p < t_r <= (t_p + tolerancia_segundos)
+    except: return False
+
 def calcular_banco_horas(tipo, hora_registro, func):
+    """Calcula banco de horas. NÃO conta banco se estiver dentro da tolerância de 5 minutos
+    ANTES (para chegadas) ou DEPOIS (para saídas) do horário padrão."""
     try:
         h_r = hora_registro.split(":")
         t_r = int(h_r[0])*3600 + int(h_r[1])*60 + (int(h_r[2]) if len(h_r)>2 else 0)
+        tolerancia = 5 * 60  # 5 minutos em segundos
+        
         if tipo == "ENTRADA":
             h_p = func["horario_entrada"].split(":"); t_p = int(h_p[0])*3600+int(h_p[1])*60
-            if t_r < t_p: return (t_p-t_r)//60
+            # Só conta banco se chegar MAIS de 5 minutos antes
+            if t_r < (t_p - tolerancia): return (t_p-t_r)//60
         elif tipo == "SAIDA_ALMOCO":
             h_p = func["horario_saida_almoco"].split(":"); t_p = int(h_p[0])*3600+int(h_p[1])*60
-            if t_r > t_p: return (t_r-t_p)//60
+            # Só conta banco se sair MAIS de 5 minutos DEPOIS
+            if t_r > (t_p + tolerancia): return (t_r-t_p)//60
         elif tipo == "RETORNO_ALMOCO":
             h_p = func["horario_retorno_almoco"].split(":"); t_p = int(h_p[0])*3600+int(h_p[1])*60
-            if t_r < t_p: return (t_p-t_r)//60
+            # Só conta banco se chegar MAIS de 5 minutos antes
+            if t_r < (t_p - tolerancia): return (t_p-t_r)//60
         elif tipo == "SAIDA":
             h_p = func["horario_saida"].split(":"); t_p = int(h_p[0])*3600+int(h_p[1])*60
-            if t_r > t_p: return (t_r-t_p)//60
+            # Só conta banco se sair MAIS de 5 minutos DEPOIS
+            if t_r > (t_p + tolerancia): return (t_r-t_p)//60
         return 0
     except: return 0
 
@@ -373,7 +407,7 @@ RODAPE_WELL = """
   <div class="rodape-content">
     <span class="rodape-icone">⚡</span>
     <span class="rodape-texto">Desenvolvido por <strong>WELL</strong></span>
-    <span class="rodape-versao">v3.1</span>
+    <span class="rodape-versao">v3.2</span>
   </div>
 </div>
 """
@@ -649,6 +683,36 @@ body { min-height:100vh; padding:15px; position:relative; overflow-x:hidden; }
 .btn-continuar { width:100%; padding:14px; background:linear-gradient(135deg,#667eea,#764ba2); color:white; border:none; border-radius:12px; font-weight:bold; font-size:15px; cursor:pointer; transition:all 0.3s; }
 .btn-continuar:hover { transform:translateY(-2px); box-shadow:0 6px 20px rgba(102,126,234,0.4); }
 .bloqueio-aviso { background:linear-gradient(135deg,#fffde7,#fff9c4); border:1px solid #fbc02d; border-radius:10px; padding:10px; font-size:11px; color:#f57f17; margin-top:15px; }
+
+/* ========== TELA DE CONFIRMAÇÃO DE REGISTRO (BONITA) ========== */
+.tela-confirmacao { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:linear-gradient(135deg,rgba(76,175,80,0.92),rgba(56,249,215,0.88),rgba(102,126,234,0.9)); backdrop-filter:blur(15px); z-index:3000; align-items:center; justify-content:center; padding:20px; }
+.tela-confirmacao.ativa { display:flex; animation:fadeIn 0.4s ease; }
+@keyframes fadeIn { from{opacity:0} to{opacity:1} }
+.confirmacao-box { background:white; border-radius:32px; padding:45px 35px; width:100%; max-width:440px; text-align:center; box-shadow:0 40px 100px rgba(0,0,0,0.35); animation:confirmarEntrada 0.6s cubic-bezier(0.175,0.885,0.32,1.275); }
+@keyframes confirmarEntrada { from{opacity:0;transform:scale(0.7) translateY(30px)} to{opacity:1;transform:scale(1) translateY(0)} }
+.confirmacao-icone-grande { width:130px; height:130px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:65px; margin:0 auto 25px; animation:checkPop 0.7s cubic-bezier(0.175,0.885,0.32,1.5); box-shadow:0 15px 40px rgba(0,0,0,0.2); }
+@keyframes checkPop { 0%{transform:scale(0) rotate(-30deg)} 60%{transform:scale(1.15) rotate(5deg)} 100%{transform:scale(1) rotate(0)} }
+.confirmacao-titulo { font-size:28px; font-weight:bold; margin-bottom:8px; color:#333; }
+.confirmacao-subtitulo { color:#888; font-size:14px; margin-bottom:25px; }
+.confirmacao-nome { background:linear-gradient(135deg,#f5f7fa,#e8ecf1); padding:15px; border-radius:16px; margin-bottom:18px; }
+.confirmacao-nome .label { font-size:11px; color:#888; text-transform:uppercase; font-weight:bold; letter-spacing:1px; }
+.confirmacao-nome .valor { font-size:20px; font-weight:bold; color:#333; margin-top:4px; }
+.confirmacao-dados { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:20px; }
+.confirmacao-dado { background:#f8f9fa; padding:14px 10px; border-radius:14px; }
+.confirmacao-dado .dado-label { font-size:10px; color:#888; text-transform:uppercase; font-weight:bold; }
+.confirmacao-dado .dado-valor { font-size:16px; font-weight:bold; color:#333; margin-top:4px; }
+.confirmacao-dado .dado-valor.pequeno { font-size:13px; }
+.confirmacao-status { padding:16px; border-radius:16px; margin-bottom:22px; font-weight:bold; font-size:15px; color:white; }
+.confirmacao-status.normal { background:linear-gradient(135deg,#4CAF50,#66bb6a); }
+.confirmacao-status.tolerancia { background:linear-gradient(135deg,#ff9800,#ffb74d); }
+.confirmacao-status.banco { background:linear-gradient(135deg,#00bcd4,#4dd0e1); }
+.confirmacao-status.atrasado { background:linear-gradient(135deg,#f44336,#ef5350); }
+.btn-confirmar-ok { width:100%; padding:18px; background:linear-gradient(135deg,#667eea,#764ba2); color:white; border:none; border-radius:16px; font-weight:bold; font-size:17px; cursor:pointer; transition:all 0.3s; box-shadow:0 8px 25px rgba(102,126,234,0.4); }
+.btn-confirmar-ok:hover { transform:translateY(-3px); box-shadow:0 12px 35px rgba(102,126,234,0.5); }
+.btn-confirmar-ok:active { transform:translateY(0); }
+.confirmacao-hora-real { position:absolute; top:25px; right:25px; background:rgba(255,255,255,0.25); color:white; padding:10px 18px; border-radius:25px; font-weight:bold; font-size:14px; backdrop-filter:blur(10px); border:1px solid rgba(255,255,255,0.3); }
+.confirmacao-decoracao { position:absolute; bottom:0; left:0; right:0; height:8px; background:linear-gradient(90deg,#4CAF50,#38f9d7,#667eea,#f093fb,#4CAF50); background-size:300% 100%; animation:arco-iris 4s linear infinite; border-radius:0 0 32px 32px; }
+
 </style>
 </head>
 <body class="fundo-animado">
@@ -693,6 +757,42 @@ body { min-height:100vh; padding:15px; position:relative; overflow-x:hidden; }
     <div class="bloqueio-aviso">⚠️ Esta tela não pode ser fechada. O sistema verificará automaticamente a aprovação.</div>
   </div>
 </div>
+
+<!-- TELA DE CONFIRMAÇÃO DE REGISTRO - BONITA E ANIMADA -->
+<div class="tela-confirmacao" id="telaConfirmacao">
+  <div class="confirmacao-hora-real" id="confHoraReal">--:--:--</div>
+  <div class="confirmacao-box">
+    <div class="confirmacao-icone-grande" id="confIcone" style="background:linear-gradient(135deg,#4CAF50,#66bb6a);color:white;">✅</div>
+    <h2 class="confirmacao-titulo" id="confTitulo">PONTO REGISTRADO!</h2>
+    <p class="confirmacao-subtitulo" id="confSubtitulo">Registro efetuado com sucesso</p>
+    <div class="confirmacao-nome">
+      <div class="label">Funcionário</div>
+      <div class="valor" id="confNome">---</div>
+    </div>
+    <div class="confirmacao-dados">
+      <div class="confirmacao-dado">
+        <div class="dado-label">Tipo</div>
+        <div class="dado-valor pequeno" id="confTipo">---</div>
+      </div>
+      <div class="confirmacao-dado">
+        <div class="dado-label">Horário</div>
+        <div class="dado-valor" id="confHora">--:--:--</div>
+      </div>
+      <div class="confirmacao-dado">
+        <div class="dado-label">Data</div>
+        <div class="dado-valor pequeno" id="confData">--/--/----</div>
+      </div>
+      <div class="confirmacao-dado">
+        <div class="dado-label">Padrão</div>
+        <div class="dado-valor pequeno" id="confPadrao">--:--:--</div>
+      </div>
+    </div>
+    <div class="confirmacao-status normal" id="confStatus">✅ No horário exato</div>
+    <button class="btn-confirmar-ok" onclick="fecharTelaConfirmacao()">✓ CONFIRMAR</button>
+    <div class="confirmacao-decoracao"></div>
+  </div>
+</div>
+
 <div class="modal-overlay" id="modalJust">
 <div class="modal-box">
 <h2>⚠️ Atenção!</h2>
@@ -831,17 +931,74 @@ async function confirmar(){
   if(!pendente)return;
   const j=document.getElementById('justificativa').value.trim();
   if(!j){alert('Informe a justificativa!');document.getElementById('justificativa').focus();return;}
-  fecharModal(); await executar(pendente.cpf,pendente.tipo,j);
+  fecharModal();
+  
+  if(pendente.solicitar){
+    // É uma solicitação de aprovação para o admin
+    try{
+      const r=await fetch('/api/solicitar_ponto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cpf:pendente.cpf,tipo:pendente.tipo,qr_code:QR,justificativa:j||'Não informado'})});
+      const d=await r.json();
+      if(!r.ok){alert('❌ '+(d.detail||'Erro'));return;}
+      // Buscar os dados de atraso para a tela de bloqueio
+      try{
+        const v=await fetch('/api/verificar_ponto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cpf:CPF,tipo:pendente.tipo,qr_code:QR})});
+        const vd=await v.json();
+        mostrarTelaBloqueio(pendente.tipo,vd.minutos_atraso||0);
+        iniciarPolling();
+      }catch(e){mostrarTelaBloqueio(pendente.tipo,0);iniciarPolling();}
+    }catch(e){alert('❌ Erro ao enviar solicitação!');}
+  }else{
+    // É um registro normal com justificativa
+    await executar(pendente.cpf,pendente.tipo,j);
+  }
 }
 async function executar(cpf,tipo,just){
   try{
     const r=await fetch('/api/bater_ponto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cpf:cpf,tipo:tipo,qr_code:QR,justificativa:just})});
     const d=await r.json();
-    if(r.ok){let t='sucesso';if(d.mensagem.includes('Banco'))t='banco-horas';mostrar(d.mensagem,t);}
-    else mostrar(d.detail||'Erro','erro');
-  }catch(e){mostrar('Erro de conexão!','erro');}
+    if(r.ok && d.registro_ok){
+      mostrarTelaConfirmacao(d);
+    }else{
+      alert('❌ '+(d.detail||'Erro ao registrar ponto'));
+    }
+  }catch(e){alert('❌ Erro de conexão!');}
 }
-function mostrar(texto,tipo){const m=document.getElementById('mensagem');m.textContent=texto;m.className='mensagem '+tipo;setTimeout(()=>m.className='mensagem',10000);}
+function mostrar(texto,tipo){
+  // Função mantida para compatibilidade, mas agora usa alert para erros
+  if(tipo==='erro'){alert('⚠️ '+texto);}
+}
+
+let intervaloHoraReal=null;
+function mostrarTelaConfirmacao(d){
+  document.getElementById('confIcone').textContent=d.tipo_icone||'✅';
+  document.getElementById('confIcone').style.background='linear-gradient(135deg,'+d.tipo_cor+','+d.tipo_cor+')';
+  document.getElementById('confTitulo').textContent=d.tipo_label+' REGISTRADA!';
+  document.getElementById('confSubtitulo').textContent='Registro efetuado com sucesso';
+  document.getElementById('confNome').textContent=d.nome;
+  document.getElementById('confTipo').textContent=d.tipo_label;
+  document.getElementById('confHora').textContent=d.hora;
+  document.getElementById('confData').textContent=d.data;
+  document.getElementById('confPadrao').textContent=d.horario_padrao;
+  
+  const statusEl=document.getElementById('confStatus');
+  statusEl.textContent=d.status_texto;
+  statusEl.className='confirmacao-status '+d.status_registro.toLowerCase();
+  
+  document.getElementById('telaConfirmacao').classList.add('ativa');
+  
+  // Atualizar hora real no canto
+  atualizarHoraRealConf();
+  if(intervaloHoraReal)clearInterval(intervaloHoraReal);
+  intervaloHoraReal=setInterval(atualizarHoraRealConf,1000);
+}
+function atualizarHoraRealConf(){
+  const el=document.getElementById('confHoraReal');
+  if(el)el.textContent=new Date().toLocaleTimeString('pt-BR');
+}
+function fecharTelaConfirmacao(){
+  document.getElementById('telaConfirmacao').classList.remove('ativa');
+  if(intervaloHoraReal){clearInterval(intervaloHoraReal);intervaloHoraReal=null;}
+}
 document.getElementById('modalJust').addEventListener('click',function(e){if(e.target===this)fecharModal();});
 </script>
 </body>
@@ -855,7 +1012,7 @@ def gerar_html_admin():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>⚙️ Painel Administrativo v3.1</title>
+<title>⚙️ Painel Administrativo v3.2</title>
 <style>
 * { margin:0; padding:0; box-sizing:border-box; font-family:'Segoe UI',Arial,sans-serif; }
 body { background:#f0f2f5; min-height:100vh; }
@@ -975,7 +1132,7 @@ label { font-size:13px; color:#555; font-weight:bold; display:block; margin-top:
 <div class="header">
 <div class="header-content">
 <img src="/static/logo.png?t=""" + ts + """" alt="Logo" class="logo-header" onerror="this.outerHTML='<div class=\\'logo-header-fallback\\'>🏥</div>'">
-<h1>⚙️ Painel Administrativo v3.1</h1>
+<h1>⚙️ Painel Administrativo v3.2</h1>
 </div>
 <div class="logout" onclick="sair()">🚪 Sair</div>
 </div>
@@ -1534,7 +1691,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 conn.close()
                 responder_json(self, {
                     "status": "ok",
-                    "servico": "Sistema de Ponto v3.1",
+                    "servico": "Sistema de Ponto v3.2",
                     "timestamp": agora_brasilia().strftime("%Y-%m-%d %H:%M:%S"),
                     "banco": "conectado"
                 })
@@ -1923,30 +2080,45 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 minutos = 0
                 msg_just = ""
                 info = ""
+                tolerancia = 5  # minutos
+                
+                # NOVA LÓGICA:
+                # - Até 5 minutos ANTES do horário: tolerância, registra NORMAL, SEM banco de horas
+                # - Horário exato: normal
+                # - 1 minuto ou mais DEPOIS: ATRASO = BLOQUEADO (para chegadas: ENTRADA, RETORNO_ALMOCO)
+                # - Para saídas (SAIDA_ALMOCO, SAIDA): sair mais de 5 min ANTES = BLOQUEADO
                 
                 if tipo == "ENTRADA":
-                    atrasado = 1 if verificar_atraso(hora_str, func["horario_entrada"], tolerancia_minutos=5) else 0
+                    # Verifica se chegou DEPOIS do horário (qualquer atraso, mesmo 1 min)
+                    atrasado = 1 if verificar_atraso(hora_str, func["horario_entrada"], tolerancia_minutos=0) else 0
                     if atrasado:
                         minutos = calcular_minutos(hora_str, func["horario_entrada"])
-                        msg_just = f"Atraso na ENTRADA. Horário padrão: {func['horario_entrada']} (tolerância: 5 min)."
+                        msg_just = f"Atraso na ENTRADA. Horário padrão: {func['horario_entrada']}. Qualquer atraso requer aprovação do administrador."
                         info = f"Atraso de {minutos} minuto(s)"
                 elif tipo == "SAIDA_ALMOCO":
+                    # Verifica se saiu MAIS de 5 minutos ANTES do horário
                     minutos_antes = calcular_minutos(func["horario_saida_almoco"], hora_str)
-                    if not verificar_atraso(hora_str, func["horario_saida_almoco"]) and minutos_antes >= 30:
+                    saiu_cedo_demais = (minutos_antes > tolerancia) and not verificar_atraso(hora_str, func["horario_saida_almoco"], tolerancia_minutos=0)
+                    if saiu_cedo_demais:
+                        atrasado = 1
                         minutos = minutos_antes
-                        msg_just = f"Saída para almoço com {minutos_antes} min de antecedência. Padrão: {func['horario_saida_almoco']}."
+                        msg_just = f"Saída para almoço com {minutos_antes} min de antecedência (acima da tolerância de {tolerancia} min). Padrão: {func['horario_saida_almoco']}."
                         info = f"Antecedência de {minutos_antes} min"
                 elif tipo == "RETORNO_ALMOCO":
-                    atrasado = 1 if verificar_atraso(hora_str, func["horario_retorno_almoco"], tolerancia_minutos=5) else 0
+                    # Verifica se chegou DEPOIS do horário (qualquer atraso, mesmo 1 min)
+                    atrasado = 1 if verificar_atraso(hora_str, func["horario_retorno_almoco"], tolerancia_minutos=0) else 0
                     if atrasado:
                         minutos = calcular_minutos(hora_str, func["horario_retorno_almoco"])
-                        msg_just = f"Atraso no RETORNO. Padrão: {func['horario_retorno_almoco']} (tolerância: 5 min)."
+                        msg_just = f"Atraso no RETORNO DO ALMOÇO. Horário padrão: {func['horario_retorno_almoco']}. Qualquer atraso requer aprovação do administrador."
                         info = f"Atraso de {minutos} minuto(s)"
                 elif tipo == "SAIDA":
-                    atrasado = 1 if verificar_atraso(func["horario_saida"], hora_str, tolerancia_minutos=5) else 0
-                    if atrasado:
-                        minutos = calcular_minutos(func["horario_saida"], hora_str)
-                        msg_just = f"SAÍDA ANTECIPADA. Padrão: {func['horario_saida']} (tolerância: 5 min)."
+                    # Verifica se saiu MAIS de 5 minutos ANTES do horário
+                    minutos_antes = calcular_minutos(func["horario_saida"], hora_str)
+                    saiu_cedo_demais = (minutos_antes > tolerancia) and not verificar_atraso(hora_str, func["horario_saida"], tolerancia_minutos=0)
+                    if saiu_cedo_demais:
+                        atrasado = 1
+                        minutos = minutos_antes
+                        msg_just = f"SAÍDA ANTECIPADA. Horário padrão: {func['horario_saida']}. Sair mais de {tolerancia} min antes requer aprovação do administrador."
                         info = f"Antecipada em {minutos} minuto(s)"
                 
                 conn.close()
@@ -2023,15 +2195,25 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 
                 atrasado = 0
                 minutos_atraso = 0
+                tolerancia = 5
                 if tipo == "ENTRADA":
-                    atrasado = 1 if verificar_atraso(hora_str, func["horario_entrada"], tolerancia_minutos=5) else 0
+                    atrasado = 1 if verificar_atraso(hora_str, func["horario_entrada"], tolerancia_minutos=0) else 0
                     if atrasado: minutos_atraso = calcular_minutos(hora_str, func["horario_entrada"])
+                elif tipo == "SAIDA_ALMOCO":
+                    minutos_antes = calcular_minutos(func["horario_saida_almoco"], hora_str)
+                    saiu_cedo_demais = (minutos_antes > tolerancia) and not verificar_atraso(hora_str, func["horario_saida_almoco"], tolerancia_minutos=0)
+                    if saiu_cedo_demais:
+                        atrasado = 1
+                        minutos_atraso = minutos_antes
                 elif tipo == "RETORNO_ALMOCO":
-                    atrasado = 1 if verificar_atraso(hora_str, func["horario_retorno_almoco"], tolerancia_minutos=5) else 0
+                    atrasado = 1 if verificar_atraso(hora_str, func["horario_retorno_almoco"], tolerancia_minutos=0) else 0
                     if atrasado: minutos_atraso = calcular_minutos(hora_str, func["horario_retorno_almoco"])
                 elif tipo == "SAIDA":
-                    atrasado = 1 if verificar_atraso(func["horario_saida"], hora_str, tolerancia_minutos=5) else 0
-                    if atrasado: minutos_atraso = calcular_minutos(func["horario_saida"], hora_str)
+                    minutos_antes = calcular_minutos(func["horario_saida"], hora_str)
+                    saiu_cedo_demais = (minutos_antes > tolerancia) and not verificar_atraso(hora_str, func["horario_saida"], tolerancia_minutos=0)
+                    if saiu_cedo_demais:
+                        atrasado = 1
+                        minutos_atraso = minutos_antes
                 
                 conn.execute("""
                     INSERT INTO solicitacoes_pendentes 
@@ -2578,14 +2760,14 @@ def gerar_pdf_individual(func_id, mes):
 # ===================== INICIAR SERVIDOR =====================
 if __name__ == "__main__":
     print("=" * 65)
-    print("   🚀 SISTEMA DE PONTO v3.1 - FUNCIONANDO!")
+    print("   🚀 SISTEMA DE PONTO v3.2 - FUNCIONANDO!")
     print("=" * 65)
     print(f"📱 Página do funcionário:  http://localhost:{PORTA}")
     print(f"👤 Painel Funcionário:     http://localhost:{PORTA}/funcionario")
     print(f"🔐 Login Admin:            http://localhost:{PORTA}/admin")
     print(f"👤 Usuário: {ADMIN_USUARIO}   |   Senha: {ADMIN_SENHA}")
     print("=" * 65)
-    print("✨ NOVAS FUNCIONALIDADES v3.1:")
+    print("✨ NOVAS FUNCIONALIDADES v3.2:")
     print("   👥 Sistema de múltiplos administradores")
     print("   📊 Painel de resumo visual da equipe")
     print("   🎨 Cards coloridos com horários dos funcionários")
