@@ -2289,12 +2289,18 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 if tipo == "ENTRADA":
                     atrasado = 1 if verificar_atraso(hora_str, func["horario_entrada"], tolerancia_minutos=5) else 0
                     if atrasado: minutos_atraso = calcular_minutos(hora_str, func["horario_entrada"])
+                elif tipo == "SAIDA_ALMOCO":
+                    # Para saída almoço: se chegou aqui em /api/bater_ponto, já foi verificado
+                    # em /api/verificar_ponto e não está bloqueado. Atrasado permanece 0.
+                    atrasado = 0
+                    minutos_atraso = 0
                 elif tipo == "RETORNO_ALMOCO":
                     atrasado = 1 if verificar_atraso(hora_str, func["horario_retorno_almoco"], tolerancia_minutos=5) else 0
                     if atrasado: minutos_atraso = calcular_minutos(hora_str, func["horario_retorno_almoco"])
                 elif tipo == "SAIDA":
-                    atrasado = 1 if verificar_atraso(func["horario_saida"], hora_str, tolerancia_minutos=5) else 0
-                    if atrasado: minutos_atraso = calcular_minutos(func["horario_saida"], hora_str)
+                    # Para saída: se chegou aqui, já foi verificado. Atrasado permanece 0.
+                    atrasado = 0
+                    minutos_atraso = 0
                 
                 minutos_banco = calcular_banco_horas(tipo, hora_str, func)
                 
@@ -2307,6 +2313,41 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 conn.close()
                 
                 tipo_info = TIPOS_REGISTRO[tipo]
+                
+                # Determinar horário padrão
+                if tipo == "ENTRADA":
+                    horario_padrao = func["horario_entrada"]
+                elif tipo == "SAIDA_ALMOCO":
+                    horario_padrao = func["horario_saida_almoco"]
+                elif tipo == "RETORNO_ALMOCO":
+                    horario_padrao = func["horario_retorno_almoco"]
+                else:  # SAIDA
+                    horario_padrao = func["horario_saida"]
+                
+                # Determinar status para a tela de confirmação
+                if atrasado:
+                    status_texto = f"⚠️ Atrasado em {minutos_atraso} minuto(s)"
+                    status_registro = "atrasado"
+                elif minutos_banco > 0:
+                    status_texto = f"⏱️ Banco de horas: +{minutos_banco} min"
+                    status_registro = "banco"
+                else:
+                    # Verificar se está na tolerância
+                    if tipo in ["ENTRADA", "RETORNO_ALMOCO"]:
+                        if verificar_na_tolerancia_depois(hora_str, horario_padrao, tolerancia_minutos=5):
+                            status_texto = "✅ Dentro da tolerância"
+                            status_registro = "tolerancia"
+                        else:
+                            status_texto = "✅ No horário exato"
+                            status_registro = "normal"
+                    else:  # SAIDA_ALMOCO, SAIDA
+                        if verificar_na_tolerancia_antes(hora_str, horario_padrao, tolerancia_minutos=5):
+                            status_texto = "✅ Dentro da tolerância"
+                            status_registro = "tolerancia"
+                        else:
+                            status_texto = "✅ No horário exato"
+                            status_registro = "normal"
+                
                 msg = f"{tipo_info['icone']} {tipo_info['label']} registrada!\\n"
                 msg += f"👤 {func['nome']}\\n📅 {agora.strftime('%d/%m/%Y')}\\n⏰ {hora_str}"
                 if atrasado: msg += f"\\n⚠️ Atraso: {minutos_atraso} min"
@@ -2314,7 +2355,20 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 if justificativa: msg += f"\\n📝 Justificativa registrada"
                 
                 print(f"[PONTO] {func['nome']} | {tipo} | {hora_str} | IP:{ip_cliente}")
-                responder_json(self, {"mensagem": msg})
+                
+                responder_json(self, {
+                    "registro_ok": True,
+                    "mensagem": msg,
+                    "tipo_icone": tipo_info["icone"],
+                    "tipo_cor": tipo_info["cor"],
+                    "tipo_label": tipo_info["label"],
+                    "nome": func["nome"],
+                    "hora": hora_str,
+                    "data": agora.strftime("%d/%m/%Y"),
+                    "horario_padrao": horario_padrao,
+                    "status_texto": status_texto,
+                    "status_registro": status_registro
+                })
             except Exception as e:
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
             return
