@@ -1506,6 +1506,22 @@ class ServidorPonto(BaseHTTPRequestHandler):
         
         if caminho.startswith("/static/"):
             nome_arquivo = caminho.replace("/static/", "").split("?")[0]
+
+        # Rota de Health Check para UptimeRobot
+        if caminho == "/health" or caminho == "/healthz":
+            try:
+                conn = get_db()
+                conn.execute("SELECT 1 FROM funcionarios LIMIT 1")
+                conn.close()
+                responder_json(self, {
+                    "status": "ok",
+                    "servico": "Sistema de Ponto v3.1",
+                    "timestamp": agora_brasilia().strftime("%Y-%m-%d %H:%M:%S"),
+                    "banco": "conectado"
+                })
+            except Exception as e:
+                responder_json(self, {"status": "erro", "detalhe": str(e)}, status=500)
+            return
             caminho_completo = os.path.join("static", nome_arquivo)
             if os.path.exists(caminho_completo):
                 self.send_response(200)
