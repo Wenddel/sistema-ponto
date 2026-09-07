@@ -1,0 +1,31 @@
+{
+  "name": "Sistema de Ponto Clínica",
+  "short_name": "Ponto Clínica",
+  "description": "Sistema de controle de ponto com reconhecimento facial",
+  "start_url": "/admin",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#667eea",
+  "theme_color": "#667eea",
+  "lang": "pt-BR",
+  "categories": [
+    "business",
+    "productivity",
+    "tools"
+  ],
+  "icons": [
+    {
+      "src": "/static/logo.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/static/logo.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
