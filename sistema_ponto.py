@@ -144,6 +144,23 @@ def init_db():
         tipo_acesso TEXT DEFAULT 'pagina_inicial',
         FOREIGN KEY (funcionario_id) REFERENCES funcionarios(id) ON DELETE SET NULL
     )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS solicitacoes_pendentes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        funcionario_id INTEGER NOT NULL,
+        cpf TEXT NOT NULL,
+        data_hora_solicitacao TEXT NOT NULL,
+        tipo TEXT NOT NULL,
+        atrasado INTEGER DEFAULT 0,
+        minutos_atraso INTEGER DEFAULT 0,
+        justificativa TEXT DEFAULT '',
+        status TEXT DEFAULT 'PENDENTE',
+        ip_dispositivo TEXT DEFAULT '',
+        user_agent TEXT DEFAULT '',
+        data_hora_aprovacao TEXT DEFAULT '',
+        admin_aprovador TEXT DEFAULT '',
+        motivo_negacao TEXT DEFAULT '',
+        FOREIGN KEY (funcionario_id) REFERENCES funcionarios(id) ON DELETE CASCADE
+    )""")
     for coluna, tipo in [("minutos_atraso","INTEGER DEFAULT 0"),("minutos_banco_horas","INTEGER DEFAULT 0"),("justificativa","TEXT DEFAULT ''"),("ip_dispositivo","TEXT DEFAULT ''"),("user_agent","TEXT DEFAULT ''"),("horario_acesso","TEXT DEFAULT ''")]:
         try:
             conn.execute(f"ALTER TABLE registros_ponto ADD COLUMN {coluna} {tipo}")
@@ -534,6 +551,33 @@ body { min-height:100vh; padding:15px; position:relative; overflow-x:hidden; }
 .btn-cancelar { background:linear-gradient(135deg,#e0e0e0,#bdbdbd); color:#333; }
 .btn-confirmar { background:linear-gradient(135deg,#667eea,#764ba2); color:white; }
 .disp-info { margin-top:15px; padding:12px; background:linear-gradient(135deg,#f3e5f5,#e1bee7); border-radius:12px; font-size:11px; color:#6a1b9a; text-align:center; border:1px solid #ce93d8; }
+.tela-bloqueio { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); backdrop-filter:blur(10px); z-index:2000; align-items:center; justify-content:center; padding:20px; }
+.tela-bloqueio.ativa { display:flex; }
+.bloqueio-box { background:white; border-radius:28px; padding:40px 30px; width:100%; max-width:420px; text-align:center; box-shadow:0 30px 80px rgba(244,67,54,0.4); animation:entrar-cima 0.5s cubic-bezier(0.175,0.885,0.32,1.275); }
+.bloqueio-icone { width:100px; height:100px; border-radius:50%; background:linear-gradient(135deg,#f44336,#ff5722); display:flex; align-items:center; justify-content:center; font-size:50px; margin:0 auto 20px; box-shadow:0 10px 30px rgba(244,67,54,0.5); animation:pulse-bloqueio 2s infinite; }
+@keyframes pulse-bloqueio { 0%,100%{transform:scale(1);box-shadow:0 10px 30px rgba(244,67,54,0.5)} 50%{transform:scale(1.08);box-shadow:0 15px 40px rgba(244,67,54,0.6)} }
+.bloqueio-box h2 { color:#f44336; font-size:22px; margin-bottom:10px; }
+.bloqueio-sub { color:#666; font-size:14px; margin-bottom:20px; line-height:1.6; }
+.bloqueio-info { background:linear-gradient(135deg,#fff3e0,#ffe0b2); border:2px solid #ff9800; border-radius:14px; padding:15px; margin-bottom:20px; text-align:left; }
+.bloqueio-info p { margin:5px 0; font-size:13px; color:#e65100; }
+.bloqueio-info strong { color:#bf360c; }
+.bloqueio-status { background:linear-gradient(135deg,#e3f2fd,#bbdefb); border-radius:14px; padding:15px; margin-bottom:15px; }
+.bloqueio-status .status-texto { color:#1565c0; font-weight:bold; font-size:14px; }
+.bloqueio-status .status-dots { display:inline-block; margin-left:8px; }
+.bloqueio-status .status-dots span { display:inline-block; width:8px; height:8px; background:#1565c0; border-radius:50%; margin:0 2px; animation:dots 1.4s infinite; }
+.bloqueio-status .status-dots span:nth-child(2){animation-delay:0.2s}
+.bloqueio-status .status-dots span:nth-child(3){animation-delay:0.4s}
+@keyframes dots { 0%,80%,100%{transform:scale(0);opacity:0.5} 40%{transform:scale(1);opacity:1} }
+.bloqueio-aprovado { background:linear-gradient(135deg,#e8f5e9,#c8e6c9); border:2px solid #4CAF50; border-radius:14px; padding:20px; margin-bottom:15px; }
+.bloqueio-aprovado h3 { color:#2e7d32; font-size:18px; margin-bottom:8px; }
+.bloqueio-aprovado p { color:#1b5e20; font-size:14px; }
+.bloqueio-negado { background:linear-gradient(135deg,#ffebee,#ffcdd2); border:2px solid #f44336; border-radius:14px; padding:20px; margin-bottom:15px; }
+.bloqueio-negado h3 { color:#b71c1c; font-size:18px; margin-bottom:8px; }
+.bloqueio-negado p { color:#c62828; font-size:14px; }
+.bloqueio-negado .motivo { background:white; padding:10px; border-radius:8px; margin-top:10px; font-style:italic; color:#555; font-size:13px; }
+.btn-continuar { width:100%; padding:14px; background:linear-gradient(135deg,#667eea,#764ba2); color:white; border:none; border-radius:12px; font-weight:bold; font-size:15px; cursor:pointer; transition:all 0.3s; }
+.btn-continuar:hover { transform:translateY(-2px); box-shadow:0 6px 20px rgba(102,126,234,0.4); }
+.bloqueio-aviso { background:linear-gradient(135deg,#fffde7,#fff9c4); border:1px solid #fbc02d; border-radius:10px; padding:10px; font-size:11px; color:#f57f17; margin-top:15px; }
 </style>
 </head>
 <body class="fundo-animado">
@@ -560,6 +604,26 @@ body { min-height:100vh; padding:15px; position:relative; overflow-x:hidden; }
 </div>
 """ + RODAPE_WELL + """
 </div>
+
+<!-- TELA DE BLOQUEIO - AGUARDANDO APROVAÇÃO ADMIN -->
+<div class="tela-bloqueio" id="telaBloqueio">
+  <div class="bloqueio-box" id="bloqueioConteudo">
+    <div class="bloqueio-icone" id="bloqueioIcone">🔒</div>
+    <h2 id="bloqueioTitulo">REGISTRO BLOQUEADO</h2>
+    <p class="bloqueio-sub" id="bloqueioSub">Seu registro está fora da tolerância de 5 minutos e requer aprovação do administrador.</p>
+    <div class="bloqueio-info" id="bloqueioInfo">
+      <p><strong>Tipo:</strong> <span id="bloqTipo">-</span></p>
+      <p><strong>Atraso:</strong> <span id="bloqAtraso">-</span> minuto(s)</p>
+      <p><strong>Solicitado em:</strong> <span id="bloqHora">-</span></p>
+    </div>
+    <div class="bloqueio-status" id="bloqueioStatus">
+      <span class="status-texto">⏳ Aguardando aprovação do administrador</span>
+      <span class="status-dots"><span></span><span></span><span></span></span>
+    </div>
+    <div class="bloqueio-aviso">⚠️ Esta tela não pode ser fechada. O sistema verificará automaticamente a aprovação.</div>
+  </div>
+</div>
+
 <div class="modal-overlay" id="modalJust">
 <div class="modal-box">
 <h2>⚠️ Atenção!</h2>
@@ -600,13 +664,18 @@ async function carregar(){
   }catch(e){window.location.href='/';}
 }
 carregar();
+let pollingId=null;
 async function registrar(tipo){
   if(!CPF)return;
   try{
     const r=await fetch('/api/verificar_ponto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cpf:CPF,tipo:tipo,qr_code:QR})});
     const d=await r.json();
     if(!r.ok){mostrar(d.detail||'Erro','erro');return;}
-    if(d.precisa_justificativa){
+    if(d.bloqueado){
+      // ATRASO ACIMA DE 5 MINUTOS: Bloquear e solicitar aprovação admin
+      await solicitarAprovacao(tipo,d);
+    }else if(d.precisa_justificativa){
+      // Atraso pequeno ou situação que pede justificativa mas não bloqueia
       pendente={cpf:CPF,tipo:tipo};
       document.getElementById('modalTexto').textContent=d.mensagem_justificativa;
       document.getElementById('modalInfo').textContent='⏱️ '+d.info_atraso;
@@ -615,6 +684,97 @@ async function registrar(tipo){
       document.getElementById('justificativa').focus();
     }else await executar(CPF,tipo,'');
   }catch(e){mostrar('Erro de conexão!','erro');}
+}
+
+async function solicitarAprovacao(tipo,dados){
+  // Pede justificativa primeiro, depois envia solicitação
+  const just=prompt('📝 Descreva o motivo do atraso:\n(esta informação será enviada ao administrador)');
+  if(just===null)return; // Usuário não quer informar motivo, mas ainda assim envia
+  
+  try{
+    const r=await fetch('/api/solicitar_ponto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cpf:CPF,tipo:tipo,qr_code:QR,justificativa:just||'Não informado'})});
+    const d=await r.json();
+    if(!r.ok){mostrar(d.detail||'Erro','erro');return;}
+    
+    // Mostrar tela de bloqueio - SEM OPÇÃO DE CANCELAR
+    mostrarTelaBloqueio(tipo,dados.minutos_atraso||0);
+    // Iniciar polling para verificar status
+    iniciarPolling();
+  }catch(e){mostrar('Erro ao enviar solicitação!','erro');}
+}
+
+function mostrarTelaBloqueio(tipo,minutos){
+  const tiposLabel={'ENTRADA':'✅ ENTRADA','SAIDA_ALMOCO':'🍽️ SAÍDA ALMOÇO','RETORNO_ALMOCO':'↩️ RETORNO ALMOÇO','SAIDA':'🚪 SAÍDA'};
+  document.getElementById('bloqTipo').textContent=tiposLabel[tipo]||tipo;
+  document.getElementById('bloqAtraso').textContent=minutos;
+  document.getElementById('bloqHora').textContent=new Date().toLocaleTimeString('pt-BR');
+  document.getElementById('telaBloqueio').classList.add('ativa');
+  // Prevenir ESC e outros métodos de fechamento
+  document.addEventListener('keydown',prevenirFechamento);
+}
+
+function prevenirFechamento(e){
+  if(e.key==='Escape'){e.preventDefault();e.stopPropagation();}
+}
+
+function iniciarPolling(){
+  pararPolling();
+  pollingId=setInterval(verificarStatusSolicitacao,3000);
+  verificarStatusSolicitacao();
+}
+
+function pararPolling(){
+  if(pollingId){clearInterval(pollingId);pollingId=null;}
+}
+
+async function verificarStatusSolicitacao(){
+  if(!CPF)return;
+  try{
+    const r=await fetch('/api/solicitacao_status/'+CPF);
+    const d=await r.json();
+    if(!d.encontrada)return;
+    
+    if(d.status==='APROVADA'){
+      pararPolling();
+      mostrarResultadoAprovacao(d);
+    }else if(d.status==='NEGADA'){
+      pararPolling();
+      mostrarResultadoNegacao(d);
+    }
+  }catch(e){}
+}
+
+function mostrarResultadoAprovacao(d){
+  document.getElementById('bloqueioIcone').textContent='✅';
+  document.getElementById('bloqueioIcone').style.background='linear-gradient(135deg,#4CAF50,#66bb6a)';
+  document.getElementById('bloqueioIcone').style.animation='none';
+  document.getElementById('bloqueioTitulo').textContent='SOLICITAÇÃO APROVADA!';
+  document.getElementById('bloqueioTitulo').style.color='#2e7d32';
+  document.getElementById('bloqueioSub').textContent='O administrador aprovou seu registro. Ponto registrado com sucesso.';
+  document.getElementById('bloqueioStatus').outerHTML=
+    '<div class="bloqueio-aprovado"><h3>🎉 Ponto Registrado!</h3><p>Tipo: '+d.tipo_formatado+'<br>Horário: '+d.data_hora.split(' ')[1]+'</p></div>'+
+    '<button class="btn-continuar" onclick="fecharTelaBloqueio()">Continuar</button>';
+  document.removeEventListener('keydown',prevenirFechamento);
+}
+
+function mostrarResultadoNegacao(d){
+  document.getElementById('bloqueioIcone').textContent='❌';
+  document.getElementById('bloqueioIcone').style.background='linear-gradient(135deg,#f44336,#d32f2f)';
+  document.getElementById('bloqueioIcone').style.animation='none';
+  document.getElementById('bloqueioTitulo').textContent='SOLICITAÇÃO NEGADA';
+  document.getElementById('bloqueioTitulo').style.color='#b71c1c';
+  document.getElementById('bloqueioSub').textContent='O administrador negou sua solicitação de registro.';
+  const motivo=d.motivo_negacao?'<div class="motivo">Motivo: '+d.motivo_negacao+'</div>':'';
+  document.getElementById('bloqueioStatus').outerHTML=
+    '<div class="bloqueio-negado"><h3>⚠️ Registro não efetuado</h3><p>Procure o administrador para mais informações.</p>'+motivo+'</div>'+
+    '<button class="btn-continuar" onclick="fecharTelaBloqueio()">Entendido</button>';
+  document.removeEventListener('keydown',prevenirFechamento);
+}
+
+function fecharTelaBloqueio(){
+  document.getElementById('telaBloqueio').classList.remove('ativa');
+  // Resetar tela para estado original
+  location.reload();
 }
 function fecharModal(){document.getElementById('modalJust').classList.remove('ativo');pendente=null;}
 async function confirmar(){
@@ -700,6 +860,28 @@ th { background:linear-gradient(135deg,#f8f9fa,#eef2f7); font-weight:bold; color
 .filtros { display:flex; gap:10px; margin-bottom:15px; flex-wrap:wrap; align-items:center; }
 .filtros input, .filtros select { margin:0; width:auto; min-width:150px; }
 label { font-size:13px; color:#555; font-weight:bold; display:block; margin-top:8px; }
+.tab-badge { position:relative; }
+.badge-notificacao { position:absolute; top:-5px; right:-8px; background:#f44336; color:white; border-radius:50%; width:20px; height:20px; font-size:11px; display:flex; align-items:center; justify-content:center; font-weight:bold; box-shadow:0 2px 8px rgba(244,67,54,0.5); animation:pulse-badge 2s infinite; }
+@keyframes pulse-badge { 0%,100%{transform:scale(1)} 50%{transform:scale(1.15)} }
+.solic-card { background:linear-gradient(135deg,#fff,#fafafa); border:2px solid #e0e0e0; border-left:5px solid #ff9800; border-radius:14px; padding:18px; margin:12px 0; transition:all 0.3s; box-shadow:0 3px 10px rgba(0,0,0,0.05); }
+.solic-card:hover { transform:translateX(4px); box-shadow:0 6px 20px rgba(0,0,0,0.1); }
+.solic-card.atraso-alto { border-left-color:#f44336; background:linear-gradient(135deg,#fff,#fff5f5); }
+.solic-header { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:10px; }
+.solic-nome { font-size:16px; font-weight:bold; color:#333; }
+.solic-tipo { font-size:12px; padding:4px 10px; border-radius:20px; font-weight:bold; color:white; }
+.tipo-entrada-bg { background:linear-gradient(135deg,#4CAF50,#66bb6a); }
+.tipo-saida-almoco-bg { background:linear-gradient(135deg,#ff9800,#ffb74d); }
+.tipo-retorno-almoco-bg { background:linear-gradient(135deg,#2196F3,#64b5f6); }
+.tipo-saida-bg { background:linear-gradient(135deg,#f44336,#ef5350); }
+.solic-detalhes { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:8px; margin:10px 0; }
+.solic-detalhe-item { background:#f5f5f5; padding:8px 10px; border-radius:8px; font-size:12px; }
+.solic-detalhe-item strong { display:block; color:#888; font-size:10px; text-transform:uppercase; margin-bottom:2px; }
+.solic-justificativa { background:linear-gradient(135deg,#fff8e1,#ffecb3); border-radius:10px; padding:10px 12px; margin:10px 0; font-size:13px; color:#e65100; border-left:3px solid #ff9800; }
+.solic-acoes { display:flex; gap:10px; margin-top:12px; }
+.solic-acoes button { flex:1; padding:10px; font-size:13px; }
+.alerta-solic-vazio { text-align:center; padding:40px; color:#999; font-size:15px; }
+.alerta-solic-vazio .icone-grande { font-size:50px; display:block; margin-bottom:15px; opacity:0.5; }
+.motivo-input { width:100%; padding:10px; margin:8px 0; border:2px solid #e0e0e0; border-radius:8px; font-size:13px; resize:vertical; min-height:60px; }
 </style>
 </head>
 <body>
@@ -717,6 +899,7 @@ label { font-size:13px; color:#555; font-weight:bold; display:block; margin-top:
 <button class="tab" onclick="abrir('registros',this)">📊 Registros</button>
 <button class="tab" onclick="abrir('relatorios',this)">📄 Relatórios PDF</button>
 <button class="tab" onclick="abrir('qrcode',this)">📱 QR Code</button>
+<button class="tab tab-badge" onclick="abrir('solicitacoes',this)" id="tabSolicitacoes">📨 Solicitações <span class="badge-notificacao" id="badgeSolic" style="display:none;">0</span></button>
 <button class="tab" onclick="abrir('acessos',this)">📡 Acessos</button>
 <button class="tab" onclick="abrir('config',this)">🔧 Configurações</button>
 </div>
@@ -779,6 +962,12 @@ label { font-size:13px; color:#555; font-weight:bold; display:block; margin-top:
 <button onclick="gerarQR()">🔄 Gerar/Atualizar QR Code</button>
 <div id="qrImg" style="margin-top:20px;"></div>
 </div>
+<div id="solicitacoes" class="painel">
+<h2>📨 Solicitações Pendentes de Aprovação</h2>
+<div class="info-box">⚠️ Funcionários com atraso superior a 5 minutos precisam de sua aprovação para registrar o ponto. A tela do funcionário fica bloqueada até sua decisão.</div>
+<button onclick="carregarSolicitacoes()">🔄 Atualizar Lista</button>
+<div id="listaSolicitacoes"></div>
+</div>
 <div id="acessos" class="painel">
 <h2>📡 Registros de Acesso de Dispositivos</h2>
 <button onclick="carregarAcessos()">🔄 Atualizar</button>
@@ -813,6 +1002,7 @@ const h=new Date();const ma=h.toISOString().slice(0,7);
 document.getElementById('mesAno').value=ma;document.getElementById('mesAnoFunc').value=ma;
 document.getElementById('urlLocal').textContent=window.location.origin+'/';
 document.getElementById('cpfCad').addEventListener('input',function(){this.value=this.value.replace(/\\D/g,'');});
+let pollingAdmin=null;
 function abrir(n,btn){
   document.querySelectorAll('.painel').forEach(p=>p.classList.remove('ativo'));
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('ativo'));
@@ -821,7 +1011,100 @@ function abrir(n,btn){
   if(n==='registros')carregarRegs();
   if(n==='relatorios')carregarSel();
   if(n==='acessos')carregarAcessos();
+  if(n==='solicitacoes')carregarSolicitacoes();
 }
+
+// Iniciar polling para verificar solicitações pendentes e atualizar badge
+function iniciarPollingAdmin(){
+  pararPollingAdmin();
+  pollingAdmin=setInterval(atualizarBadgeSolic,5000);
+  atualizarBadgeSolic();
+}
+function pararPollingAdmin(){if(pollingAdmin){clearInterval(pollingAdmin);pollingAdmin=null;}}
+
+async function atualizarBadgeSolic(){
+  try{
+    const r=await fetch('/api/solicitacoes_pendentes');
+    if(r.status===401){window.location.href='/admin';return;}
+    const d=await r.json();
+    const badge=document.getElementById('badgeSolic');
+    if(d.length>0){
+      badge.style.display='flex';
+      badge.textContent=d.length;
+    }else{
+      badge.style.display='none';
+    }
+  }catch(e){}
+}
+
+async function carregarSolicitacoes(){
+  const r=await fetch('/api/solicitacoes_pendentes');
+  if(r.status===401){window.location.href='/admin';return;}
+  const d=await r.json();
+  const lista=document.getElementById('listaSolicitacoes');
+  
+  if(d.length===0){
+    lista.innerHTML='<div class="alerta-solic-vazio"><span class="icone-grande">✅</span>Nenhuma solicitação pendente no momento.</div>';
+    return;
+  }
+  
+  lista.innerHTML=d.map(function(s){
+    const ct='tipo-'+s.tipo.toLowerCase().replace(/_/g,'-')+'-bg';
+    const atrasoClasse=s.minutos_atraso>=15?'solic-card atraso-alto':'solic-card';
+    const justificativa=s.justificativa?'<div class="solic-justificativa">📝 <strong>Justificativa:</strong> '+s.justificativa+'</div>':'';
+    return '<div class="'+atrasoClasse+'" id="solic-'+s.id+'">'+
+      '<div class="solic-header">'+
+        '<div class="solic-nome">👤 '+s.nome+'</div>'+
+        '<span class="solic-tipo '+ct+'">'+s.tipo_formatado+'</span>'+
+      '</div>'+
+      '<div class="solic-detalhes">'+
+        '<div class="solic-detalhe-item"><strong>Data</strong>'+s.data+'</div>'+
+        '<div class="solic-detalhe-item"><strong>Hora</strong>'+s.hora+'</div>'+
+        '<div class="solic-detalhe-item"><strong>Atraso</strong><span style="color:#f44336;font-weight:bold;">'+s.minutos_atraso+' min</span></div>'+
+        '<div class="solic-detalhe-item"><strong>CPF</strong>'+s.cpf+'</div>'+
+        '<div class="solic-detalhe-item"><strong>Horário Padrão</strong>'+(s.tipo==='SAIDA'?s.horario_saida:s.horario_entrada)+'</div>'+
+        '<div class="solic-detalhe-item"><strong>IP</strong><span style="font-size:10px;">'+(s.ip||'-')+'</span></div>'+
+      '</div>'+
+      justificativa+
+      '<div class="solic-acoes">'+
+        '<button class="btn-success" onclick="aprovarSolic('+s.id+')">✅ ACEITAR ATRASO</button>'+
+        '<button class="btn-danger" onclick="negarSolic('+s.id+')">❌ NEGAR</button>'+
+      '</div>'+
+    '</div>';
+  }).join('');
+}
+
+async function aprovarSolic(id){
+  if(!confirm('✅ Confirmar aprovação?\n\nO ponto será registrado para este funcionário.'))return;
+  try{
+    const r=await fetch('/api/solicitacoes/'+id+'/aprovar',{method:'POST',headers:{'Content-Type':'application/json'}});
+    if(r.status===401){window.location.href='/admin';return;}
+    const d=await r.json();
+    if(r.ok){
+      alert('✅ Solicitação aprovada! Ponto registrado.');
+      carregarSolicitacoes();
+      atualizarBadgeSolic();
+    }else alert('❌ Erro: '+(d.detail||'Erro ao aprovar'));
+  }catch(e){alert('Erro de conexão!');}
+}
+
+async function negarSolic(id){
+  const motivo=prompt('❌ Informe o motivo da negativa (será exibido ao funcionário):');
+  if(motivo===null)return;
+  try{
+    const r=await fetch('/api/solicitacoes/'+id+'/negar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({motivo:motivo||'Não informado'})});
+    if(r.status===401){window.location.href='/admin';return;}
+    const d=await r.json();
+    if(r.ok){
+      alert('❌ Solicitação negada. O funcionário será notificado.');
+      carregarSolicitacoes();
+      atualizarBadgeSolic();
+    }else alert('❌ Erro: '+(d.detail||'Erro ao negar'));
+  }catch(e){alert('Erro de conexão!');}
+}
+
+// Iniciar polling quando a página carregar
+setTimeout(iniciarPollingAdmin,1000);
 function sair(){document.cookie='sessao_admin=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';window.location.href='/admin';}
 function msg(id,texto,tipo){const e=document.getElementById(id);e.textContent=texto;e.className='mensagem '+tipo;setTimeout(()=>e.className='mensagem',4000);}
 async function cadastrar(){
@@ -958,11 +1241,81 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
             return
         
-        rotas_admin = ["/api/funcionarios", "/api/registros", "/api/gerar_qrcode", "/api/pdf/geral", "/api/logout", "/api/acessos"]
-        precisa_login = (caminho in rotas_admin or caminho.startswith("/api/funcionarios/") or caminho.startswith("/api/pdf/funcionario/"))
+        rotas_admin = ["/api/funcionarios", "/api/registros", "/api/gerar_qrcode", "/api/pdf/geral", "/api/logout", "/api/acessos", "/api/solicitacoes_pendentes"]
+        precisa_login = (caminho in rotas_admin or caminho.startswith("/api/funcionarios/") or caminho.startswith("/api/pdf/funcionario/") or caminho.startswith("/api/solicitacoes/"))
+        
+        # Rota para funcionário consultar status da sua solicitação
+        if caminho.startswith("/api/solicitacao_status/"):
+            cpf = formatar_cpf(caminho.replace("/api/solicitacao_status/", ""))
+            if len(cpf) != 11:
+                responder_json(self, {"detail": "CPF inválido"}, status=400)
+                return
+            try:
+                conn = get_db()
+                # Buscar solicitação mais recente deste CPF
+                solic = conn.execute("""
+                    SELECT s.*, f.nome FROM solicitacoes_pendentes s
+                    JOIN funcionarios f ON s.funcionario_id = f.id
+                    WHERE s.cpf = ? ORDER BY s.id DESC LIMIT 1
+                """, (cpf,)).fetchone()
+                conn.close()
+                
+                if solic:
+                    responder_json(self, {
+                        "encontrada": True,
+                        "id": solic["id"],
+                        "status": solic["status"],
+                        "tipo": solic["tipo"],
+                        "tipo_formatado": solic["tipo"].replace("_", " "),
+                        "minutos_atraso": solic["minutos_atraso"] or 0,
+                        "data_hora": solic["data_hora_solicitacao"],
+                        "motivo_negacao": solic["motivo_negacao"] or "",
+                        "data_aprovacao": solic["data_hora_aprovacao"] or ""
+                    })
+                else:
+                    responder_json(self, {"encontrada": False})
+            except Exception as e:
+                responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
+            return
         
         if precisa_login and not verificar_login(self):
             responder_json(self, {"detail": "Não autorizado. Faça login."}, status=401)
+            return
+        
+        if caminho == "/api/solicitacoes_pendentes":
+            try:
+                conn = get_db()
+                solics = conn.execute("""
+                    SELECT s.*, f.nome, f.horario_entrada, f.horario_saida_almoco, 
+                           f.horario_retorno_almoco, f.horario_saida
+                    FROM solicitacoes_pendentes s
+                    JOIN funcionarios f ON s.funcionario_id = f.id
+                    WHERE s.status = 'PENDENTE'
+                    ORDER BY s.data_hora_solicitacao ASC
+                """).fetchall()
+                conn.close()
+                resultado = []
+                for s in solics:
+                    dh = datetime.strptime(s["data_hora_solicitacao"], "%Y-%m-%d %H:%M:%S")
+                    resultado.append({
+                        "id": s["id"],
+                        "funcionario_id": s["funcionario_id"],
+                        "nome": s["nome"],
+                        "cpf": s["cpf"],
+                        "data": dh.strftime("%d/%m/%Y"),
+                        "hora": dh.strftime("%H:%M:%S"),
+                        "tipo": s["tipo"],
+                        "tipo_formatado": s["tipo"].replace("_", " "),
+                        "atrasado": bool(s["atrasado"]),
+                        "minutos_atraso": s["minutos_atraso"] or 0,
+                        "justificativa": s["justificativa"] or "",
+                        "ip": s["ip_dispositivo"] or "",
+                        "horario_entrada": s["horario_entrada"],
+                        "horario_saida": s["horario_saida"]
+                    })
+                responder_json(self, resultado)
+            except Exception as e:
+                responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
             return
         
         if caminho == "/api/funcionarios":
@@ -1240,12 +1593,111 @@ class ServidorPonto(BaseHTTPRequestHandler):
                         info = f"Antecipada em {minutos} minuto(s)"
                 
                 conn.close()
+                # BLOQUEIO: se atrasado (já passou da tolerância de 5min), precisa de aprovação admin
+                bloqueado = (atrasado == 1)
                 responder_json(self, {
-                    "precisa_justificativa": (minutos > 0),
+                    "precisa_justificativa": (minutos > 0 and not bloqueado),
+                    "bloqueado": bloqueado,
                     "mensagem_justificativa": msg_just,
                     "info_atraso": info,
                     "minutos_atraso": minutos,
                     "atrasado": atrasado
+                })
+            except Exception as e:
+                responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
+            return
+        
+        if caminho == "/api/solicitar_ponto":
+            cpf = formatar_cpf(dados.get("cpf", ""))
+            tipo = dados.get("tipo", "ENTRADA")
+            qr_code = dados.get("qr_code", "")
+            justificativa = sanitizar_texto(dados.get("justificativa", ""), 500)
+            
+            if qr_code != SEGREDO_QR:
+                responder_json(self, {"detail": "QR Code inválido!"}, status=400)
+                return
+            if tipo not in TIPOS_REGISTRO:
+                responder_json(self, {"detail": "Tipo inválido!"}, status=400)
+                return
+            if len(cpf) != 11:
+                responder_json(self, {"detail": "CPF inválido!"}, status=400)
+                return
+            
+            try:
+                conn = get_db()
+                func = conn.execute("SELECT * FROM funcionarios WHERE cpf = ?", (cpf,)).fetchone()
+                if not func:
+                    conn.close()
+                    responder_json(self, {"detail": "CPF não cadastrado!"}, status=404)
+                    return
+                
+                agora = agora_brasilia()
+                data_str = agora.strftime("%Y-%m-%d")
+                data_hora_str = agora.strftime("%Y-%m-%d %H:%M:%S")
+                hora_str = agora.strftime("%H:%M:%S")
+                
+                ultimo = obter_ultimo_registro(func["id"], data_str)
+                ultimo_tipo = ultimo["tipo"] if ultimo else None
+                
+                valido, msg_erro = verificar_sequencia_valida(ultimo_tipo, tipo)
+                if not valido:
+                    conn.close()
+                    responder_json(self, {"detail": "⛔ " + msg_erro}, status=400)
+                    return
+                
+                if verificar_registro_duplicado(func["id"], data_str, tipo):
+                    conn.close()
+                    responder_json(self, {"detail": f"⛔ {TIPOS_REGISTRO[tipo]['label']} JÁ registrada hoje!"}, status=400)
+                    return
+                
+                # Verificar se já existe solicitação pendente para este tipo hoje
+                solic_existente = conn.execute("""
+                    SELECT id FROM solicitacoes_pendentes 
+                    WHERE funcionario_id = ? AND strftime('%Y-%m-%d', data_hora_solicitacao) = ? 
+                    AND tipo = ? AND status = 'PENDENTE' LIMIT 1
+                """, (func["id"], data_str, tipo)).fetchone()
+                
+                if solic_existente:
+                    conn.close()
+                    responder_json(self, {
+                        "status": "ja_existe",
+                        "solicitacao_id": solic_existente["id"],
+                        "mensagem": "Já existe uma solicitação pendente de aprovação."
+                    })
+                    return
+                
+                # Calcular atraso para registrar na solicitação
+                atrasado = 0
+                minutos_atraso = 0
+                if tipo == "ENTRADA":
+                    atrasado = 1 if verificar_atraso(hora_str, func["horario_entrada"], tolerancia_minutos=5) else 0
+                    if atrasado: minutos_atraso = calcular_minutos(hora_str, func["horario_entrada"])
+                elif tipo == "RETORNO_ALMOCO":
+                    atrasado = 1 if verificar_atraso(hora_str, func["horario_retorno_almoco"], tolerancia_minutos=5) else 0
+                    if atrasado: minutos_atraso = calcular_minutos(hora_str, func["horario_retorno_almoco"])
+                elif tipo == "SAIDA":
+                    atrasado = 1 if verificar_atraso(func["horario_saida"], hora_str, tolerancia_minutos=5) else 0
+                    if atrasado: minutos_atraso = calcular_minutos(func["horario_saida"], hora_str)
+                
+                conn.execute("""
+                    INSERT INTO solicitacoes_pendentes 
+                    (funcionario_id, cpf, data_hora_solicitacao, tipo, atrasado, minutos_atraso, 
+                     justificativa, status, ip_dispositivo, user_agent)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDENTE', ?, ?)
+                """, (func["id"], cpf, data_hora_str, tipo, atrasado, minutos_atraso, 
+                      justificativa, ip_cliente, user_agent))
+                conn.commit()
+                
+                solic_id = conn.execute("SELECT last_insert_rowid() as id").fetchone()["id"]
+                conn.close()
+                
+                tipo_info = TIPOS_REGISTRO[tipo]
+                print(f"[SOLICITAÇÃO #{solic_id}] {func['nome']} | {tipo} | Atraso: {minutos_atraso}min | IP:{ip_cliente}")
+                
+                responder_json(self, {
+                    "status": "solicitado",
+                    "solicitacao_id": solic_id,
+                    "mensagem": f"Solicitação enviada para aprovação do administrador.\n\n{tipo_info['icone']} {tipo_info['label']}\n👤 {func['nome']}\n⏰ {hora_str}\n⚠️ Atraso: {minutos_atraso} min\n\nAguarde a aprovação..."
                 })
             except Exception as e:
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
@@ -1333,6 +1785,103 @@ class ServidorPonto(BaseHTTPRequestHandler):
         
         if not verificar_login(self):
             responder_json(self, {"detail": "Não autorizado"}, status=401)
+            return
+        
+        if caminho.startswith("/api/solicitacoes/") and caminho.endswith("/aprovar"):
+            try:
+                solic_id = int(caminho.replace("/api/solicitacoes/", "").replace("/aprovar", ""))
+                conn = get_db()
+                solic = conn.execute("SELECT * FROM solicitacoes_pendentes WHERE id = ?", (solic_id,)).fetchone()
+                
+                if not solic:
+                    conn.close()
+                    responder_json(self, {"detail": "Solicitação não encontrada"}, status=404)
+                    return
+                
+                if solic["status"] != "PENDENTE":
+                    conn.close()
+                    responder_json(self, {"detail": f"Solicitação já foi {solic['status']}"}, status=400)
+                    return
+                
+                func = conn.execute("SELECT * FROM funcionarios WHERE id = ?", (solic["funcionario_id"],)).fetchone()
+                
+                agora = agora_brasilia()
+                data_hora_aprovacao = agora.strftime("%Y-%m-%d %H:%M:%S")
+                
+                # Usar a data/hora original da solicitação para o registro
+                data_hora_registro = solic["data_hora_solicitacao"]
+                hora_str = data_hora_registro.split(" ")[1] if " " in data_hora_registro else data_hora_registro
+                
+                # Calcular banco de horas
+                minutos_banco = calcular_banco_horas(solic["tipo"], hora_str, func)
+                
+                # Registrar o ponto efetivamente
+                conn.execute("""
+                    INSERT INTO registros_ponto 
+                    (funcionario_id, data_hora, tipo, atrasado, minutos_atraso, minutos_banco_horas, 
+                     justificativa, ip_dispositivo, user_agent, horario_acesso)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (solic["funcionario_id"], data_hora_registro, solic["tipo"], 
+                      solic["atrasado"], solic["minutos_atraso"], minutos_banco,
+                      solic["justificativa"], solic["ip_dispositivo"], 
+                      solic["user_agent"], data_hora_aprovacao))
+                
+                # Atualizar status da solicitação
+                conn.execute("""
+                    UPDATE solicitacoes_pendentes 
+                    SET status = 'APROVADA', data_hora_aprovacao = ?, admin_aprovador = ?
+                    WHERE id = ?
+                """, (data_hora_aprovacao, ADMIN_USUARIO, solic_id))
+                
+                conn.commit()
+                conn.close()
+                
+                tipo_info = TIPOS_REGISTRO[solic["tipo"]]
+                print(f"[APROVADA #{solic_id}] {func['nome']} | {solic['tipo']} | Atraso: {solic['minutos_atraso']}min")
+                responder_json(self, {"status": "ok", "mensagem": f"Solicitação aprovada! Ponto registrado para {func['nome']}."})
+            except ValueError:
+                responder_json(self, {"detail": "ID inválido"}, status=400)
+            except Exception as e:
+                responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
+            return
+        
+        if caminho.startswith("/api/solicitacoes/") and caminho.endswith("/negar"):
+            try:
+                solic_id = int(caminho.replace("/api/solicitacoes/", "").replace("/negar", ""))
+                motivo = sanitizar_texto(dados.get("motivo", ""), 500)
+                
+                conn = get_db()
+                solic = conn.execute("SELECT * FROM solicitacoes_pendentes WHERE id = ?", (solic_id,)).fetchone()
+                
+                if not solic:
+                    conn.close()
+                    responder_json(self, {"detail": "Solicitação não encontrada"}, status=404)
+                    return
+                
+                if solic["status"] != "PENDENTE":
+                    conn.close()
+                    responder_json(self, {"detail": f"Solicitação já foi {solic['status']}"}, status=400)
+                    return
+                
+                func = conn.execute("SELECT nome FROM funcionarios WHERE id = ?", (solic["funcionario_id"],)).fetchone()
+                agora = agora_brasilia()
+                data_hora_aprovacao = agora.strftime("%Y-%m-%d %H:%M:%S")
+                
+                conn.execute("""
+                    UPDATE solicitacoes_pendentes 
+                    SET status = 'NEGADA', data_hora_aprovacao = ?, admin_aprovador = ?, motivo_negacao = ?
+                    WHERE id = ?
+                """, (data_hora_aprovacao, ADMIN_USUARIO, motivo, solic_id))
+                
+                conn.commit()
+                conn.close()
+                
+                print(f"[NEGADA #{solic_id}] {func['nome']} | Motivo: {motivo[:50]}")
+                responder_json(self, {"status": "ok", "mensagem": "Solicitação negada."})
+            except ValueError:
+                responder_json(self, {"detail": "ID inválido"}, status=400)
+            except Exception as e:
+                responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
             return
         
         if caminho == "/api/funcionarios":
