@@ -30,40 +30,19 @@ os.environ["TZ"] = "America/Sao_Paulo"
 try:
     import time
     time.tzset()
-    print("[FUSO] time.tzset() aplicado com sucesso")
-except Exception as e_tz:
-    print(f"[FUSO] time.tzset() não disponível: {e_tz}")
+except:
+    pass
 try:
     from zoneinfo import ZoneInfo
     FUSO_BRASILIA = ZoneInfo("America/Sao_Paulo")
-    print("[FUSO] ZoneInfo carregado: America/Sao_Paulo")
-except Exception as e_zi:
+except:
     FUSO_BRASILIA = None
-    print(f"[FUSO] ZoneInfo não disponível, usando fallback UTC-3: {e_zi}")
 
 def agora_brasilia():
     """Retorna datetime atual no fuso horário de Brasília (UTC-3)"""
-    try:
-        if FUSO_BRASILIA:
-            return datetime.now(FUSO_BRASILIA).replace(tzinfo=None)
-    except:
-        pass
-    # Fallback garantido: calcular UTC-3 manualmente
-    from datetime import timezone, timedelta
-    utc_agora = datetime.now(timezone.utc)
-    brasilia = utc_agora - timedelta(hours=3)
-    return brasilia.replace(tzinfo=None)
-
-# Verificar fuso horário na inicialização
-_dt_teste = agora_brasilia()
-from datetime import datetime as _dt_utc, timezone as _tz_utc
-_dt_utc_now = _dt_utc.now(_tz_utc)
-print(f"[FUSO] ========================================")
-print(f"[FUSO] Horário UTC:      {_dt_utc_now.strftime('%d/%m/%Y %H:%M:%S')}")
-print(f"[FUSO] Horário Brasília: {_dt_teste.strftime('%d/%m/%Y %H:%M:%S')}")
-print(f"[FUSO] ZoneInfo:         {'OK' if FUSO_BRASILIA else 'Fallback UTC-3'}")
-print(f"[FUSO] TZ Environment:   {os.environ.get('TZ', 'não definido')}")
-print(f"[FUSO] ========================================")
+    if FUSO_BRASILIA:
+        return datetime.now(FUSO_BRASILIA).replace(tzinfo=None)
+    return datetime.now()
 
 # ===================== CONFIGURACOES =====================
 SEGREDO_QR = "CLINICA_PONTO_2024"
@@ -243,47 +222,17 @@ def formatar_cpf(cpf):
     return ''.join(filter(str.isdigit, str(cpf)))
 
 def verificar_atraso(hora_registro, horario_padrao, tolerancia_minutos=0):
-    """
-    Verifica se o registro está ATRASADO (passou do horário).
-    NOVA REGRA: Qualquer segundo que passe do horário já é considerado atraso.
-    A tolerância é usada apenas para verificar antecedência excessiva.
-    """
     try:
-        hora_registro = str(hora_registro).strip()
-        horario_padrao = str(horario_padrao).strip()
-        if not hora_registro or not horario_padrao:
-            return False
         h_r = hora_registro.split(":")
         h_p = horario_padrao.split(":")
         t_r = int(h_r[0])*3600 + int(h_r[1])*60 + (int(h_r[2]) if len(h_r)>2 else 0)
         t_p = int(h_p[0])*3600 + int(h_p[1])*60 + (int(h_p[2]) if len(h_p)>2 else 0)
         tolerancia_segundos = tolerancia_minutos * 60
-        return t_r > t_p  # Qualquer coisa DEPOIS do horário já é atraso
-    except: return False
-
-def verificar_antecedencia_excessiva(hora_registro, horario_padrao, tolerancia_minutos=5):
-    """
-    Verifica se o registro está muito ANTES do horário (mais que a tolerância permitida).
-    Ex: horário 08:00, tolerância 5 min → registrar às 07:54 ou antes = excessivo.
-    """
-    try:
-        hora_registro = str(hora_registro).strip()
-        horario_padrao = str(horario_padrao).strip()
-        if not hora_registro or not horario_padrao:
-            return False
-        h_r = hora_registro.split(":")
-        h_p = horario_padrao.split(":")
-        t_r = int(h_r[0])*3600 + int(h_r[1])*60 + (int(h_r[2]) if len(h_r)>2 else 0)
-        t_p = int(h_p[0])*3600 + int(h_p[1])*60 + (int(h_p[2]) if len(h_p)>2 else 0)
-        tolerancia_segundos = tolerancia_minutos * 60
-        return t_r < (t_p - tolerancia_segundos)
+        return t_r > (t_p + tolerancia_segundos)
     except: return False
 
 def calcular_minutos(hora1, hora2):
     try:
-        hora1 = str(hora1).strip(); hora2 = str(hora2).strip()
-        if not hora1 or not hora2:
-            return 0
         h1 = hora1.split(":"); h2 = hora2.split(":")
         t1 = int(h1[0])*3600 + int(h1[1])*60 + (int(h1[2]) if len(h1)>2 else 0)
         t2 = int(h2[0])*3600 + int(h2[1])*60 + (int(h2[2]) if len(h2)>2 else 0)
@@ -291,30 +240,21 @@ def calcular_minutos(hora1, hora2):
     except: return 0
 
 def calcular_banco_horas(tipo, hora_registro, func):
-    """
-    NOVA REGRA: Até 5 minutos de antecedência NÃO gera banco de horas.
-    É considerado registro normal, sem pontos extras.
-    """
     try:
-        tolerancia_seg = 5 * 60  # 5 minutos
         h_r = hora_registro.split(":")
         t_r = int(h_r[0])*3600 + int(h_r[1])*60 + (int(h_r[2]) if len(h_r)>2 else 0)
         if tipo == "ENTRADA":
             h_p = func["horario_entrada"].split(":"); t_p = int(h_p[0])*3600+int(h_p[1])*60
-            diferenca = t_p - t_r
-            if diferenca > tolerancia_seg: return (diferenca)//60
+            if t_r < t_p: return (t_p-t_r)//60
         elif tipo == "SAIDA_ALMOCO":
             h_p = func["horario_saida_almoco"].split(":"); t_p = int(h_p[0])*3600+int(h_p[1])*60
-            diferenca = t_r - t_p
-            if diferenca > tolerancia_seg: return (diferenca)//60
+            if t_r > t_p: return (t_r-t_p)//60
         elif tipo == "RETORNO_ALMOCO":
             h_p = func["horario_retorno_almoco"].split(":"); t_p = int(h_p[0])*3600+int(h_p[1])*60
-            diferenca = t_p - t_r
-            if diferenca > tolerancia_seg: return (diferenca)//60
+            if t_r < t_p: return (t_p-t_r)//60
         elif tipo == "SAIDA":
             h_p = func["horario_saida"].split(":"); t_p = int(h_p[0])*3600+int(h_p[1])*60
-            diferenca = t_r - t_p
-            if diferenca > tolerancia_seg: return (diferenca)//60
+            if t_r > t_p: return (t_r-t_p)//60
         return 0
     except: return 0
 
@@ -639,34 +579,36 @@ def gerar_html_funcionario():
 <title>👤 Painel do Funcionário</title>
 <style>
 * { margin:0; padding:0; box-sizing:border-box; font-family:'Segoe UI',Arial,sans-serif; }
-body { min-height:100vh; display:flex; align-items:center; justify-content:center; padding:15px; position:relative; overflow-x:hidden; }
+body { min-height:100vh; padding:15px; position:relative; overflow-x:hidden; }
 """ + ESTILOS_5D + ESTILO_RODAPE_WELL + """
-.wrapper { position:relative; z-index:1; width:100%; max-width:480px; margin:0 auto; }
-.card-topo { padding:28px; margin-bottom:20px; }
+.wrapper { position:relative; z-index:1; max-width:480px; margin:0 auto; }
+.card-topo { padding:25px; margin-bottom:20px; }
 .card-topo.animar-entrar { animation-delay:0.1s; }
-.voltar { display:inline-flex; align-items:center; gap:5px; color:#667eea; text-decoration:none; font-size:14px; font-weight:bold; margin-bottom:18px; padding:8px 14px; background:rgba(102,126,234,0.1); border-radius:20px; transition:all 0.3s; }
+.voltar { display:inline-flex; align-items:center; gap:5px; color:#667eea; text-decoration:none; font-size:13px; font-weight:bold; margin-bottom:15px; padding:6px 12px; background:rgba(102,126,234,0.1); border-radius:20px; transition:all 0.3s; }
 .voltar:hover { background:rgba(102,126,234,0.2); transform:translateX(-3px); }
-.foto-func { width:80px; height:80px; border-radius:50%; background:linear-gradient(135deg,#667eea,#f093fb); display:flex; align-items:center; justify-content:center; color:white; font-size:34px; font-weight:bold; margin:0 auto 14px; box-shadow:0 10px 25px rgba(102,126,234,0.4); border:3px solid white; }
-.nome-func { text-align:center; font-size:22px; color:#333; margin-bottom:6px; font-weight:bold; }
-.cpf-func { text-align:center; color:#888; font-size:14px; margin-bottom:18px; }
-.status-wrapper { text-align:center; margin-bottom:18px; }
-.status-acesso { background:linear-gradient(135deg,#e8f5e9,#c8e6c9); color:#2e7d32; padding:10px 18px; border-radius:25px; font-size:13px; font-weight:bold; display:inline-block; }
-.horarios-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:20px; }
-.horario-item { background:linear-gradient(135deg,#f5f7fa,#e4e8ec); padding:12px; border-radius:12px; text-align:center; }
-.horario-label { font-size:12px; color:#888; text-transform:uppercase; font-weight:bold; letter-spacing:0.5px; }
-.horario-valor { font-size:16px; color:#333; font-weight:bold; margin-top:4px; }
-.data-hora { background:linear-gradient(135deg,#e8f0fe,#f3e8ff); color:#667eea; padding:16px; border-radius:14px; font-weight:bold; font-size:15px; margin-bottom:22px; text-align:center; border:2px solid rgba(102,126,234,0.2); }
-.card-botoes { padding:28px; margin-bottom:20px; }
-.card-botoes h2 { font-size:18px; color:#333; margin-bottom:20px; text-align:center; font-weight:bold; }
+.foto-func { width:72px; height:72px; border-radius:50%; background:linear-gradient(135deg,#667eea,#f093fb); display:flex; align-items:center; justify-content:center; color:white; font-size:30px; font-weight:bold; margin:0 auto 12px; box-shadow:0 10px 25px rgba(102,126,234,0.4); border:3px solid white; }
+.nome-func { text-align:center; font-size:20px; color:#333; margin-bottom:5px; }
+.cpf-func { text-align:center; color:#888; font-size:13px; margin-bottom:16px; }
+.status-wrapper { text-align:center; margin-bottom:15px; }
+.status-acesso { background:linear-gradient(135deg,#e8f5e9,#c8e6c9); color:#2e7d32; padding:10px 16px; border-radius:25px; font-size:12px; font-weight:bold; display:inline-block; }
+.horarios-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:18px; }
+.horario-item { background:linear-gradient(135deg,#f5f7fa,#e4e8ec); padding:10px; border-radius:10px; text-align:center; }
+.horario-label { font-size:10px; color:#888; text-transform:uppercase; font-weight:bold; }
+.horario-valor { font-size:14px; color:#333; font-weight:bold; margin-top:3px; }
+.data-hora { background:linear-gradient(135deg,#e8f0fe,#f3e8ff); color:#667eea; padding:14px; border-radius:14px; font-weight:bold; font-size:13px; margin-bottom:20px; text-align:center; border:2px solid rgba(102,126,234,0.2); }
+.card-botoes { padding:25px; margin-bottom:20px; }
+.card-botoes h2 { font-size:16px; color:#333; margin-bottom:18px; text-align:center; }
 .botoes { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
-.botoes button { padding:22px 12px; font-size:14px; font-weight:bold; }
-.icone-btn { font-size:30px; display:block; margin-bottom:8px; }
+.botoes button { padding:20px 10px; font-size:13px; }
+.icone-btn { font-size:28px; display:block; margin-bottom:6px; }
 .btn-entrada { background:linear-gradient(135deg,#4CAF50,#66bb6a,#43a047); }
 .btn-almoco { background:linear-gradient(135deg,#ff9800,#ffb74d,#f57c00); }
 .btn-retorno { background:linear-gradient(135deg,#2196F3,#64b5f6,#1976D2); }
 .btn-saida { background:linear-gradient(135deg,#f44336,#ef5350,#d32f2f); }
 .mensagem { padding:16px; border-radius:14px; margin-top:18px; font-size:14px; font-weight:bold; white-space:pre-line; line-height:1.6; display:none; text-align:center; }
-.mensagem.erro { background:linear-gradient(135deg,#ffebee,#ffcdd2); color:#b71c1c; display:block; border:1px solid #ef9a9a; }
+.sucesso { background:linear-gradient(135deg,#e8f5e9,#c8e6c9); color:#1b5e20; display:block; border:1px solid #a5d6a7; }
+.erro { background:linear-gradient(135deg,#ffebee,#ffcdd2); color:#b71c1c; display:block; border:1px solid #ef9a9a; }
+.banco-horas { background:linear-gradient(135deg,#e0f7fa,#b2ebf2); color:#006064; display:block; border:1px solid #80deea; }
 .modal-overlay { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.6); backdrop-filter:blur(5px); z-index:1000; align-items:center; justify-content:center; padding:20px; }
 .modal-overlay.ativo { display:flex; }
 .modal-box { background:white; border-radius:22px; padding:30px; width:100%; max-width:420px; box-shadow:0 30px 70px rgba(0,0,0,0.4); animation:entrar-cima 0.4s cubic-bezier(0.175,0.885,0.32,1.275); }
@@ -680,31 +622,6 @@ body { min-height:100vh; display:flex; align-items:center; justify-content:cente
 .btn-cancelar { background:linear-gradient(135deg,#e0e0e0,#bdbdbd); color:#333; }
 .btn-confirmar { background:linear-gradient(135deg,#667eea,#764ba2); color:white; }
 .disp-info { margin-top:15px; padding:12px; background:linear-gradient(135deg,#f3e5f5,#e1bee7); border-radius:12px; font-size:11px; color:#6a1b9a; text-align:center; border:1px solid #ce93d8; }
-
-/* ===== CARD DE CONFIRMAÇÃO DE REGISTRO ===== */
-.registro-confirmacao { margin-top:20px; border-radius:22px; overflow:hidden; box-shadow:0 15px 40px rgba(0,0,0,0.15); animation:entrar-cima 0.5s cubic-bezier(0.175,0.885,0.32,1.275); display:none; }
-.registro-confirmacao.ativo { display:block; }
-.registro-topo { padding:25px; text-align:center; color:white; position:relative; overflow:hidden; }
-.registro-topo::before { content:""; position:absolute; top:-50%; left:-50%; width:200%; height:200%; background:radial-gradient(circle,rgba(255,255,255,0.2) 0%,transparent 60%); animation:brilho 3s ease-in-out infinite; }
-@keyframes brilho { 0%,100%{transform:translate(0,0)} 50%{transform:translate(10%,10%)} }
-.registro-icone { font-size:48px; margin-bottom:8px; position:relative; z-index:1; animation:pulse-registro 2s infinite; }
-@keyframes pulse-registro { 0%,100%{transform:scale(1)} 50%{transform:scale(1.1)} }
-.registro-tipo { font-size:20px; font-weight:bold; margin-bottom:4px; position:relative; z-index:1; text-shadow:0 2px 10px rgba(0,0,0,0.2); }
-.registro-status { font-size:13px; opacity:0.95; position:relative; z-index:1; }
-.registro-corpo { background:white; padding:25px; }
-.registro-hora-destaque { text-align:center; margin-bottom:20px; }
-.registro-hora-label { font-size:12px; color:#888; text-transform:uppercase; font-weight:bold; letter-spacing:1px; margin-bottom:5px; }
-.registro-hora { font-size:56px; font-weight:bold; background:linear-gradient(135deg,#667eea,#f093fb); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; line-height:1; letter-spacing:-2px; }
-.registro-data { font-size:15px; color:#666; margin-top:5px; font-weight:500; }
-.registro-info-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:18px; padding-top:18px; border-top:2px dashed #eee; }
-.registro-info-item { background:linear-gradient(135deg,#f8f9ff,#f0f4ff); padding:14px; border-radius:12px; text-align:center; }
-.registro-info-label { font-size:10px; color:#888; text-transform:uppercase; font-weight:bold; margin-bottom:4px; }
-.registro-info-valor { font-size:14px; color:#333; font-weight:bold; }
-.registro-info-valor.atraso { color:#f44336; }
-.registro-info-valor.banco { color:#4CAF50; }
-.registro-check { display:inline-flex; align-items:center; justify-content:center; width:28px; height:28px; background:#4CAF50; color:white; border-radius:50%; font-size:16px; margin-left:8px; animation:check-pop 0.5s cubic-bezier(0.175,0.885,0.32,1.275); }
-@keyframes check-pop { 0%{transform:scale(0)} 60%{transform:scale(1.2)} 100%{transform:scale(1)} }
-
 .tela-bloqueio { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); backdrop-filter:blur(10px); z-index:2000; align-items:center; justify-content:center; padding:20px; }
 .tela-bloqueio.ativa { display:flex; }
 .bloqueio-box { background:white; border-radius:28px; padding:40px 30px; width:100%; max-width:420px; text-align:center; box-shadow:0 30px 80px rgba(244,67,54,0.4); animation:entrar-cima 0.5s cubic-bezier(0.175,0.885,0.32,1.275); }
@@ -754,41 +671,6 @@ body { min-height:100vh; display:flex; align-items:center; justify-content:cente
 <button class="btn-3d btn-saida" onclick="registrar('SAIDA')"><span class="icone-btn">🚪</span>SAÍDA</button>
 </div>
 <div class="mensagem" id="mensagem"></div>
-
-<!-- CARD DE CONFIRMAÇÃO DE REGISTRO -->
-<div class="registro-confirmacao" id="registroConfirmacao">
-  <div class="registro-topo" id="registroTopo">
-    <div class="registro-icone" id="registroIcone">✅</div>
-    <div class="registro-tipo" id="registroTipo">ENTRADA</div>
-    <div class="registro-status">Registrado com sucesso <span class="registro-check">✓</span></div>
-  </div>
-  <div class="registro-corpo">
-    <div class="registro-hora-destaque">
-      <div class="registro-hora-label">Horário Registrado</div>
-      <div class="registro-hora" id="registroHora">--:--</div>
-      <div class="registro-data" id="registroData">--/--/----</div>
-    </div>
-    <div class="registro-info-grid">
-      <div class="registro-info-item">
-        <div class="registro-info-label">Funcionário</div>
-        <div class="registro-info-valor" id="registroNome">---</div>
-      </div>
-      <div class="registro-info-item">
-        <div class="registro-info-label">Dia</div>
-        <div class="registro-info-valor" id="registroDia">---</div>
-      </div>
-      <div class="registro-info-item" id="itemAtraso" style="display:none;">
-        <div class="registro-info-label">Atraso</div>
-        <div class="registro-info-valor atraso" id="registroAtraso">---</div>
-      </div>
-      <div class="registro-info-item" id="itemBanco" style="display:none;">
-        <div class="registro-info-label">Banco Horas</div>
-        <div class="registro-info-valor banco" id="registroBanco">---</div>
-      </div>
-    </div>
-  </div>
-</div>
-
 <div class="disp-info" id="dispInfo">📡 Dispositivo registrado com segurança</div>
 </div>
 """ + RODAPE_WELL + """
@@ -924,42 +806,8 @@ function mostrarResultadoAprovacao(d){
   document.getElementById('bloqueioSub').textContent='O administrador aprovou seu registro. Ponto registrado com sucesso.';
   document.getElementById('bloqueioStatus').outerHTML=
     '<div class="bloqueio-aprovado"><h3>🎉 Ponto Registrado!</h3><p>Tipo: '+d.tipo_formatado+'<br>Horário: '+d.data_hora.split(' ')[1]+'</p></div>'+
-    '<button class="btn-continuar" onclick="fecharEMostrarCard()">Ver Registro</button>';
+    '<button class="btn-continuar" onclick="fecharTelaBloqueio()">Continuar</button>';
   document.removeEventListener('keydown',prevenirFechamento);
-  window._dadosAprovacao=d;
-}
-function fecharEMostrarCard(){
-  const d=window._dadosAprovacao;
-  const tiposMap={
-    'ENTRADA':{'label':'ENTRADA','icone':'✅'},
-    'SAIDA_ALMOCO':{'label':'SAÍDA ALMOÇO','icone':'🍽️'},
-    'RETORNO_ALMOCO':{'label':'RETORNO ALMOÇO','icone':'↩️'},
-    'SAIDA':{'label':'SAÍDA','icone':'🚪'}
-  };
-  const info=d.data_hora.split(' ');
-  const dataPartes=info[0].split('-');
-  const dataFormatada=dataPartes[2]+'/'+dataPartes[1]+'/'+dataPartes[0];
-  const horaCompleta=info[1];
-  const horaSimples=horaCompleta.substring(0,5);
-  const diasSemana=['Domingo','Segunda-feira','Terça-feira','Quarta-feira','Quinta-feira','Sexta-feira','Sábado'];
-  const dataObj=new Date(info[0]+'T'+horaCompleta);
-  const diaSemana=diasSemana[dataObj.getDay()];
-  const tipoInfo=tiposMap[d.tipo]||{'label':d.tipo_formatado,'icone':'📌'};
-  document.getElementById('telaBloqueio').classList.remove('ativa');
-  mostrarRegistro({
-    'tipo':d.tipo,
-    'tipo_label':tipoInfo.label,
-    'tipo_icone':tipoInfo.icone,
-    'nome':document.getElementById('nomeFunc').textContent,
-    'data':dataFormatada,
-    'dia_semana':diaSemana,
-    'hora':horaCompleta,
-    'hora_simples':horaSimples,
-    'atrasado':d.minutos_atraso>0,
-    'minutos_atraso':d.minutos_atraso||0,
-    'banco_horas':0,
-    'tem_justificativa':true
-  });
 }
 function mostrarResultadoNegacao(d){
   document.getElementById('bloqueioIcone').textContent='❌';
@@ -976,6 +824,7 @@ function mostrarResultadoNegacao(d){
 }
 function fecharTelaBloqueio(){
   document.getElementById('telaBloqueio').classList.remove('ativa');
+  location.reload();
 }
 function fecharModal(){document.getElementById('modalJust').classList.remove('ativo');pendente=null;}
 async function confirmar(){
@@ -988,42 +837,11 @@ async function executar(cpf,tipo,just){
   try{
     const r=await fetch('/api/bater_ponto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cpf:cpf,tipo:tipo,qr_code:QR,justificativa:just})});
     const d=await r.json();
-    if(r.ok){
-      if(d.registro)mostrarRegistro(d.registro);
-    }
+    if(r.ok){let t='sucesso';if(d.mensagem.includes('Banco'))t='banco-horas';mostrar(d.mensagem,t);}
     else mostrar(d.detail||'Erro','erro');
   }catch(e){mostrar('Erro de conexão!','erro');}
 }
 function mostrar(texto,tipo){const m=document.getElementById('mensagem');m.textContent=texto;m.className='mensagem '+tipo;setTimeout(()=>m.className='mensagem',10000);}
-function mostrarRegistro(reg){
-  const card=document.getElementById('registroConfirmacao');
-  const topo=document.getElementById('registroTopo');
-  const cores={
-    'ENTRADA':'linear-gradient(135deg,#4CAF50,#66bb6a,#43a047,#2e7d32)',
-    'SAIDA_ALMOCO':'linear-gradient(135deg,#ff9800,#ffb74d,#f57c00,#e65100)',
-    'RETORNO_ALMOCO':'linear-gradient(135deg,#2196F3,#64b5f6,#1976D2,#1565c0)',
-    'SAIDA':'linear-gradient(135deg,#f44336,#ef5350,#d32f2f,#c62828)'
-  };
-  topo.style.background=cores[reg.tipo]||'linear-gradient(135deg,#667eea,#764ba2)';
-  document.getElementById('registroIcone').textContent=reg.tipo_icone;
-  document.getElementById('registroTipo').textContent=reg.tipo_label;
-  document.getElementById('registroHora').textContent=reg.hora_simples;
-  document.getElementById('registroData').textContent=reg.data;
-  document.getElementById('registroNome').textContent=reg.nome;
-  document.getElementById('registroDia').textContent=reg.dia_semana.charAt(0).toUpperCase()+reg.dia_semana.slice(1);
-  const itemAtraso=document.getElementById('itemAtraso');
-  const itemBanco=document.getElementById('itemBanco');
-  if(reg.atrasado){
-    itemAtraso.style.display='block';
-    document.getElementById('registroAtraso').textContent=reg.minutos_atraso+' min';
-  }else itemAtraso.style.display='none';
-  if(reg.banco_horas>0){
-    itemBanco.style.display='block';
-    document.getElementById('registroBanco').textContent='+'+reg.banco_horas+' min';
-  }else itemBanco.style.display='none';
-  card.classList.add('ativo');
-  card.scrollIntoView({behavior:'smooth',block:'nearest'});
-}
 document.getElementById('modalJust').addEventListener('click',function(e){if(e.target===this)fecharModal();});
 </script>
 </body>
@@ -2106,67 +1924,40 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 msg_just = ""
                 info = ""
                 
-                # Validar se o horário correspondente está cadastrado
-                horario_necessario = {
-                    "ENTRADA": func["horario_entrada"],
-                    "SAIDA_ALMOCO": func["horario_saida_almoco"],
-                    "RETORNO_ALMOCO": func["horario_retorno_almoco"],
-                    "SAIDA": func["horario_saida"]
-                }.get(tipo, "")
-                
-                if not horario_necessario or not horario_necessario.strip():
-                    conn.close()
-                    responder_json(self, {"detail": f"⚠️ Horário de {TIPOS_REGISTRO[tipo]['label']} não cadastrado para este funcionário. Contate o RH."}, status=400)
-                    return
-                
-                # NOVA REGRA UNIFICADA para TODOS os 4 tipos:
-                # - Pode registrar até 5 minutos ANTES do horário → normal
-                # - Se passar do horário (qualquer segundo DEPOIS) → BLOQUEADO
-                # - Se chegar mais de 5 minutos ANTES → também BLOQUEADO (antecedência excessiva)
-                horario_ref = {
-                    "ENTRADA": func["horario_entrada"],
-                    "SAIDA_ALMOCO": func["horario_saida_almoco"],
-                    "RETORNO_ALMOCO": func["horario_retorno_almoco"],
-                    "SAIDA": func["horario_saida"]
-                }[tipo]
-                
-                tipo_label = TIPOS_REGISTRO[tipo]["label"]
-                esta_atrasado = verificar_atraso(hora_str, horario_ref)
-                esta_muito_cedo = verificar_antecedencia_excessiva(hora_str, horario_ref, tolerancia_minutos=5)
-                
-                if esta_atrasado:
-                    atrasado = 1
-                    minutos = calcular_minutos(hora_str, horario_ref)
-                    msg_just = f"Atraso no(a) {tipo_label}. Horário padrão: {horario_ref}. Não há tolerância para atrasos."
-                    info = f"Atraso de {minutos} minuto(s)"
-                elif esta_muito_cedo:
-                    atrasado = 1
-                    minutos = calcular_minutos(horario_ref, hora_str)
-                    msg_just = f"{tipo_label} com antecedência excessiva. Horário padrão: {horario_ref} (permitido até 5 min antes)."
-                    info = f"Antecedência de {minutos} minuto(s)"
-                else:
-                    atrasado = 0
-                    minutos = 0
+                if tipo == "ENTRADA":
+                    atrasado = 1 if verificar_atraso(hora_str, func["horario_entrada"], tolerancia_minutos=5) else 0
+                    if atrasado:
+                        minutos = calcular_minutos(hora_str, func["horario_entrada"])
+                        msg_just = f"Atraso na ENTRADA. Horário padrão: {func['horario_entrada']} (tolerância: 5 min)."
+                        info = f"Atraso de {minutos} minuto(s)"
+                elif tipo == "SAIDA_ALMOCO":
+                    minutos_antes = calcular_minutos(func["horario_saida_almoco"], hora_str)
+                    if not verificar_atraso(hora_str, func["horario_saida_almoco"]) and minutos_antes >= 30:
+                        minutos = minutos_antes
+                        msg_just = f"Saída para almoço com {minutos_antes} min de antecedência. Padrão: {func['horario_saida_almoco']}."
+                        info = f"Antecedência de {minutos_antes} min"
+                elif tipo == "RETORNO_ALMOCO":
+                    atrasado = 1 if verificar_atraso(hora_str, func["horario_retorno_almoco"], tolerancia_minutos=5) else 0
+                    if atrasado:
+                        minutos = calcular_minutos(hora_str, func["horario_retorno_almoco"])
+                        msg_just = f"Atraso no RETORNO. Padrão: {func['horario_retorno_almoco']} (tolerância: 5 min)."
+                        info = f"Atraso de {minutos} minuto(s)"
+                elif tipo == "SAIDA":
+                    atrasado = 1 if verificar_atraso(func["horario_saida"], hora_str, tolerancia_minutos=5) else 0
+                    if atrasado:
+                        minutos = calcular_minutos(func["horario_saida"], hora_str)
+                        msg_just = f"SAÍDA ANTECIPADA. Padrão: {func['horario_saida']} (tolerância: 5 min)."
+                        info = f"Antecipada em {minutos} minuto(s)"
                 
                 conn.close()
                 bloqueado = (atrasado == 1)
-                horario_padrao_debug = {
-                    "ENTRADA": func["horario_entrada"],
-                    "SAIDA_ALMOCO": func["horario_saida_almoco"],
-                    "RETORNO_ALMOCO": func["horario_retorno_almoco"],
-                    "SAIDA": func["horario_saida"]
-                }.get(tipo, "")
-                # Log de debug para verificar o que está acontecendo
-                print(f"[VERIFICAR] {func['nome']} | Tipo:{tipo} | Hora:{hora_str} | Padrão:{horario_padrao_debug} | Atrasado:{atrasado} | Bloqueado:{bloqueado} | Minutos:{minutos}")
                 responder_json(self, {
                     "precisa_justificativa": (minutos > 0 and not bloqueado),
                     "bloqueado": bloqueado,
                     "mensagem_justificativa": msg_just,
                     "info_atraso": info,
                     "minutos_atraso": minutos,
-                    "atrasado": atrasado,
-                    "hora_atual": hora_str,
-                    "horario_padrao": horario_padrao_debug
+                    "atrasado": atrasado
                 })
             except Exception as e:
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
@@ -2341,23 +2132,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 if justificativa: msg += f"\\n📝 Justificativa registrada"
                 
                 print(f"[PONTO] {func['nome']} | {tipo} | {hora_str} | IP:{ip_cliente}")
-                responder_json(self, {
-                    "mensagem": msg,
-                    "registro": {
-                        "tipo": tipo,
-                        "tipo_label": tipo_info["label"],
-                        "tipo_icone": tipo_info["icone"],
-                        "nome": func["nome"],
-                        "data": agora.strftime("%d/%m/%Y"),
-                        "dia_semana": agora.strftime("%A"),
-                        "hora": hora_str,
-                        "hora_simples": agora.strftime("%H:%M"),
-                        "atrasado": bool(atrasado),
-                        "minutos_atraso": minutos_atraso,
-                        "banco_horas": minutos_banco,
-                        "tem_justificativa": bool(justificativa)
-                    }
-                })
+                responder_json(self, {"mensagem": msg})
             except Exception as e:
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
             return
