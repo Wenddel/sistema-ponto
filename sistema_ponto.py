@@ -30,6 +30,7 @@ acessos_funcionarios = {}
 # Estrutura: chave = id_solicitacao, valor = dict com dados da solicitacao
 autorizacoes_pendentes = {}
 TIMEOUT_AUTORIZACAO_SEGUNDOS = 300  # 5 minutos
+TOLERANCIA_MINUTOS = 5  # Tolerancia de atraso antes de pedir autorizacao
 
 os.makedirs("static", exist_ok=True)
 
@@ -400,7 +401,7 @@ RODAPE_WELL = """
   <div class="rodape-content">
     <span class="rodape-icone">⚡</span>
     <span class="rodape-texto">Desenvolvido por <strong>WELL</strong></span>
-    <span class="rodape-versao">v4.0 AUTORIZA</span>
+    <span class="rodape-versao">v4.1</span>
   </div>
 </div>
 """
@@ -706,7 +707,6 @@ body { min-height:100vh; padding:15px; position:relative; overflow-x:hidden; }
 <div class="barra-progresso"><div class="preenchimento" id="autBarra" style="width:100%"></div></div>
 </div>
 <div class="resposta-admin" id="autResposta"></div>
-<button class="btn-cancelar-aut" onclick="cancelarAutorizacao()">❌ Cancelar Solicitação</button>
 </div>
 </div>
 
@@ -1021,7 +1021,8 @@ label { font-size:13px; color:#555; font-weight:bold; display:block; margin-top:
 .card-autorizacao .diferenca { text-align:center; padding:12px; background:linear-gradient(135deg,#ff5722,#f44336); color:white; border-radius:10px; font-weight:bold; margin-bottom:15px; }
 .card-autorizacao .acoes { display:flex; gap:10px; }
 .card-autorizacao .acoes button { flex:1; padding:12px; font-size:13px; }
-.card-autorizacao textarea { width:100%; margin-bottom:10px; min-height:60px; resize:vertical; }
+.card-autorizacao textarea { width:100%; margin-bottom:10px; min-height:60px; resize:vertical; position:relative; z-index:10; pointer-events:auto; background:white; border:2px solid #e8e8e8; border-radius:10px; padding:12px; font-size:14px; font-family:'Segoe UI',Arial,sans-serif; transition:all 0.3s; }
+.card-autorizacao textarea:focus { border-color:#667eea; background:white; outline:none; box-shadow:0 0 0 4px rgba(102,126,234,0.1); }
 .tempo-urgencia { position:absolute; top:15px; right:15px; font-size:11px; color:#e65100; font-weight:bold; background:rgba(255,255,255,0.7); padding:3px 8px; border-radius:10px; }
 .vazio-aut { text-align:center; padding:40px; color:#999; font-size:14px; }
 .vazio-aut .icone { font-size:48px; margin-bottom:10px; opacity:0.5; }
@@ -1400,7 +1401,7 @@ def salvar_historico_json():
         
         dados_historico = {
             "meta": {
-                "versao_sistema": "4.0 AUTORIZA",
+                "versao_sistema": "4.1",
                 "ultima_atualizacao": agora_brasilia().strftime("%Y-%m-%d %H:%M:%S"),
                 "total_funcionarios": len(funcionarios),
                 "total_registros_ponto": len(registros),
@@ -1857,9 +1858,9 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 if tipo == "ENTRADA":
                     horario_padrao = func["horario_entrada"]
                     if verificar_atraso(hora_str, horario_padrao):
-                        # Atrasado na entrada
+                        # Atrasado na entrada - aplica tolerancia
                         minutos_diferenca = calcular_minutos(hora_str, horario_padrao)
-                        if minutos_diferenca > 0:
+                        if minutos_diferenca > TOLERANCIA_MINUTOS:
                             requer_autorizacao = True
                             tipo_diferenca = "atrasado"
                     else:
@@ -1878,18 +1879,18 @@ class ServidorPonto(BaseHTTPRequestHandler):
                             requer_autorizacao = True
                             tipo_diferenca = "antecipado"
                     else:
-                        # Saindo para almoco DEPOIS (atrasado)
+                        # Saindo para almoco DEPOIS (atrasado) - aplica tolerancia
                         minutos_diferenca = calcular_minutos(hora_str, horario_padrao)
-                        if minutos_diferenca > 0:
+                        if minutos_diferenca > TOLERANCIA_MINUTOS:
                             requer_autorizacao = True
                             tipo_diferenca = "atrasado"
                 
                 elif tipo == "RETORNO_ALMOCO":
                     horario_padrao = func["horario_retorno_almoco"]
                     if verificar_atraso(hora_str, horario_padrao):
-                        # Atrasado no retorno
+                        # Atrasado no retorno - aplica tolerancia
                         minutos_diferenca = calcular_minutos(hora_str, horario_padrao)
-                        if minutos_diferenca > 0:
+                        if minutos_diferenca > TOLERANCIA_MINUTOS:
                             requer_autorizacao = True
                             tipo_diferenca = "atrasado"
                     else:
@@ -1904,13 +1905,13 @@ class ServidorPonto(BaseHTTPRequestHandler):
                     if verificar_atraso(func["horario_saida"], hora_str):
                         # Saida ANTECIPADA (invertido)
                         minutos_diferenca = calcular_minutos(func["horario_saida"], hora_str)
-                        if minutos_diferenca > 0:
+                        if minutos_diferenca > TOLERANCIA_MINUTOS:
                             requer_autorizacao = True
                             tipo_diferenca = "antecipado"
                     else:
-                        # Saindo DEPOIS do horario (hora extra)
+                        # Saindo DEPOIS do horario (hora extra) - aplica tolerancia
                         minutos_diferenca = calcular_minutos(hora_str, func["horario_saida"])
-                        if minutos_diferenca > 0:
+                        if minutos_diferenca > TOLERANCIA_MINUTOS:
                             requer_autorizacao = True
                             tipo_diferenca = "atrasado"
                 
@@ -2124,14 +2125,23 @@ class ServidorPonto(BaseHTTPRequestHandler):
         minutos_atraso = 0
         
         if tipo == "ENTRADA":
-            atrasado = 1 if verificar_atraso(hora_str, func["horario_entrada"]) else 0
-            if atrasado: minutos_atraso = calcular_minutos(hora_str, func["horario_entrada"])
+            if verificar_atraso(hora_str, func["horario_entrada"]):
+                minutos_calc = calcular_minutos(hora_str, func["horario_entrada"])
+                if minutos_calc > TOLERANCIA_MINUTOS:
+                    atrasado = 1
+                    minutos_atraso = minutos_calc
         elif tipo == "RETORNO_ALMOCO":
-            atrasado = 1 if verificar_atraso(hora_str, func["horario_retorno_almoco"]) else 0
-            if atrasado: minutos_atraso = calcular_minutos(hora_str, func["horario_retorno_almoco"])
+            if verificar_atraso(hora_str, func["horario_retorno_almoco"]):
+                minutos_calc = calcular_minutos(hora_str, func["horario_retorno_almoco"])
+                if minutos_calc > TOLERANCIA_MINUTOS:
+                    atrasado = 1
+                    minutos_atraso = minutos_calc
         elif tipo == "SAIDA":
-            atrasado = 1 if verificar_atraso(func["horario_saida"], hora_str) else 0
-            if atrasado: minutos_atraso = calcular_minutos(func["horario_saida"], hora_str)
+            if verificar_atraso(func["horario_saida"], hora_str):
+                minutos_calc = calcular_minutos(func["horario_saida"], hora_str)
+                if minutos_calc > TOLERANCIA_MINUTOS:
+                    atrasado = 1
+                    minutos_atraso = minutos_calc
         
         minutos_banco = calcular_banco_horas(tipo, hora_str, func)
         
@@ -2406,7 +2416,7 @@ def gerar_pdf_individual(func_id, mes):
 # ===================== INICIAR SERVIDOR =====================
 if __name__ == "__main__":
     print("=" * 65)
-    print("   🚀 SISTEMA DE PONTO v4.0 AUTORIZA - FUNCIONANDO!")
+    print("   🚀 SISTEMA DE PONTO v4.1 - FUNCIONANDO!")
     print("=" * 65)
     print(f"📱 Pagina inicial (CPF):   http://localhost:{PORTA}")
     print(f"👤 Painel Funcionario:     http://localhost:{PORTA}/funcionario")
