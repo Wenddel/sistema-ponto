@@ -2090,10 +2090,10 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 
                 if tipo == "ENTRADA":
                     # Verifica se chegou DEPOIS do horário (qualquer atraso, mesmo 1 min)
-                    atrasado = 1 if verificar_atraso(hora_str, func["horario_entrada"], tolerancia_minutos=0) else 0
+                    atrasado = 1 if verificar_atraso(hora_str, func["horario_entrada"], tolerancia_minutos=5) else 0
                     if atrasado:
                         minutos = calcular_minutos(hora_str, func["horario_entrada"])
-                        msg_just = f"Atraso na ENTRADA. Horário padrão: {func['horario_entrada']}. Qualquer atraso requer aprovação do administrador."
+                        msg_just = f"Atraso na ENTRADA. Horário padrão: {func['horario_entrada']}. Tolerância de 5 min ultrapassada. Requer aprovação do administrador."
                         info = f"Atraso de {minutos} minuto(s)"
                 elif tipo == "SAIDA_ALMOCO":
                     # Verifica se saiu MAIS de 5 minutos ANTES do horário
@@ -2106,10 +2106,10 @@ class ServidorPonto(BaseHTTPRequestHandler):
                         info = f"Antecedência de {minutos_antes} min"
                 elif tipo == "RETORNO_ALMOCO":
                     # Verifica se chegou DEPOIS do horário (qualquer atraso, mesmo 1 min)
-                    atrasado = 1 if verificar_atraso(hora_str, func["horario_retorno_almoco"], tolerancia_minutos=0) else 0
+                    atrasado = 1 if verificar_atraso(hora_str, func["horario_retorno_almoco"], tolerancia_minutos=5) else 0
                     if atrasado:
                         minutos = calcular_minutos(hora_str, func["horario_retorno_almoco"])
-                        msg_just = f"Atraso no RETORNO DO ALMOÇO. Horário padrão: {func['horario_retorno_almoco']}. Qualquer atraso requer aprovação do administrador."
+                        msg_just = f"Atraso no RETORNO DO ALMOÇO. Horário padrão: {func['horario_retorno_almoco']}. Tolerância de 5 min ultrapassada. Requer aprovação do administrador."
                         info = f"Atraso de {minutos} minuto(s)"
                 elif tipo == "SAIDA":
                     # Verifica se saiu MAIS de 5 minutos ANTES do horário
@@ -2197,7 +2197,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 minutos_atraso = 0
                 tolerancia = 5
                 if tipo == "ENTRADA":
-                    atrasado = 1 if verificar_atraso(hora_str, func["horario_entrada"], tolerancia_minutos=0) else 0
+                    atrasado = 1 if verificar_atraso(hora_str, func["horario_entrada"], tolerancia_minutos=5) else 0
                     if atrasado: minutos_atraso = calcular_minutos(hora_str, func["horario_entrada"])
                 elif tipo == "SAIDA_ALMOCO":
                     minutos_antes = calcular_minutos(func["horario_saida_almoco"], hora_str)
@@ -2206,7 +2206,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
                         atrasado = 1
                         minutos_atraso = minutos_antes
                 elif tipo == "RETORNO_ALMOCO":
-                    atrasado = 1 if verificar_atraso(hora_str, func["horario_retorno_almoco"], tolerancia_minutos=0) else 0
+                    atrasado = 1 if verificar_atraso(hora_str, func["horario_retorno_almoco"], tolerancia_minutos=5) else 0
                     if atrasado: minutos_atraso = calcular_minutos(hora_str, func["horario_retorno_almoco"])
                 elif tipo == "SAIDA":
                     minutos_antes = calcular_minutos(func["horario_saida"], hora_str)
