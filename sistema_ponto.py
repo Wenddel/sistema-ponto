@@ -1302,7 +1302,7 @@ Carregando dados dos funcionários...
 </div>
 <script>
 // ========== CONFIGURAÇÕES INICIAIS ==========
-const h=new Date();const ma=h.toISOString().slice(0,7);
+const h=new Date();const ma=h.getFullYear()+"-"+String(h.getMonth()+1).padStart(2,"0");
 document.getElementById('mesAno').value=ma;
 document.getElementById('mesAnoFunc').value=ma;
 document.getElementById('urlLocal').textContent=window.location.origin+'/';
@@ -1374,7 +1374,7 @@ async function carregarResumo(){
     // Estatísticas
     document.getElementById('totalFuncs').textContent=funcs.length;
     
-    const hoje=new Date().toISOString().slice(0,10);
+    const d=new Date();const hoje=d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");
     const regsHoje=registros.filter(function(x){
       const partes=x.data.split('/');
       const dataReg=partes[2]+'-'+partes[1]+'-'+partes[0];
