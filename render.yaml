@@ -4,7 +4,7 @@ services:
     runtime: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python sistema_ponto_v3.2_PERSISTENTE.py"
+    startCommand: "python sistema_ponto_v3.2_COM_BACKUP.py"
     envVars:
       - key: TZ
         value: America/Sao_Paulo
