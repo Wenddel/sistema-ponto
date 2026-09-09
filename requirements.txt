@@ -1,3 +1,15 @@
-qrcode[pil]
-Pillow>=10.0.0
+# ============================================
+#  REQUIREMENTS - SISTEMA DE PONTO v3.2 PG
+# ============================================
+# Instale todas as dependências com:
+# pip install -r requirements.txt
+
+# --- QR Code ---
+qrcode>=7.4.2
+pillow>=10.0.0
+
+# --- Geração de PDF ---
 reportlab>=4.0.0
+
+# --- PostgreSQL (Neon/Supabase) ---
+psycopg2-binary>=2.9.9
