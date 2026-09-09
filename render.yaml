@@ -4,7 +4,7 @@ services:
     runtime: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python sistema_ponto_v3.2_COM_BACKUP.py"
+    startCommand: "python sistema_ponto_v3.2_COM_BACKUP_FINAL.py"
     envVars:
       - key: TZ
         value: America/Sao_Paulo
@@ -13,7 +13,6 @@ services:
       - key: PERSIST_DIR
         value: /var/data
     autoDeploy: yes
-    # 🛡️ DISCO PERSISTENTE - NÃO É APAGADO NOS DEPLOYS
     disks:
       - name: dados-ponto
         mountPath: /var/data
