@@ -24,6 +24,210 @@ from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
+# =============================================================================
+#           🛡️ SISTEMA DE PERSISTÊNCIA E BACKUP AUTOMÁTICO
+# =============================================================================
+"""
+PROTEÇÃO CONTRA PERDA DE DADOS NO RENDER:
+- Render Disk montado em /var/data (NÃO É APAGADO em deploys)
+- Backups automáticos locais com versionamento
+- Restauração automática se o banco for perdido
+- Endpoint /health para UptimeRobot
+"""
+import shutil
+import signal
+import atexit
+import base64
+import threading
+
+# Diretório persistente principal (Render Disk montado aqui)
+PERSIST_DIR = os.environ.get("PERSIST_DIR", "/var/data")
+if not os.path.isdir(PERSIST_DIR) or not os.access(PERSIST_DIR, os.W_OK):
+    PERSIST_DIR = os.path.abspath("./data")
+
+# Diretórios de proteção
+BACKUP_DIR = os.path.join(PERSIST_DIR, "backups")
+DB_DIR = os.path.join(PERSIST_DIR, "db")
+ARCHIVE_DIR = os.path.join(PERSIST_DIR, "arquivo_morto")
+
+for d in [PERSIST_DIR, BACKUP_DIR, DB_DIR, ARCHIVE_DIR]:
+    os.makedirs(d, exist_ok=True)
+
+MAX_BACKUPS_LOCAIS = int(os.environ.get("MAX_BACKUPS_LOCAIS", "50"))
+
+print(f"\n{'='*70}")
+print(f"🛡️  SISTEMA DE PROTEÇÃO DE DADOS INICIADO")
+print(f"{'='*70}")
+print(f"📂 Diretório persistente: {PERSIST_DIR}")
+print(f"💾 Banco de dados:        {os.path.join(DB_DIR, 'ponto.db')}")
+print(f"📦 Diretório de backups: {BACKUP_DIR}")
+print(f"{'='*70}\n")
+
+
+def tamanho_arquivo(caminho):
+    try:
+        return os.path.getsize(caminho)
+    except:
+        return 0
+
+
+def banco_tem_dados(caminho_db):
+    if not os.path.exists(caminho_db):
+        return False
+    if tamanho_arquivo(caminho_db) < 1024:
+        return False
+    try:
+        conn = sqlite3.connect(caminho_db)
+        tabelas = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        if not tabelas:
+            conn.close()
+            return False
+        total = 0
+        for (tabela,) in tabelas:
+            try:
+                count = conn.execute(f"SELECT COUNT(*) FROM '{tabela}'").fetchone()[0]
+                total += count
+            except:
+                pass
+        conn.close()
+        return total > 0
+    except:
+        return False
+
+
+def fazer_backup_local(origem=None, sufixo=""):
+    if origem is None:
+        origem = DB_NOME
+    if not os.path.exists(origem):
+        return None
+    try:
+        timestamp = agora_brasilia().strftime("%Y%m%d_%H%M%S")
+        nome_backup = f"ponto_backup_{timestamp}{sufixo}.db"
+        caminho_backup = os.path.join(BACKUP_DIR, nome_backup)
+        try:
+            conn = sqlite3.connect(origem)
+            conn.execute(f"VACUUM INTO ?", (caminho_backup,))
+            conn.close()
+        except:
+            shutil.copy2(origem, caminho_backup)
+        print(f"[BACKUP] ✅ Backup criado: {nome_backup} ({tamanho_arquivo(caminho_backup)} bytes)")
+        limpar_backups_antigos()
+        return caminho_backup
+    except Exception as e:
+        print(f"[BACKUP] ❌ Erro: {e}")
+        return None
+
+
+def limpar_backups_antigos():
+    try:
+        backups = sorted([
+            os.path.join(BACKUP_DIR, f)
+            for f in os.listdir(BACKUP_DIR)
+            if f.startswith("ponto_backup_") and f.endswith(".db")
+        ], key=os.path.getmtime, reverse=True)
+        while len(backups) > MAX_BACKUPS_LOCAIS:
+            antigo = backups.pop()
+            try:
+                os.remove(antigo)
+            except:
+                pass
+    except:
+        pass
+
+
+def listar_backups_disponiveis():
+    try:
+        return sorted([
+            os.path.join(BACKUP_DIR, f)
+            for f in os.listdir(BACKUP_DIR)
+            if f.startswith("ponto_backup_") and f.endswith(".db")
+        ], key=os.path.getmtime, reverse=True)
+    except:
+        return []
+
+
+def restaurar_de_backup(caminho_backup, destino=None):
+    if destino is None:
+        destino = DB_NOME
+    if not os.path.exists(caminho_backup):
+        return False
+    try:
+        if os.path.exists(destino) and banco_tem_dados(destino):
+            fazer_backup_local(destino, sufixo="_antes_restore")
+        shutil.copy2(caminho_backup, destino)
+        print(f"[RESTORE] ✅ Restaurado de: {os.path.basename(caminho_backup)}")
+        return True
+    except Exception as e:
+        print(f"[RESTORE] ❌ Erro: {e}")
+        return False
+
+
+def restaurar_ultimo_backup():
+    backups = listar_backups_disponiveis()
+    if not backups:
+        return False
+    for backup in backups:
+        if banco_tem_dados(backup):
+            return restaurar_de_backup(backup)
+    return False
+
+
+def verificar_e_restaurar_banco():
+    print(f"\n🔍 VERIFICAÇÃO DE INTEGRIDADE DO BANCO")
+    if banco_tem_dados(DB_NOME):
+        print(f"✅ Banco principal está íntegro ({tamanho_arquivo(DB_NOME)} bytes)")
+        fazer_backup_local(sufixo="_inicializacao")
+        return True
+    print(f"⚠️ Banco vazio/perdido! Tentando restaurar...")
+    if restaurar_ultimo_backup():
+        print(f"✅ DADOS RECUPERADOS via backup local!")
+        return True
+    if os.path.exists("ponto.db") and banco_tem_dados("ponto.db"):
+        if restaurar_de_backup("ponto.db"):
+            print(f"✅ DADOS RECUPERADOS via arquivo legado!")
+            return True
+    print(f"🆕 Nenhuma fonte encontrada. Criando banco novo.")
+    return False
+
+
+def finalizar_seguro():
+    print(f"\n🛑 Desligando - backup final...")
+    fazer_backup_local(sufixo="_shutdown")
+    print(f"✅ Backup final concluído!\n")
+
+
+atexit.register(finalizar_seguro)
+try:
+    signal.signal(signal.SIGTERM, lambda s, f: finalizar_seguro())
+    signal.signal(signal.SIGINT, lambda s, f: finalizar_seguro())
+except:
+    pass
+
+
+def backup_periodico_loop():
+    import time as _time
+    while True:
+        _time.sleep(4 * 3600)
+        try:
+            fazer_backup_local(sufixo="_periodico")
+        except:
+            pass
+
+
+def iniciar_backup_periodico():
+    try:
+        t = threading.Thread(target=backup_periodico_loop, daemon=True)
+        t.start()
+        print("[BACKUP] ⏰ Backup periódico agendado (cada 4h)")
+    except:
+        pass
+
+# =============================================================================
+#           FIM DO SISTEMA DE PERSISTÊNCIA
+# =============================================================================
+
+
+
 # ===================== CONFIGURACAO FUSO HORARIO BRASILIA =====================
 import os
 os.environ["TZ"] = "America/Sao_Paulo"
@@ -118,7 +322,8 @@ def criar_logo_padrao():
         print(f"[LOGO] Erro: {e}")
         return False
 
-DB_NOME = "ponto.db"
+# DB_NOME agora aponta para o disco persistente do Render
+DB_NOME = os.path.join(DB_DIR, "ponto.db")
 
 def get_db():
     conn = sqlite3.connect(DB_NOME)
@@ -127,6 +332,7 @@ def get_db():
     return conn
 
 def init_db():
+    verificar_e_restaurar_banco()
     conn = get_db()
     
     # Tabela de funcionários
@@ -216,6 +422,9 @@ def init_db():
 
 init_db()
 criar_logo_padrao()
+
+# Inicia backup periódico em thread separada
+iniciar_backup_periodico()
 
 # ===================== FUNÇÕES AUXILIARES =====================
 def formatar_cpf(cpf):
@@ -1148,6 +1357,7 @@ label { font-size:13px; color:#555; font-weight:bold; display:block; margin-top:
 <button class="tab" onclick="abrirAba('acessos',this)">📡 Acessos</button>
 <button class="tab" onclick="abrirAba('admins',this)">👥 Admins</button>
 <button class="tab" onclick="abrirAba('config',this)">🔧 Configurações</button>
+<button class="tab" onclick="abrirAba('backup',this)">🛡️ Backup</button>
 </div>
 
 <!-- ========== ABA: RESUMO (NOVA!) ========== -->
@@ -1296,6 +1506,21 @@ Carregando dados dos funcionários...
 • Cookies HttpOnly e SameSite
 </p>
 </div>
+
+<!-- ========== ABA: BACKUP (PROTEÇÃO DE DADOS) ========== -->
+<div id="backup" class="painel">
+<h2>🛡️ Gerenciamento de Backups</h2>
+<div class="info-box">✅ Seus dados estão protegidos em disco persistente. Esta aba permite criar backups manuais e restaurar estados anteriores.</div>
+<div class="card" style="max-width:600px;">
+<h3 style="margin-bottom:15px;color:#555;">💾 Ações Rápidas</h3>
+<button class="btn-success" onclick="criarBackupManual()">💾 CRIAR BACKUP AGORA</button>
+<button onclick="listarBackups()">📋 LISTAR BACKUPS</button>
+</div>
+<div class="card" style="max-width:800px;">
+<h3 style="margin-bottom:15px;color:#555;">📦 Backups Disponíveis</h3>
+<div id="listaBackups"><p style="color:#888;font-size:13px;">Clique em "LISTAR BACKUPS" para ver os backups disponíveis</p></div>
+</div>
+</div>
 """ + RODAPE_WELL + """
 </div>
 </div>
@@ -1355,6 +1580,38 @@ async function atualizarBadgeSolic(){
   }catch(e){}
 }
 setTimeout(iniciarPollingAdmin,1000);
+
+// ========== FUNÇÕES DE BACKUP ==========
+async function criarBackupManual(){
+  try{
+    const r=await fetch('/api/admin/backup/criar',{method:'POST'});
+    const d=await r.json();
+    if(r.ok){alert('✅ '+d.mensagem);listarBackups();}
+    else alert('❌ Erro');
+  }catch(e){alert('❌ Erro de conexão');}
+}
+async function listarBackups(){
+  try{
+    const r=await fetch('/api/admin/backups');
+    const d=await r.json();
+    const el=document.getElementById('listaBackups');
+    if(d.backups&&d.backups.length>0){
+      el.innerHTML=d.backups.map(function(b){
+        return '<div style="padding:12px;background:#f8f9ff;border-radius:10px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;"><div><strong>📦 '+b.nome+'</strong><br><small style="color:#888;">'+b.tamanho+' bytes | '+b.data+'</small></div><button class="btn-small btn-warning" onclick="restaurarBackup(\''+b.nome+'\')">🔄 Restaurar</button></div>';
+      }).join('');
+    }else{el.innerHTML='<p style="color:#888;font-size:13px;">Nenhum backup disponível</p>';}
+  }catch(e){}
+}
+async function restaurarBackup(nome){
+  if(!confirm('ATENÇÃO: Isso substituirá o banco atual. Deseja continuar?'))return;
+  try{
+    const r=await fetch('/api/admin/backup/restaurar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({nome:nome})});
+    const d=await r.json();
+    alert(d.mensagem||'Concluído! Recarregando...');
+    setTimeout(function(){location.reload();},1500);
+  }catch(e){alert('Erro');}
+}
+
 
 // ========== NOVA FUNÇÃO: CARREGAR RESUMO ==========
 async function carregarResumo(){
@@ -1699,6 +1956,27 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 responder_json(self, {"status": "erro", "detalhe": str(e)}, status=500)
             return
         
+
+        if caminho == "/api/admin/backups":
+            if not verificar_login(self):
+                responder_json(self, {"detail": "Não autorizado"}, status=401)
+                return
+            backups = listar_backups_disponiveis()
+            lista = []
+            for b in backups[:20]:
+                try:
+                    stat = os.stat(b)
+                    from datetime import datetime as _dt
+                    lista.append({
+                        "nome": os.path.basename(b),
+                        "tamanho": stat.st_size,
+                        "data": _dt.fromtimestamp(stat.st_mtime).strftime("%d/%m/%Y %H:%M:%S")
+                    })
+                except:
+                    pass
+            responder_json(self, {"backups": lista})
+            return
+
         if caminho.startswith("/api/buscar/"):
             cpf = formatar_cpf(caminho.replace("/api/buscar/", ""))
             if len(cpf) != 11:
@@ -2547,6 +2825,34 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 responder_json(self, {"detail": f"Erro BD: {str(e)}"}, status=500)
             return
         
+
+        # Rotas de Backup
+        if caminho == "/api/admin/backup/criar":
+            if not verificar_login(self):
+                responder_json(self, {"detail": "Não autorizado"}, status=401)
+                return
+            caminho_backup = fazer_backup_local(sufixo="_manual_admin")
+            if caminho_backup:
+                responder_json(self, {"mensagem": f"Backup criado: {os.path.basename(caminho_backup)}"})
+            else:
+                responder_json(self, {"detail": "Erro ao criar backup"}, status=500)
+            return
+
+        if caminho == "/api/admin/backup/restaurar":
+            if not verificar_login(self):
+                responder_json(self, {"detail": "Não autorizado"}, status=401)
+                return
+            nome = dados.get("nome", "")
+            caminho = os.path.join(BACKUP_DIR, nome)
+            if not os.path.exists(caminho):
+                responder_json(self, {"detail": "Backup não encontrado"}, status=404)
+                return
+            if restaurar_de_backup(caminho):
+                responder_json(self, {"mensagem": "Backup restaurado com sucesso! Recarregue a página."})
+            else:
+                responder_json(self, {"detail": "Erro ao restaurar"}, status=500)
+            return
+
         responder_json(self, {"detail": "Rota não encontrada"}, status=404)
     
     def do_DELETE(self):
@@ -2595,6 +2901,34 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 responder_json(self, {"detail": f"Erro: {str(e)}"}, status=500)
             return
         
+
+        # Rotas de Backup
+        if caminho == "/api/admin/backup/criar":
+            if not verificar_login(self):
+                responder_json(self, {"detail": "Não autorizado"}, status=401)
+                return
+            caminho_backup = fazer_backup_local(sufixo="_manual_admin")
+            if caminho_backup:
+                responder_json(self, {"mensagem": f"Backup criado: {os.path.basename(caminho_backup)}"})
+            else:
+                responder_json(self, {"detail": "Erro ao criar backup"}, status=500)
+            return
+
+        if caminho == "/api/admin/backup/restaurar":
+            if not verificar_login(self):
+                responder_json(self, {"detail": "Não autorizado"}, status=401)
+                return
+            nome = dados.get("nome", "")
+            caminho = os.path.join(BACKUP_DIR, nome)
+            if not os.path.exists(caminho):
+                responder_json(self, {"detail": "Backup não encontrado"}, status=404)
+                return
+            if restaurar_de_backup(caminho):
+                responder_json(self, {"mensagem": "Backup restaurado com sucesso! Recarregue a página."})
+            else:
+                responder_json(self, {"detail": "Erro ao restaurar"}, status=500)
+            return
+
         responder_json(self, {"detail": "Rota não encontrada"}, status=404)
 
 # ===================== FUNÇÕES DE PDF =====================
