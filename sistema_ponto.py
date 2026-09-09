@@ -1555,6 +1555,7 @@ function abrirAba(nomeId, botao){
   if(nomeId==='acessos')carregarAcessos();
   if(nomeId==='solicitacoes')carregarSolicitacoes();
   if(nomeId==='admins')carregarAdmins();
+  if(nomeId==='backup')listarBackups();
 }
 
 // ========== POLLING PARA SOLICITAÇÕES ==========
@@ -2589,6 +2590,8 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 """, (func["id"], data_hora_str, tipo, atrasado, minutos_atraso, minutos_banco, justificativa, ip_cliente, user_agent, horario_acesso))
                 conn.commit()
                 conn.close()
+                # Backup automático após cada registro de ponto
+                fazer_backup_local(sufixo="_apos_registro")
                 
                 tipo_info = TIPOS_REGISTRO[tipo]
                 
@@ -2738,6 +2741,8 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 
                 conn.commit()
                 conn.close()
+                # Backup automático após cada registro de ponto
+                fazer_backup_local(sufixo="_apos_registro")
                 
                 print(f"[APROVADA #{solic_id}] {func['nome']} | {solic['tipo']} | Atraso: {solic['minutos_atraso']}min")
                 responder_json(self, {"status": "ok", "mensagem": f"Solicitação aprovada! Ponto registrado para {func['nome']}."})
@@ -2819,6 +2824,7 @@ class ServidorPonto(BaseHTTPRequestHandler):
                 novo_id = conn.execute("SELECT last_insert_rowid() as id").fetchone()["id"]
                 conn.close()
                 
+                fazer_backup_local(sufixo="_novo_funcionario")
                 print(f"[CADASTRO] {nome} | CPF: {cpf}")
                 responder_json(self, {"status": "ok", "id": novo_id})
             except Exception as e:
